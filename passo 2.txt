@@ -1,0 +1,14 @@
+FASE 2: Architettura del Microservizio brx-sync
+Per la massima scalabilità, useremo FastAPI con Celery e Redis.
+
+Rate Limiter Distribuito (Redis): Implementeremo un algoritmo Token Bucket in Redis. Ogni token CardTrader avrà il suo secchio di 200 "gettoni" ogni 10 secondi. Se il secchio è vuoto, il Worker aspetta senza mandare in crash il sistema.
+
+Code (Queues) differenziate:
+
+high-priority: Per vendite real-time (Ebartex -> CardTrader). Deve riflettersi "subitissimo".
+
+bulk-sync: Per l'importazione iniziale o aggiornamenti massivi di prezzo.
+
+webhooks: Per processare i messaggi in arrivo da CardTrader.
+
+Sistema di Idempotenza: Ogni operazione avrà un operation_id. Se CardTrader risponde lentamente e noi riproviamo, il sistema saprà che quell'aggiornamento è già stato inviato.

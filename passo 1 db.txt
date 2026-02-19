@@ -1,0 +1,32 @@
+FASE 1: Design del Database (PostgreSQL)
+Dobbiamo creare una struttura che separi i dati globali (MySQL) da quelli dinamici dell'utente (Postgres). Queste tabelle gestiranno milioni di righe con indici ottimizzati.
+
+Tabella user_sync_settings (Stato della connessione)
+
+user_id: UUID (FK verso la tabella utenti) - PK.
+
+cardtrader_token: Encrypted String (il segreto dell'utente).
+
+webhook_secret: String (per validare i messaggi in entrata da CardTrader).
+
+sync_status: Enum (idle, initial_sync, active, error).
+
+last_sync_at: Timestamp.
+
+Tabella user_inventory (Lo stock reale)
+
+id: BigInt - PK.
+
+user_id: UUID - Index (per query veloci sulla collezione).
+
+blueprint_id: Int - Index (il cardtrader_id della stampa carta).
+
+quantity: Int (quantità attuale).
+
+price_cents: Int (prezzo in centesimi per evitare errori di virgola mobile).
+
+properties: JSONB (Foil, Signed, Altered, Language). Uso di JSONB per flessibilità massima senza migrazioni continue.
+
+external_stock_id: String - Index (l'ID univoco dell'oggetto su CardTrader, per aggiornamenti mirati).
+
+updated_at: Timestamp.

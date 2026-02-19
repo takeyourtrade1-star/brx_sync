@@ -1,0 +1,8 @@
+FASE 3: Piano AWS & Terraform (main.tf)
+Dovremo aggiornare la tua infrastruttura per ospitare questo nuovo carico:
+
+Redis (AWS ElastiCache): Indispensabile per gestire le code di Celery e il rate limiting distribuito.
+
+Worker Fargate: Un servizio dedicato su ECS (Fargate) che scala orizzontalmente. Se abbiamo 1000 utenti che sincronizzano, AWS accenderà più Worker automaticamente.
+
+Secrets Manager: Per salvare la chiave master di crittografia dei token utenti.

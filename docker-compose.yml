@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: brx-sync-postgres
+    environment:
+      POSTGRES_DB: brx_sync_db
+      POSTGRES_USER: brx_sync_user
+      POSTGRES_PASSWORD: brx_sync_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brx_sync_user -d brx_sync_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - brx-sync-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: brx-sync-redis
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - brx-sync-network
+
+  brx-sync-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: brx-sync-api
+    environment:
+      # Database
+      DATABASE_URL: postgresql+asyncpg://brx_sync_user:brx_sync_pass@postgres:5432/brx_sync_db
+      
+      # MySQL (read-only for blueprint mapping)
+      MYSQL_HOST: ${MYSQL_HOST:-localhost}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      
+      # Fernet Key
+      FERNET_KEY: ${FERNET_KEY}
+      
+      # Application
+      DEBUG: "true"
+      ENVIRONMENT: development
+      
+      # AWS SSM (optional)
+      AWS_SSM_ENABLED: "false"
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - brx-sync-network
+
+  brx-sync-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: brx-sync-worker
+    command: celery -A app.tasks.celery_app worker --loglevel=info --queues=high-priority,bulk-sync,default
+    environment:
+      # Same environment as API
+      DATABASE_URL: postgresql+asyncpg://brx_sync_user:brx_sync_pass@postgres:5432/brx_sync_db
+      MYSQL_HOST: ${MYSQL_HOST:-localhost}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      REDIS_URL: redis://redis:6379/0
+      FERNET_KEY: ${FERNET_KEY}
+      DEBUG: "true"
+      ENVIRONMENT: development
+      AWS_SSM_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - brx-sync-network
+
+volumes:
+  postgres_data:
+
+networks:
+  brx-sync-network:
+    driver: bridge

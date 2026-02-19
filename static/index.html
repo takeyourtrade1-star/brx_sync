@@ -1,0 +1,2161 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BRX Sync - Test Locale</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f7;
+            color: #1d1d1f;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #86868b;
+            font-size: 14px;
+        }
+        
+        .section {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .section h2 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #e5e5e7;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #1d1d1f;
+        }
+        
+        input, textarea, select {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #d2d2d7;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            transition: border-color 0.2s;
+        }
+        
+        input:focus, textarea:focus, select:focus {
+            outline: none;
+            border-color: #0071e3;
+        }
+        
+        button {
+            background: #0071e3;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        button:hover {
+            background: #0077ed;
+        }
+        
+        button:disabled {
+            background: #d2d2d7;
+            cursor: not-allowed;
+        }
+        
+        .btn-secondary {
+            background: #86868b;
+        }
+        
+        .btn-secondary:hover {
+            background: #6e6e73;
+        }
+        
+        .status {
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+        
+        .status.success {
+            background: #d1f2eb;
+            color: #006644;
+            border: 1px solid #00d084;
+        }
+        
+        .status.error {
+            background: #fce8e6;
+            color: #d32f2f;
+            border: 1px solid #ea4335;
+        }
+        
+        .status.info {
+            background: #e8f0fe;
+            color: #1967d2;
+            border: 1px solid #4285f4;
+        }
+        
+        .status.loading {
+            background: #fef7e0;
+            color: #f9ab00;
+            border: 1px solid #fbbc04;
+        }
+        
+        .result-box {
+            background: #f5f5f7;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .info-card {
+            background: #f5f5f7;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 4px solid #0071e3;
+        }
+        
+        .info-card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        
+        .info-card p {
+            font-size: 12px;
+            color: #86868b;
+        }
+        
+        .loading-spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f3f3f3;
+            border-top: 2px solid #0071e3;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔄 BRX Sync</h1>
+            <p class="subtitle">Test Locale - Microservizio Sincronizzazione CardTrader</p>
+        </header>
+        
+        <div class="section">
+            <h2>📊 Stato Connessioni & Health Checks</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
+                <button onclick="testConnections()">Test Connessioni Base</button>
+                <button onclick="testHealthDetailed()">Health Check Dettagliato</button>
+                <button onclick="testHealthLive()">Liveness Probe</button>
+                <button onclick="applyCompositeIndexMigration()" style="background: #34a853;">🔧 Applica Migrazione Indice</button>
+            </div>
+            <div id="connections-status"></div>
+        </div>
+        
+        <div class="section">
+            <h2>🧪 Test Nuove Funzionalità Enterprise</h2>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px;">
+                <button onclick="testExceptionHandling()">Test Exception Handling</button>
+                <button onclick="testValidation()">Test Validazione</button>
+                <button onclick="testSchemas()">Test Pydantic Schemas</button>
+            </div>
+            <div id="enterprise-tests-status"></div>
+        </div>
+        
+        <div class="section">
+            <h2>🔐 Configurazione Utente</h2>
+            <div class="form-group">
+                <label>User ID (UUID)</label>
+                <input type="text" id="user-id" placeholder="es: 123e4567-e89b-12d3-a456-426614174000">
+                <button class="btn-secondary" onclick="generateUserId()" style="margin-top: 8px; padding: 8px 16px;">Genera UUID</button>
+            </div>
+            <div class="form-group">
+                <label>CardTrader Token</label>
+                <input type="password" id="cardtrader-token" placeholder="Token API CardTrader">
+                <p style="font-size: 12px; color: #86868b; margin-top: 8px;">
+                    Ottieni il token da: CardTrader → Settings → API
+                </p>
+            </div>
+            <div class="grid" style="margin-top: 15px;">
+                <button onclick="saveConfig()">Salva Locale (solo UI)</button>
+                <button onclick="setupUser()">Setup Utente (Database)</button>
+            </div>
+            <div id="config-status"></div>
+        </div>
+        
+        <div class="section">
+            <h2>🔔 Configurazione Webhook</h2>
+            <div style="background: #e3f2fd; border: 1px solid #2196f3; border-radius: 8px; padding: 12px; margin-bottom: 15px; font-size: 12px;">
+                <strong>ℹ️ INFO:</strong> Configura il webhook su CardTrader per ricevere notifiche in tempo reale quando ordini o prodotti vengono creati/modificati/eliminati.<br>
+                <div style="margin-top: 8px; font-size: 11px; color: #666;">
+                    📖 Vai su: <a href="https://www.cardtrader.com/it/full_api_app" target="_blank" style="color: #2196f3;">CardTrader Full API App</a>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>User ID (UUID)</label>
+                <input type="text" id="webhook-user-id" placeholder="Inserisci User ID o usa quello configurato sopra">
+                <button class="btn-secondary" onclick="useConfiguredUserId()" style="margin-top: 8px; padding: 8px 16px;">Usa User ID Configurato</button>
+            </div>
+            <div class="grid" style="margin-top: 15px;">
+                <button onclick="getWebhookUrl()">📋 Ottieni URL Webhook</button>
+                <button onclick="testWebhookConnection()" class="btn-secondary">🧪 Test Webhook</button>
+                <button onclick="syncFromCardTrader()">🔄 Sync da CardTrader</button>
+            </div>
+            <div id="webhook-status" style="margin-top: 15px;"></div>
+            <div id="webhook-url-display" style="margin-top: 15px; display: none;">
+                <div style="background: #f5f5f7; border: 1px solid #d2d2d7; border-radius: 8px; padding: 15px;">
+                    <h3 style="margin-top: 0; margin-bottom: 10px; font-size: 14px;">📋 URL Webhook da Configurare</h3>
+                    <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
+                        <input type="text" id="webhook-url-input" readonly style="flex: 1; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; background: white; font-family: monospace; font-size: 12px;">
+                        <button onclick="copyWebhookUrl()" style="padding: 8px 16px; background: #007aff; color: white; border: none; border-radius: 6px; cursor: pointer;">📋 Copia</button>
+                    </div>
+                    <div style="background: white; border: 1px solid #d2d2d7; border-radius: 6px; padding: 12px; margin-top: 10px;">
+                        <h4 style="margin-top: 0; margin-bottom: 8px; font-size: 13px;">📝 Istruzioni:</h4>
+                        <ol style="margin: 0; padding-left: 20px; font-size: 12px; line-height: 1.6;">
+                            <li>Vai su <a href="https://www.cardtrader.com/it/full_api_app" target="_blank" style="color: #007aff;">CardTrader Full API App</a></li>
+                            <li>Copia l'URL webhook sopra (clicca "Copia")</li>
+                            <li>Incolla l'URL nel campo <strong>"Indirizzo del tuo endpoint webhook"</strong></li>
+                            <li>Clicca su <strong>"Salva l'endpoint del Webhook"</strong></li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+            <div id="webhook-logs" style="margin-top: 15px; display: none;">
+                <h3 style="font-size: 14px; margin-bottom: 10px;">📊 Log Webhook (Ultimi 50)</h3>
+                <div id="webhook-logs-content" style="background: #1d1d1f; color: #f5f5f7; padding: 15px; border-radius: 8px; font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; line-height: 1.4;">
+                    <div style="color: #86868b;">Caricamento log webhook...</div>
+                </div>
+                <div style="margin-top: 10px; display: flex; gap: 8px;">
+                    <button onclick="loadWebhookLogs()" class="btn-secondary" style="padding: 6px 12px; font-size: 12px;">🔄 Aggiorna Log</button>
+                    <button onclick="toggleWebhookAutoRefresh()" id="webhook-auto-refresh-btn" class="btn-secondary" style="padding: 6px 12px; font-size: 12px;">▶️ Auto-refresh OFF</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>🚀 Sincronizzazione</h2>
+            <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 12px; margin-bottom: 15px; font-size: 12px;">
+                <strong>⚠️ IMPORTANTE:</strong> Assicurati che il worker Celery sia avviato in un terminale separato:<br>
+                <div style="margin-top: 8px;">
+                    <strong>Metodo 1 - Script Rapido:</strong><br>
+                    <code style="background: #f5f5f7; padding: 4px 8px; border-radius: 4px; display: inline-block; margin-top: 4px;">
+                        ./restart_worker.sh
+                    </code>
+                </div>
+                <div style="margin-top: 8px;">
+                    <strong>Metodo 2 - Manuale:</strong><br>
+                    <code style="background: #f5f5f7; padding: 4px 8px; border-radius: 4px; display: inline-block; margin-top: 4px;">
+                        celery -A app.tasks.celery_app worker --loglevel=info -Q bulk-sync,high-priority,default
+                    </code>
+                </div>
+                <div style="margin-top: 8px; font-size: 11px; color: #666;">
+                    📖 Per dettagli completi, consulta: <code>WORKER_GUIDE.md</code>
+                </div>
+            </div>
+            <div class="grid">
+                <div>
+                    <h3 style="margin-bottom: 15px;">Avvia Bulk Sync</h3>
+                    <p style="font-size: 12px; color: #86868b; margin-bottom: 15px;">
+                        Scarica tutti i prodotti da CardTrader e popola il database locale.
+                    </p>
+                    <button onclick="startSync()">Avvia Sync</button>
+                </div>
+                <div>
+                    <h3 style="margin-bottom: 15px;">Stato Sync</h3>
+                    <p style="font-size: 12px; color: #86868b; margin-bottom: 15px;">
+                        Verifica lo stato della sincronizzazione corrente.
+                    </p>
+                    <div style="display: flex; gap: 8px;">
+                        <button onclick="getSyncStatus()">Controlla Stato</button>
+                        <button onclick="checkTaskStatusManual()" class="btn-secondary">Controlla Task</button>
+                    </div>
+                </div>
+            </div>
+            <div id="sync-status"></div>
+        </div>
+        
+        <div class="section">
+            <h2>📦 Inventario Sincronizzato</h2>
+            <div class="form-group">
+                <label>Limite risultati</label>
+                <input type="number" id="inventory-limit" value="100" min="1" max="1000">
+            </div>
+            <button onclick="getInventory()">🔄 Carica Inventario</button>
+            <div id="inventory-result"></div>
+        </div>
+        
+        <div class="section">
+            <h2>📋 Debug Logs (Tempo Reale)</h2>
+            <div style="display: flex; gap: 10px; margin-bottom: 15px; align-items: center; flex-wrap: wrap;">
+                <button onclick="loadDebugLogs()">🔄 Aggiorna Log</button>
+                <button onclick="toggleAutoRefresh()" id="auto-refresh-btn">▶️ Auto-refresh OFF</button>
+                <label style="font-size: 12px; color: #86868b; display: flex; align-items: center; gap: 5px;">
+                    <span>Limite:</span>
+                    <input type="number" id="log-limit" value="50" min="10" max="500" style="width: 60px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;">
+                </label>
+            </div>
+            <div id="debug-logs" style="background: #1d1d1f; color: #f5f5f7; padding: 15px; border-radius: 8px; font-family: 'Monaco', 'Menlo', monospace; font-size: 11px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; line-height: 1.4;">
+                <div style="color: #86868b;">Caricamento log...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>🔍 Test CardTrader API</h2>
+            <div class="grid">
+                <div>
+                    <button onclick="testCardTraderInfo()">Test /info</button>
+                </div>
+                <div>
+                    <button onclick="testCardTraderExpansions()">Test /expansions</button>
+                </div>
+                <div>
+                    <button onclick="testCardTraderProducts()">Test /products</button>
+                </div>
+            </div>
+            <div id="api-result"></div>
+        </div>
+    </div>
+    
+    <!-- Modal per modificare item -->
+    <div id="edit-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
+        <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.3);">
+            <h2 style="margin-bottom: 20px; font-size: 24px;">✏️ Modifica Item</h2>
+            <div id="edit-modal-content">
+                <!-- Contenuto dinamico -->
+            </div>
+            <div style="margin-top: 20px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button onclick="closeEditModal()" style="padding: 10px 20px; background: #86868b; color: white; border: none; border-radius: 6px; cursor: pointer;">Annulla</button>
+                <button onclick="saveItemChanges()" style="padding: 10px 20px; background: #34a853; color: white; border: none; border-radius: 6px; cursor: pointer;">💾 Salva Modifiche</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        const API_BASE = 'http://localhost:8000/api/v1';
+        
+        let currentEditItem = null;
+        
+        function openEditModal(itemId, itemJson) {
+            try {
+                const item = typeof itemJson === 'string' ? JSON.parse(itemJson.replace(/&quot;/g, '"')) : itemJson;
+                currentEditItem = item;
+                
+                const props = item.properties || {};
+                // CardTrader valid condition values (from API documentation)
+                // Must match exactly: "Mint", "Near Mint", "Slightly Played", "Moderately Played", "Played", "Heavily Played", "Poor"
+                const conditionOptions = ['Mint', 'Near Mint', 'Slightly Played', 'Moderately Played', 'Played', 'Heavily Played', 'Poor'];
+                const languageOptions = ['en', 'it', 'de', 'fr', 'es', 'pt', 'ja', 'ko', 'zh'];
+                
+                let html = `
+                    <div class="form-group">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Quantità *</label>
+                        <input type="number" id="edit-quantity" value="${item.quantity}" min="0" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Prezzo (€) *</label>
+                        <input type="number" id="edit-price" value="${(item.price_cents / 100).toFixed(2)}" min="0" step="0.01" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Descrizione</label>
+                        <textarea id="edit-description" rows="3" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: inherit; resize: vertical;" placeholder="Descrizione del prodotto (visibile a tutti)">${item.description || ''}</textarea>
+                        <small style="color: #86868b; font-size: 11px;">Descrizione visibile a tutti gli utenti</small>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Campo Dati Utente</label>
+                        <input type="text" id="edit-user_data_field" value="${item.user_data_field || ''}" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;" placeholder="es: warehouse B, shelf 10C">
+                        <small style="color: #86868b; font-size: 11px;">Campo personalizzato per metadata (posizione magazzino, riferimento interno, ecc.)</small>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Gradata</label>
+                        <select id="edit-graded" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                            <option value="">-- Seleziona --</option>
+                            <option value="false" ${item.graded === false ? 'selected' : ''}>No</option>
+                            <option value="true" ${item.graded === true ? 'selected' : ''}>Sì</option>
+                        </select>
+                        <small style="color: #86868b; font-size: 11px;">Campo top-level (non dentro properties)</small>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Condizione</label>
+                        <select id="edit-condition" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                            <option value="">-- Seleziona --</option>
+                            ${conditionOptions.map(opt => `<option value="${opt}" ${props.condition === opt ? 'selected' : ''}>${opt}</option>`).join('')}
+                        </select>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="edit-signed" ${props.signed === true || props.signed === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
+                            <span style="font-weight: 600;">Firmata</span>
+                        </label>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="edit-altered" ${props.altered === true || props.altered === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
+                            <span style="font-weight: 600;">Alterata</span>
+                        </label>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="edit-mtg_foil" ${props.mtg_foil === true || props.mtg_foil === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
+                            <span style="font-weight: 600;">Foil</span>
+                        </label>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Lingua</label>
+                        <select id="edit-mtg_language" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                            <option value="">-- Seleziona --</option>
+                            ${languageOptions.map(opt => `<option value="${opt}" ${props.mtg_language === opt ? 'selected' : ''}>${opt.toUpperCase()}</option>`).join('')}
+                        </select>
+                    </div>
+                    
+                    <div class="form-group" style="margin-top: 15px;">
+                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Altre Proprietà (JSON)</label>
+                        <textarea id="edit-other-props" rows="4" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: monospace; font-size: 11px;" placeholder='{"custom_field": "value", ...}'>${JSON.stringify(Object.fromEntries(Object.entries(props).filter(([k]) => !['condition', 'graded', 'signed', 'altered', 'mtg_foil', 'mtg_language'].includes(k))), null, 2)}</textarea>
+                        <small style="color: #86868b; font-size: 11px;">
+                            Proprietà aggiuntive in formato JSON (opzionale).<br>
+                            <strong>⚠️ NOTA:</strong> Le seguenti proprietà sono <strong>read-only</strong> e verranno ignorate da CardTrader:<br>
+                            <code style="font-size: 10px;">mtg_card_colors, collector_number, tournament_legal, cmc, mtg_rarity</code>
+                        </small>
+                    </div>
+                `;
+                
+                document.getElementById('edit-modal-content').innerHTML = html;
+                document.getElementById('edit-modal').style.display = 'flex';
+            } catch (error) {
+                alert(`❌ Errore apertura modal: ${error.message}`);
+                console.error(error);
+            }
+        }
+        
+        function closeEditModal() {
+            document.getElementById('edit-modal').style.display = 'none';
+            currentEditItem = null;
+        }
+        
+        async function saveItemChanges() {
+            if (!currentEditItem) {
+                alert('❌ Nessun item selezionato');
+                return;
+            }
+            
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            if (!userId) {
+                alert('⚠️ User ID non configurato');
+                return;
+            }
+            
+            const quantity = parseInt(document.getElementById('edit-quantity').value);
+            const price = parseFloat(document.getElementById('edit-price').value);
+            const priceCents = Math.round(price * 100);
+            const description = document.getElementById('edit-description').value.trim();
+            const userDataField = document.getElementById('edit-user_data_field').value.trim();
+            const gradedSelect = document.getElementById('edit-graded').value;
+            const graded = gradedSelect === '' ? null : gradedSelect === 'true';
+            
+            if (isNaN(quantity) || quantity < 0) {
+                alert('⚠️ Quantità non valida');
+                return;
+            }
+            
+            if (isNaN(price) || price < 0) {
+                alert('⚠️ Prezzo non valido');
+                return;
+            }
+            
+            // Costruisci properties object
+            // IMPORTANTE: Includiamo sempre i valori booleani (anche se false)
+            // per assicurarci che CardTrader riceva i valori corretti
+            const properties = {};
+            
+            // Condition: CRITICAL - sempre includere se selezionata
+            const condition = document.getElementById('edit-condition').value;
+            console.log('🔍 DEBUG: Condition value from select:', condition, 'Type:', typeof condition);
+            if (condition && condition !== '' && condition !== '-- Seleziona --') {
+                properties.condition = condition;
+                console.log('✅ Condition added to properties:', properties.condition);
+            } else {
+                console.log('⚠️ Condition NOT added - value:', condition, 'empty?', !condition, 'equals empty?', condition === '');
+            }
+            
+            // Boolean properties: SEMPRE inclusi (true o false)
+            // CardTrader ha bisogno di valori espliciti per i booleani
+            properties.signed = document.getElementById('edit-signed').checked;
+            properties.altered = document.getElementById('edit-altered').checked;
+            properties.mtg_foil = document.getElementById('edit-mtg_foil').checked;
+            
+            // Language: solo se selezionata
+            const language = document.getElementById('edit-mtg_language').value;
+            if (language && language !== '' && language !== '-- Seleziona --') {
+                properties.mtg_language = language;
+            }
+            
+            // DEBUG: Log properties after building
+            console.log('🔍 DEBUG: Properties object after building:', properties);
+            console.log('🔍 DEBUG: Has condition?', 'condition' in properties, 'Value:', properties.condition);
+            
+            // NOTA: graded NON va dentro properties, è un campo top-level separato
+            // Rimuoviamo graded da properties se presente (non dovrebbe esserci)
+            if ('graded' in properties) {
+                delete properties.graded;
+            }
+            
+            // Aggiungi altre proprietà dal JSON
+            const otherPropsText = document.getElementById('edit-other-props').value.trim();
+            console.log('🔍 DEBUG: Before otherProps - properties:', JSON.stringify(properties));
+            if (otherPropsText) {
+                try {
+                    const otherProps = JSON.parse(otherPropsText);
+                    console.log('🔍 DEBUG: Parsed otherProps:', JSON.stringify(otherProps));
+                    // Rimuovi graded da altre proprietà se presente (non dovrebbe esserci)
+                    if ('graded' in otherProps) {
+                        delete otherProps.graded;
+                    }
+                    // CRITICAL: Preserve condition if it was already set
+                    const conditionBefore = properties.condition;
+                    Object.assign(properties, otherProps);
+                    // Restore condition if it was overwritten
+                    if (conditionBefore && !properties.condition) {
+                        properties.condition = conditionBefore;
+                        console.log('⚠️ Condition was overwritten, restored:', conditionBefore);
+                    }
+                    console.log('🔍 DEBUG: After otherProps - properties:', JSON.stringify(properties));
+                } catch (e) {
+                    alert(`⚠️ Errore nel formato JSON delle altre proprietà: ${e.message}`);
+                    return;
+                }
+            }
+            
+            // FINAL CHECK: Ensure condition is still there
+            console.log('🔍 DEBUG: Final properties check before sending:', JSON.stringify(properties));
+            console.log('🔍 DEBUG: Condition in properties?', 'condition' in properties, 'Value:', properties.condition);
+            
+            // Disabilita pulsante
+            const btn = document.querySelector('#edit-modal button[onclick="saveItemChanges()"]');
+            const originalText = btn ? btn.textContent : 'Salva';
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '⏳ Salvataggio...';
+            }
+            
+            try {
+                // CRITICAL: Create a deep copy of properties to avoid reference issues
+                const propertiesToSend = JSON.parse(JSON.stringify(properties));
+                
+                const requestBody = {
+                    quantity: quantity,
+                    price_cents: priceCents,
+                    properties: propertiesToSend
+                };
+                
+                // Add optional top-level fields
+                if (description !== '') {
+                    requestBody.description = description;
+                }
+                if (userDataField !== '') {
+                    requestBody.user_data_field = userDataField;
+                }
+                if (graded !== null) {
+                    requestBody.graded = graded;
+                }
+                
+                // CRITICAL: Final verification - ensure condition is included if it was selected
+                const finalCondition = document.getElementById('edit-condition').value;
+                if (finalCondition && finalCondition !== '' && finalCondition !== '-- Seleziona --') {
+                    if (!requestBody.properties.condition) {
+                        console.warn('⚠️ Condition was lost! Restoring it:', finalCondition);
+                        requestBody.properties.condition = finalCondition;
+                    }
+                }
+                
+                // DEBUG: Log what we're sending - use JSON.stringify to see actual content
+                const propertiesForLog = JSON.parse(JSON.stringify(requestBody.properties));
+                console.log('🔵 FRONTEND: Sending update request:', {
+                    item_id: currentEditItem.id,
+                    properties: propertiesForLog,
+                    properties_stringified: JSON.stringify(requestBody.properties),
+                    properties_keys: Object.keys(requestBody.properties),
+                    has_condition: 'condition' in (requestBody.properties || {}),
+                    condition_value: requestBody.properties?.condition,
+                    condition_in_keys: Object.keys(requestBody.properties).includes('condition')
+                });
+                
+                // CRITICAL: Log the actual JSON that will be sent
+                const jsonToSend = JSON.stringify(requestBody);
+                console.log('📤 FRONTEND: Actual JSON being sent:', jsonToSend);
+                const parsedJson = JSON.parse(jsonToSend);
+                console.log('📤 FRONTEND: Parsed JSON properties:', parsedJson.properties);
+                console.log('📤 FRONTEND: Condition in parsed?', 'condition' in (parsedJson.properties || {}), 'Value:', parsedJson.properties?.condition);
+                
+                const result = await apiCall(`/sync/inventory/${userId}/item/${currentEditItem.id}`, {
+                    method: 'PUT',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: jsonToSend
+                });
+                
+                let message = `✅ Item ${currentEditItem.id} aggiornato!\n\n`;
+                message += `Quantità: ${result.quantity}\n`;
+                message += `Prezzo: €${(result.price_cents/100).toFixed(2)}\n`;
+                if (result.description) message += `Descrizione: ${result.description}\n`;
+                if (result.user_data_field) message += `User Data Field: ${result.user_data_field}\n`;
+                if (result.graded !== null && result.graded !== undefined) message += `Gradata: ${result.graded ? 'Sì' : 'No'}\n`;
+                message += `Properties: ${JSON.stringify(result.properties)}\n\n`;
+                
+                if (result.cardtrader_sync_queued) {
+                    message += '🔄 Sincronizzazione con CardTrader in corso...\n';
+                    message += '(Controlla i log per lo stato)';
+                } else {
+                    message += '⚠️ ATTENZIONE: Item senza external_stock_id!\n';
+                    message += 'L\'item è stato aggiornato solo localmente.';
+                }
+                
+            alert(message);
+            closeEditModal();
+            getInventory();
+        } catch (error) {
+            alert(`❌ Errore: ${error.message}`);
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            }
+        }
+        
+        async function purchaseItem(itemId, event = null) {
+            // Find item in current inventory to get available quantity
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                alert('⚠️ User ID non configurato');
+                return;
+            }
+            
+            // Get current inventory to find item quantity
+            let itemQuantity = 1;
+            try {
+                const inventoryResponse = await apiCall(`/sync/inventory/${userId}?limit=1000`);
+                if (inventoryResponse.items) {
+                    const item = inventoryResponse.items.find(i => i.id === itemId);
+                    if (item) {
+                        itemQuantity = item.quantity;
+                    }
+                }
+            } catch (e) {
+                console.warn('Could not fetch item quantity, defaulting to 1:', e);
+            }
+            
+            // Ask user for quantity
+            const quantityInput = prompt(
+                `Quante unità vuoi acquistare?\n\n` +
+                `Item ID: ${itemId}\n` +
+                `Quantità disponibile: ${itemQuantity}\n\n` +
+                `Inserisci la quantità (1-${itemQuantity}):`,
+                '1'
+            );
+            
+            if (quantityInput === null) {
+                return; // User cancelled
+            }
+            
+            const purchaseQuantity = parseInt(quantityInput, 10);
+            
+            if (isNaN(purchaseQuantity) || purchaseQuantity < 1) {
+                alert('❌ Quantità non valida. Deve essere un numero >= 1.');
+                return;
+            }
+            
+            if (purchaseQuantity > itemQuantity) {
+                alert(`❌ Quantità insufficiente. Disponibile: ${itemQuantity}, Richiesta: ${purchaseQuantity}`);
+                return;
+            }
+            
+            if (!confirm(`Confermi l'acquisto di ${purchaseQuantity} unità dell'item ${itemId}?\n\nQuesto verificherà la disponibilità su CardTrader e, se disponibile, scalerà la quantità dalla collezione.`)) {
+                return;
+            }
+            
+            // Disabilita il pulsante durante l'operazione
+            // Try to find button from event, or by searching for it
+            let btn = null;
+            let originalText = '';
+            
+            if (event && event.target) {
+                btn = event.target;
+            } else {
+                // Find button by searching for the one that calls purchaseItem with this itemId
+                const buttons = document.querySelectorAll('button');
+                for (const button of buttons) {
+                    const onclick = button.getAttribute('onclick') || '';
+                    if (onclick.includes(`purchaseItem(${itemId}`)) {
+                        btn = button;
+                        break;
+                    }
+                }
+            }
+            
+            if (btn) {
+                originalText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ Acquisto...';
+            }
+            
+            try {
+                const result = await apiCall(`/sync/purchase/${userId}/item/${itemId}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        quantity: purchaseQuantity
+                    })
+                });
+                
+                console.log('Purchase result:', result);
+                
+                // Always show message - check both status field and available field
+                if (result.status === 'success' && result.available !== false) {
+                    let message = `✅ Acquisto completato!\n\n`;
+                    message += `Item ID: ${result.item_id}\n`;
+                    message += `Quantità acquistata: ${result.quantity_purchased || purchaseQuantity}\n`;
+                    message += `Quantità prima: ${result.quantity_before}\n`;
+                    message += `Quantità dopo: ${result.quantity_after}\n`;
+                    message += `\n✅ La quantità è stata scalata dalla collezione su CardTrader e dal database locale.`;
+                    
+                    alert(message);
+                    
+                    // Ricarica inventario
+                    getInventory();
+                } else {
+                    // Error or not available
+                    let message = '';
+                    
+                    if (result.available === false) {
+                        message = `⚠️ Carta non disponibile!\n\n`;
+                        message += `Item ID: ${result.item_id || itemId}\n`;
+                        message += `Quantità richiesta: ${purchaseQuantity}\n`;
+                        
+                        if (result.quantity_before !== undefined) {
+                            message += `Quantità prima: ${result.quantity_before}\n`;
+                        }
+                        if (result.quantity_after !== undefined) {
+                            message += `Quantità disponibile: ${result.quantity_after}\n`;
+                        }
+                        
+                        message += `\n${result.message || 'La carta non è più disponibile in quantità sufficiente.'}`;
+                    } else {
+                        message = `❌ Acquisto non completato!\n\n`;
+                        message += `Item ID: ${result.item_id || itemId}\n`;
+                        message += `Messaggio: ${result.message || 'Nessun messaggio disponibile'}\n`;
+                    }
+                    
+                    if (result.error) {
+                        message += `\n\nDettagli tecnici: ${result.error}`;
+                    }
+                    
+                    alert(message);
+                    
+                    // Ricarica inventario per vedere aggiornamenti
+                    getInventory();
+                }
+            } catch (error) {
+                console.error('Errore durante acquisto:', error);
+                let errorMsg = `❌ Errore durante l'acquisto:\n\n`;
+                
+                if (error.code) {
+                    errorMsg += `Codice: ${error.code}\n`;
+                }
+                if (error.trace_id) {
+                    errorMsg += `Trace ID: ${error.trace_id}\n`;
+                }
+                errorMsg += `Messaggio: ${error.message || error}`;
+                
+                alert(errorMsg);
+            } finally {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            }
+        }
+        
+        // Chiudi modal cliccando fuori
+        document.addEventListener('click', function(e) {
+            const modal = document.getElementById('edit-modal');
+            if (e.target === modal) {
+                closeEditModal();
+            }
+        });
+        
+        function showStatus(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+        
+        function showResult(elementId, data) {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="result-box">${JSON.stringify(data, null, 2)}</div>`;
+        }
+        
+        async function apiCall(endpoint, options = {}) {
+            try {
+                const response = await fetch(`${API_BASE}${endpoint}`, {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...options.headers
+                    },
+                    ...options
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    // Gestione errori strutturati (nuova exception hierarchy)
+                    if (data.error) {
+                        const errorInfo = data.error;
+                        const errorMsg = errorInfo.message || errorInfo.detail || `HTTP ${response.status}`;
+                        const errorCode = errorInfo.code || 'UNKNOWN_ERROR';
+                        const traceId = errorInfo.trace_id || 'N/A';
+                        
+                        // Crea errore con informazioni complete
+                        const error = new Error(errorMsg);
+                        error.code = errorCode;
+                        error.trace_id = traceId;
+                        error.context = errorInfo.context || {};
+                        error.status_code = response.status;
+                        
+                        throw error;
+                    } else {
+                        // Fallback per errori non strutturati
+                        throw new Error(data.detail || data.message || `HTTP ${response.status}`);
+                    }
+                }
+                
+                return data;
+            } catch (error) {
+                // Se è già un Error con proprietà custom, rilancialo
+                if (error.code) {
+                    throw error;
+                }
+                // Altrimenti crea un nuovo Error
+                throw error;
+            }
+        }
+        
+        function formatError(error) {
+            // Formatta errori strutturati per visualizzazione
+            if (error.code) {
+                let msg = `❌ ${error.message || error.toString()}\n\n`;
+                msg += `Codice Errore: ${error.code}\n`;
+                if (error.trace_id) {
+                    msg += `Trace ID: ${error.trace_id}\n`;
+                }
+                if (error.status_code) {
+                    msg += `Status: ${error.status_code}\n`;
+                }
+                if (error.context && Object.keys(error.context).length > 0) {
+                    msg += `\nContesto:\n${JSON.stringify(error.context, null, 2)}`;
+                }
+                return msg;
+            }
+            return `❌ ${error.message || error.toString()}`;
+        }
+        
+        async function applyCompositeIndexMigration() {
+    const statusDiv = document.getElementById('connections-status');
+    statusDiv.innerHTML = '<div class="status loading">⏳ Applicazione migrazione indice composito...</div>';
+    
+    try {
+        const response = await fetch(`${API_BASE}/sync/migrate/composite-index`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        const result = await response.json();
+        
+        if (response.ok) {
+            statusDiv.innerHTML = `
+                <div class="status success">
+                    ✅ <strong>Migrazione applicata con successo!</strong><br>
+                    <strong>Indice:</strong> ${result.index_name}<br>
+                    <strong>Colonne:</strong> ${result.columns.join(', ')}<br>
+                    <small>L'indice ottimizzerà le query di lookup durante la sincronizzazione bulk.</small>
+                </div>
+            `;
+        } else {
+            statusDiv.innerHTML = `
+                <div class="status error">
+                    ❌ <strong>Errore durante la migrazione:</strong><br>
+                    ${result.detail || result.message || 'Errore sconosciuto'}
+                </div>
+            `;
+        }
+    } catch (error) {
+        statusDiv.innerHTML = `
+            <div class="status error">
+                ❌ <strong>Errore di connessione:</strong><br>
+                ${error.message}
+            </div>
+        `;
+    }
+}
+
+async function testConnections() {
+            showStatus('connections-status', '<span class="loading-spinner"></span>Testando connessioni...', 'loading');
+            
+            try {
+                const response = await fetch('http://localhost:8000/health/ready');
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'ready') {
+                    showStatus('connections-status', '✅ Tutte le connessioni funzionano!', 'success');
+                } else {
+                    showStatus('connections-status', `⚠️ ${data.reason || 'Connessioni non pronte'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('connections-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testHealthDetailed() {
+            showStatus('connections-status', '<span class="loading-spinner"></span>Testando health check dettagliato...', 'loading');
+            
+            try {
+                const response = await fetch('http://localhost:8000/health');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    let html = '<div class="result-box">';
+                    html += '<h3 style="margin-bottom: 10px;">📊 Health Check Completo</h3>';
+                    html += `<p><strong>Status:</strong> ${data.status || 'unknown'}</p>`;
+                    
+                    if (data.services) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Servizi:</h4>';
+                        html += '<ul style="list-style: none; padding: 0;">';
+                        for (const [service, status] of Object.entries(data.services)) {
+                            const icon = status.status === 'healthy' ? '✅' : '❌';
+                            html += `<li style="margin: 5px 0;">${icon} <strong>${service}:</strong> ${status.status}`;
+                            if (status.message) {
+                                html += ` - ${status.message}`;
+                            }
+                            html += '</li>';
+                        }
+                        html += '</ul>';
+                    }
+                    
+                    html += '</div>';
+                    document.getElementById('connections-status').innerHTML = html;
+                } else {
+                    showStatus('connections-status', `⚠️ Health check fallito: ${data.reason || 'Unknown error'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('connections-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testHealthLive() {
+            showStatus('connections-status', '<span class="loading-spinner"></span>Testando liveness probe...', 'loading');
+            
+            try {
+                const response = await fetch('http://localhost:8000/health/live');
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'alive') {
+                    showStatus('connections-status', '✅ Liveness probe: OK - Applicazione attiva', 'success');
+                } else {
+                    showStatus('connections-status', `⚠️ Liveness probe fallito: ${data.reason || 'Unknown'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('connections-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testExceptionHandling() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando exception handling...', 'loading');
+            
+            try {
+                // Test 1: Invalid UUID (dovrebbe restituire ValidationError)
+                try {
+                    await apiCall('/sync/start/invalid-uuid', { method: 'POST' });
+                } catch (error) {
+                    let html = '<div class="result-box">';
+                    html += '<h3 style="margin-bottom: 10px;">🧪 Test Exception Handling</h3>';
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test 1: Invalid UUID</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${formatError(error)}</pre>`;
+                    
+                    if (error.code) {
+                        html += `<p style="margin-top: 10px;"><strong>✅ Errore strutturato rilevato:</strong></p>`;
+                        html += `<ul style="margin-left: 20px;">`;
+                        html += `<li>Codice: ${error.code}</li>`;
+                        if (error.trace_id) html += `<li>Trace ID: ${error.trace_id}</li>`;
+                        if (error.status_code) html += `<li>Status Code: ${error.status_code}</li>`;
+                        html += `</ul>`;
+                    }
+                    
+                    // Test 2: Not Found
+                    try {
+                        await apiCall('/sync/start/00000000-0000-0000-0000-000000000000', { method: 'POST' });
+                    } catch (error2) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test 2: Not Found</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${formatError(error2)}</pre>`;
+                    }
+                    
+                    html += '</div>';
+                    document.getElementById('enterprise-tests-status').innerHTML = html;
+                }
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testValidation() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando validazione input...', 'loading');
+            
+            try {
+                let html = '<div class="result-box">';
+                html += '<h3 style="margin-bottom: 10px;">🧪 Test Validazione</h3>';
+                
+                // Test con UUID non valido
+                try {
+                    await apiCall('/sync/setup-test-user', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: 'not-a-uuid',
+                            cardtrader_token: 'test-token'
+                        })
+                    });
+                } catch (error) {
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test: UUID non valido</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${formatError(error)}</pre>`;
+                }
+                
+                // Test con campi mancanti
+                try {
+                    await apiCall('/sync/setup-test-user', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: '123e4567-e89b-12d3-a456-426614174000'
+                            // cardtrader_token mancante
+                        })
+                    });
+                } catch (error) {
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test: Campi mancanti</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${formatError(error)}</pre>`;
+                }
+                
+                html += '</div>';
+                document.getElementById('enterprise-tests-status').innerHTML = html;
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testSchemas() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando Pydantic schemas...', 'loading');
+            
+            try {
+                let html = '<div class="result-box">';
+                html += '<h3 style="margin-bottom: 10px;">🧪 Test Pydantic Schemas</h3>';
+                html += '<p>I Pydantic schemas validano automaticamente i dati in ingresso e in uscita.</p>';
+                
+                // Test con dati validi
+                const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+                if (userId) {
+                    try {
+                        const result = await apiCall(`/sync/status/${userId}`);
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">✅ Test: Schema Response Valido</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(result, null, 2)}</pre>`;
+                    } catch (error) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">⚠️ Test: Errore (normale se utente non configurato)</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${formatError(error)}</pre>`;
+                    }
+                } else {
+                    html += '<p style="margin-top: 15px; color: #86868b;">⚠️ Configura un User ID per testare gli schemas con dati reali.</p>';
+                }
+                
+                html += '</div>';
+                document.getElementById('enterprise-tests-status').innerHTML = html;
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        async function saveConfig() {
+            const userId = document.getElementById('user-id').value;
+            const token = document.getElementById('cardtrader-token').value;
+            
+            if (!userId || !token) {
+                showStatus('config-status', '⚠️ Inserisci User ID e Token', 'error');
+                return;
+            }
+            
+            // Salva in localStorage
+            localStorage.setItem('brx_user_id', userId);
+            localStorage.setItem('brx_token', token);
+            
+            showStatus('config-status', '✅ Configurazione salvata (locale)', 'success');
+        }
+        
+        function generateUserId() {
+            // Genera UUID v4
+            const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                const r = Math.random() * 16 | 0;
+                const v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+            document.getElementById('user-id').value = uuid;
+        }
+        
+        function loadConfig() {
+            const userId = localStorage.getItem('brx_user_id');
+            const token = localStorage.getItem('brx_token');
+            
+            if (userId) document.getElementById('user-id').value = userId;
+            if (token) document.getElementById('cardtrader-token').value = token;
+        }
+        
+        async function setupUser() {
+            const userId = document.getElementById('user-id').value;
+            const token = document.getElementById('cardtrader-token').value;
+            
+            if (!userId || !token) {
+                showStatus('config-status', '⚠️ Inserisci User ID e Token', 'error');
+                return;
+            }
+            
+            // Valida formato UUID
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+            if (!uuidRegex.test(userId)) {
+                showStatus('config-status', '⚠️ User ID deve essere un UUID valido', 'error');
+                return;
+            }
+            
+            showStatus('config-status', '<span class="loading-spinner"></span>Configurazione utente...', 'loading');
+            
+            try {
+                const result = await fetch(`${API_BASE}/sync/setup-test-user`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        user_id: userId,
+                        cardtrader_token: token
+                    })
+                });
+                
+                if (!result.ok) {
+                    const error = await result.json();
+                    throw new Error(error.detail || error.message || `HTTP ${result.status}`);
+                }
+                
+                const data = await result.json();
+                
+                showStatus('config-status', '✅ Utente configurato nel database!', 'success');
+                showResult('config-status', data);
+                
+                // Salva anche in localStorage
+                localStorage.setItem('brx_user_id', userId);
+                localStorage.setItem('brx_token', token);
+            } catch (error) {
+                showStatus('config-status', formatError(error), 'error');
+            }
+        }
+        
+        let currentTaskId = null;
+        let taskCheckInterval = null;
+        
+        async function startSync(force = false) {
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                showStatus('sync-status', '⚠️ Inserisci User ID', 'error');
+                return;
+            }
+            
+            showStatus('sync-status', '<span class="loading-spinner"></span>Avvio sincronizzazione...', 'loading');
+            
+            try {
+                const url = `/sync/start/${userId}${force ? '?force=true' : ''}`;
+                const result = await apiCall(url, { method: 'POST' });
+                currentTaskId = result.task_id;
+                showStatus('sync-status', `✅ Sync avviato! Task ID: ${result.task_id}`, 'success');
+                showResult('sync-status', result);
+                
+                // Avvia monitoraggio task
+                startTaskMonitoring(result.task_id);
+            } catch (error) {
+                // Se l'errore è "Sync already in progress", offri l'opzione di forzare
+                if (error.message.includes('Sync already in progress') || error.message.includes('409')) {
+                    const forceSync = confirm(
+                        '⚠️ Una sincronizzazione è già in corso.\n\n' +
+                        'Vuoi forzare una nuova sincronizzazione?\n\n' +
+                        'Questo aggiornerà tutti gli external_stock_id degli item esistenti.'
+                    );
+                    if (forceSync) {
+                        startSync(true); // Richiama con force=true
+                        return;
+                    }
+                }
+                showStatus('sync-status', formatError(error), 'error');
+            }
+        }
+        
+        function startTaskMonitoring(taskId) {
+            // Ferma eventuale monitoraggio precedente
+            if (taskCheckInterval) {
+                clearInterval(taskCheckInterval);
+            }
+            
+            // Controlla subito
+            checkTaskStatus(taskId);
+            
+            // Poi ogni 2 secondi
+            taskCheckInterval = setInterval(() => {
+                checkTaskStatus(taskId);
+            }, 2000);
+        }
+        
+        function stopTaskMonitoring() {
+            if (taskCheckInterval) {
+                clearInterval(taskCheckInterval);
+                taskCheckInterval = null;
+            }
+        }
+        
+        async function checkTaskStatus(taskId) {
+            try {
+                const result = await apiCall(`/sync/task/${taskId}`);
+                
+                const statusElement = document.getElementById('sync-status');
+                let statusHtml = '';
+                
+                if (result.status === 'SUCCESS') {
+                    statusHtml = `
+                        <div class="status success">
+                            ✅ <strong>Sincronizzazione completata!</strong><br>
+                            <small>Task ID: ${taskId}</small>
+                    `;
+                    if (result.result) {
+                        statusHtml += `<br><pre style="margin-top: 10px; font-size: 11px;">${JSON.stringify(result.result, null, 2)}</pre>`;
+                    }
+                    statusHtml += `</div>`;
+                    stopTaskMonitoring();
+                    // Ricarica inventario automaticamente
+                    setTimeout(() => getInventory(), 1000);
+                } else if (result.status === 'FAILURE' || result.status === 'REVOKED') {
+                    statusHtml = `
+                        <div class="status error">
+                            ❌ <strong>Sincronizzazione fallita!</strong><br>
+                            <small>Task ID: ${taskId}</small><br>
+                            <small>Errore: ${result.error || 'Unknown error'}</small>
+                        </div>
+                    `;
+                    stopTaskMonitoring();
+                } else if (result.status === 'PENDING') {
+                    statusHtml = `
+                        <div class="status loading">
+                            ⏳ <strong>In attesa di elaborazione...</strong><br>
+                            <small>Task ID: ${taskId}</small><br>
+                            <small>Il worker Celery potrebbe non essere avviato. Controlla i log.</small>
+                        </div>
+                    `;
+                } else if (result.status === 'STARTED' || result.status === 'RETRY') {
+                    statusHtml = `
+                        <div class="status loading">
+                            <span class="loading-spinner"></span> <strong>Sincronizzazione in corso...</strong><br>
+                            <small>Task ID: ${taskId}</small><br>
+                            <small>Stato: ${result.message || result.status}</small>
+                        </div>
+                    `;
+                } else {
+                    statusHtml = `
+                        <div class="status info">
+                            ℹ️ <strong>Stato: ${result.status}</strong><br>
+                            <small>Task ID: ${taskId}</small><br>
+                            <small>${result.message || ''}</small>
+                        </div>
+                    `;
+                }
+                
+                statusElement.innerHTML = statusHtml;
+            } catch (error) {
+                console.error('Error checking task status:', error);
+                // Non fermiamo il monitoraggio, potrebbe essere un errore temporaneo
+            }
+        }
+        
+        async function checkTaskStatusManual() {
+            const taskId = prompt('Inserisci Task ID:');
+            if (taskId) {
+                checkTaskStatus(taskId);
+            }
+        }
+        
+        async function getSyncStatus() {
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                showStatus('sync-status', '⚠️ Inserisci User ID', 'error');
+                return;
+            }
+            
+            showStatus('sync-status', '<span class="loading-spinner"></span>Caricamento stato...', 'loading');
+            
+            try {
+                const result = await apiCall(`/sync/status/${userId}`);
+                const statusClass = result.sync_status === 'active' ? 'success' : 
+                                  result.sync_status === 'error' ? 'error' : 'info';
+                showStatus('sync-status', `Stato: ${result.sync_status}`, statusClass);
+                showResult('sync-status', result);
+            } catch (error) {
+                showStatus('sync-status', formatError(error), 'error');
+            }
+        }
+        
+        async function getInventory() {
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            const limit = document.getElementById('inventory-limit').value || 100;
+            
+            if (!userId) {
+                showStatus('inventory-result', '⚠️ Inserisci User ID', 'error');
+                return;
+            }
+            
+            showStatus('inventory-result', '<span class="loading-spinner"></span>Caricamento inventario...', 'loading');
+            
+            try {
+                const result = await apiCall(`/sync/inventory/${userId}?limit=${limit}&offset=0`);
+                displayInventoryTable(result);
+            } catch (error) {
+                showStatus('inventory-result', formatError(error), 'error');
+            }
+        }
+        
+        function displayInventoryTable(data) {
+            const element = document.getElementById('inventory-result');
+            
+            if (!data.items || data.items.length === 0) {
+                element.innerHTML = '<div class="status info">📭 Nessun item nell\'inventario. Avvia una sincronizzazione per popolare l\'inventario.</div>';
+                return;
+            }
+            
+            let html = `
+                <div class="status success" style="margin-bottom: 15px;">
+                    ✅ Trovati <strong>${data.total}</strong> items totali (mostrati ${data.items.length})
+                </div>
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden;">
+                        <thead>
+                            <tr style="background: #f5f5f7; border-bottom: 2px solid #e5e5e7;">
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">ID</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Blueprint ID</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">CT Product ID</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Quantità</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Prezzo (€)</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Properties</th>
+                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Azioni</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+            
+            data.items.forEach(item => {
+                const price = (item.price_cents / 100).toFixed(2);
+                const properties = item.properties ? JSON.stringify(item.properties) : 'N/A';
+                const propsShort = properties.length > 50 ? properties.substring(0, 50) + '...' : properties;
+                
+                const externalStockId = item.external_stock_id || '<span style="color: #ea4335; font-weight: bold;">⚠️ MANCANTE</span>';
+                const hasExternalId = item.external_stock_id ? true : false;
+                
+                html += `
+                    <tr style="border-bottom: 1px solid #e5e5e7; ${!hasExternalId ? 'background: #fff3cd;' : ''}" id="item-row-${item.id}">
+                        <td style="padding: 12px; font-size: 12px;">${item.id}</td>
+                        <td style="padding: 12px; font-size: 12px; font-family: monospace;">${item.blueprint_id}</td>
+                        <td style="padding: 12px; font-size: 11px; font-family: monospace; ${!hasExternalId ? 'color: #ea4335; font-weight: bold;' : 'color: #34a853;'}">${externalStockId}</td>
+                        <td style="padding: 12px; font-size: 12px;">
+                            <input type="number" id="qty-${item.id}" value="${item.quantity}" min="0" style="width: 60px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;">
+                        </td>
+                        <td style="padding: 12px; font-size: 12px;">
+                            <input type="number" id="price-${item.id}" value="${price}" min="0" step="0.01" style="width: 80px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;">
+                        </td>
+                        <td style="padding: 12px; font-size: 11px; color: #86868b; max-width: 200px; overflow: hidden; text-overflow: ellipsis;" title="${properties}">${propsShort}</td>
+                        <td style="padding: 12px;">
+                            <button onclick="openEditModal(${item.id}, ${JSON.stringify(item).replace(/"/g, '&quot;')})" style="padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #4285f4; color: white;" ${!hasExternalId ? 'title="⚠️ Questo item non può essere sincronizzato con CardTrader senza external_stock_id"' : ''}>✏️ Modifica</button>
+                            <button onclick="purchaseItem(${item.id}, event)" style="padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #34a853; color: white;" ${!hasExternalId || item.quantity <= 0 ? 'title="⚠️ Questo item non può essere acquistato (non disponibile o senza external_stock_id)" disabled' : ''}>🛒 Acquista</button>
+                            <button onclick="deleteItem(${item.id})" style="padding: 6px 12px; font-size: 11px; background: #ea4335; color: white;" ${!hasExternalId ? 'title="⚠️ Questo item non può essere eliminato da CardTrader senza external_stock_id"' : ''}>🗑️ Elimina</button>
+                        </td>
+                    </tr>
+                `;
+            });
+            
+            html += `
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            element.innerHTML = html;
+        }
+        
+        async function updateItem(itemId) {
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            const quantity = parseInt(document.getElementById(`qty-${itemId}`).value);
+            const price = parseFloat(document.getElementById(`price-${itemId}`).value);
+            const priceCents = Math.round(price * 100);
+            
+            if (!userId) {
+                alert('⚠️ User ID non configurato');
+                return;
+            }
+            
+            if (isNaN(quantity) || quantity < 0) {
+                alert('⚠️ Quantità non valida');
+                return;
+            }
+            
+            if (isNaN(price) || price < 0) {
+                alert('⚠️ Prezzo non valido');
+                return;
+            }
+            
+            // Disabilita il pulsante durante l'operazione
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Aggiornamento...';
+            
+            try {
+                const result = await apiCall(`/sync/inventory/${userId}/item/${itemId}`, {
+                    method: 'PUT',
+                    body: JSON.stringify({
+                        quantity: quantity,
+                        price_cents: priceCents
+                    })
+                });
+                
+                let message = `✅ Item ${itemId} aggiornato localmente!\n`;
+                message += `Quantità: ${result.quantity}, Prezzo: €${(result.price_cents/100).toFixed(2)}\n\n`;
+                
+                if (result.cardtrader_sync_queued) {
+                    message += '🔄 Sincronizzazione con CardTrader in corso...\n';
+                    message += '(Controlla i log del worker Celery per lo stato)';
+                } else {
+                    message += '⚠️ ATTENZIONE: Item senza external_stock_id!\n';
+                    message += 'L\'item è stato aggiornato solo localmente.\n';
+                    message += 'Per sincronizzare con CardTrader, esegui una nuova "Bulk Sync" per aggiornare gli external_stock_id.';
+                }
+                
+                alert(message);
+                // Ricarica inventario
+                getInventory();
+            } catch (error) {
+                alert(`❌ Errore: ${error.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
+        
+        async function deleteItem(itemId) {
+            if (!confirm(`Sei sicuro di voler eliminare l'item ${itemId}?\n\nQuesto eliminerà l'item dal database locale e da CardTrader.`)) {
+                return;
+            }
+            
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                alert('⚠️ User ID non configurato');
+                return;
+            }
+            
+            // Disabilita il pulsante durante l'operazione
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ Eliminazione...';
+            
+            try {
+                const result = await apiCall(`/sync/inventory/${userId}/item/${itemId}`, {
+                    method: 'DELETE'
+                });
+                
+                let message = `✅ Item ${itemId} eliminato dal database locale!\n\n`;
+                
+                if (result.cardtrader_sync_queued) {
+                    message += '🔄 Eliminazione da CardTrader in corso...\n';
+                    message += '(Controlla i log del worker Celery per lo stato)';
+                } else {
+                    message += '⚠️ ATTENZIONE: Item senza external_stock_id!\n';
+                    message += 'L\'item è stato eliminato solo localmente.\n';
+                    message += 'Per sincronizzare con CardTrader, esegui una nuova "Bulk Sync" per aggiornare gli external_stock_id.';
+                }
+                
+                alert(message);
+                // Rimuovi riga dalla tabella
+                const row = document.getElementById(`item-row-${itemId}`);
+                if (row) {
+                    row.style.opacity = '0.5';
+                    row.style.textDecoration = 'line-through';
+                    setTimeout(() => {
+                        row.remove();
+                        // Ricarica per aggiornare il totale
+                        getInventory();
+                    }, 1000);
+                } else {
+                    // Ricarica se la riga non esiste
+                    getInventory();
+                }
+            } catch (error) {
+                alert(`❌ Errore: ${error.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = originalText;
+            }
+        }
+        
+        async function testCardTraderInfo() {
+            showStatus('api-result', '<span class="loading-spinner"></span>Testando /info...', 'loading');
+            
+            try {
+                // Questo endpoint richiede autenticazione, quindi potrebbe fallire
+                // ma mostriamo comunque il risultato
+                const result = await apiCall('/sync/test/info', { method: 'POST' });
+                showResult('api-result', result);
+            } catch (error) {
+                showStatus('api-result', `⚠️ Endpoint non disponibile o richiede autenticazione: ${error.message}`, 'info');
+            }
+        }
+        
+        async function testCardTraderExpansions() {
+            showStatus('api-result', '<span class="loading-spinner"></span>Testando /expansions...', 'loading');
+            showStatus('api-result', '⚠️ Questo endpoint richiede autenticazione CardTrader', 'info');
+        }
+        
+        async function testCardTraderProducts() {
+            showStatus('api-result', '<span class="loading-spinner"></span>Testando /products...', 'loading');
+            showStatus('api-result', '⚠️ Questo endpoint richiede autenticazione CardTrader', 'info');
+        }
+        
+        // Enterprise Testing Functions
+        async function testHealthDetailed() {
+            showStatus('connections-status', '<span class="loading-spinner"></span>Testando health check dettagliato...', 'loading');
+            
+            try {
+                const response = await fetch('http://localhost:8000/health');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    let html = '<div class="result-box">';
+                    html += '<h3 style="margin-bottom: 10px;">📊 Health Check Completo</h3>';
+                    html += `<p><strong>Status:</strong> ${data.status || 'unknown'}</p>`;
+                    
+                    if (data.services) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Servizi:</h4>';
+                        html += '<ul style="list-style: none; padding: 0;">';
+                        for (const [service, status] of Object.entries(data.services)) {
+                            const icon = status.status === 'healthy' ? '✅' : '❌';
+                            html += `<li style="margin: 5px 0;">${icon} <strong>${service}:</strong> ${status.status}`;
+                            if (status.message) {
+                                html += ` - ${status.message}`;
+                            }
+                            html += '</li>';
+                        }
+                        html += '</ul>';
+                    }
+                    
+                    html += '</div>';
+                    document.getElementById('connections-status').innerHTML = html;
+                } else {
+                    showStatus('connections-status', `⚠️ Health check fallito: ${data.reason || 'Unknown error'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('connections-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testHealthLive() {
+            showStatus('connections-status', '<span class="loading-spinner"></span>Testando liveness probe...', 'loading');
+            
+            try {
+                const response = await fetch('http://localhost:8000/health/live');
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'alive') {
+                    showStatus('connections-status', '✅ Liveness probe: OK - Applicazione attiva', 'success');
+                } else {
+                    showStatus('connections-status', `⚠️ Liveness probe fallito: ${data.reason || 'Unknown'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('connections-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testExceptionHandling() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando exception handling...', 'loading');
+            
+            try {
+                // Test 1: Invalid UUID (dovrebbe restituire ValidationError)
+                try {
+                    await apiCall('/sync/start/invalid-uuid', { method: 'POST' });
+                } catch (error) {
+                    let html = '<div class="result-box">';
+                    html += '<h3 style="margin-bottom: 10px;">🧪 Test Exception Handling</h3>';
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test 1: Invalid UUID</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap;">${formatError(error)}</pre>`;
+                    
+                    if (error.code) {
+                        html += `<p style="margin-top: 10px;"><strong>✅ Errore strutturato rilevato:</strong></p>`;
+                        html += `<ul style="margin-left: 20px;">`;
+                        html += `<li>Codice: ${error.code}</li>`;
+                        if (error.trace_id) html += `<li>Trace ID: ${error.trace_id}</li>`;
+                        if (error.status_code) html += `<li>Status Code: ${error.status_code}</li>`;
+                        html += `</ul>`;
+                    }
+                    
+                    // Test 2: Not Found
+                    try {
+                        await apiCall('/sync/start/00000000-0000-0000-0000-000000000000', { method: 'POST' });
+                    } catch (error2) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test 2: Not Found</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap;">${formatError(error2)}</pre>`;
+                    }
+                    
+                    html += '</div>';
+                    document.getElementById('enterprise-tests-status').innerHTML = html;
+                }
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testValidation() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando validazione input...', 'loading');
+            
+            try {
+                let html = '<div class="result-box">';
+                html += '<h3 style="margin-bottom: 10px;">🧪 Test Validazione</h3>';
+                
+                // Test con UUID non valido
+                try {
+                    await apiCall('/sync/setup-test-user', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: 'not-a-uuid',
+                            cardtrader_token: 'test-token'
+                        })
+                    });
+                } catch (error) {
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test: UUID non valido</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap;">${formatError(error)}</pre>`;
+                }
+                
+                // Test con campi mancanti
+                try {
+                    await apiCall('/sync/setup-test-user', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            user_id: '123e4567-e89b-12d3-a456-426614174000'
+                            // cardtrader_token mancante
+                        })
+                    });
+                } catch (error) {
+                    html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">Test: Campi mancanti</h4>';
+                    html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap;">${formatError(error)}</pre>`;
+                }
+                
+                html += '</div>';
+                document.getElementById('enterprise-tests-status').innerHTML = html;
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        async function testSchemas() {
+            showStatus('enterprise-tests-status', '<span class="loading-spinner"></span>Testando Pydantic schemas...', 'loading');
+            
+            try {
+                let html = '<div class="result-box">';
+                html += '<h3 style="margin-bottom: 10px;">🧪 Test Pydantic Schemas</h3>';
+                html += '<p>I Pydantic schemas validano automaticamente i dati in ingresso e in uscita.</p>';
+                
+                // Test con dati validi
+                const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+                if (userId) {
+                    try {
+                        const result = await apiCall(`/sync/status/${userId}`);
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">✅ Test: Schema Response Valido</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto;">${JSON.stringify(result, null, 2)}</pre>`;
+                    } catch (error) {
+                        html += '<h4 style="margin-top: 15px; margin-bottom: 8px;">⚠️ Test: Errore (normale se utente non configurato)</h4>';
+                        html += `<pre style="background: #f5f5f7; padding: 10px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap;">${formatError(error)}</pre>`;
+                    }
+                } else {
+                    html += '<p style="margin-top: 15px; color: #86868b;">⚠️ Configura un User ID per testare gli schemas con dati reali.</p>';
+                }
+                
+                html += '</div>';
+                document.getElementById('enterprise-tests-status').innerHTML = html;
+            } catch (error) {
+                showStatus('enterprise-tests-status', formatError(error), 'error');
+            }
+        }
+        
+        // Debug Logs Functions
+        let autoRefreshInterval = null;
+        let autoRefreshEnabled = false;
+        
+        async function loadDebugLogs() {
+            const limit = parseInt(document.getElementById('log-limit').value) || 50;
+            const logsElement = document.getElementById('debug-logs');
+            
+            try {
+                const response = await fetch(`/api/v1/sync/debug-logs?limit=${limit}`);
+                const data = await response.json();
+                
+                if (data.error) {
+                    logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore: ${data.error}</div>`;
+                    return;
+                }
+                
+                if (!data.logs || data.logs.length === 0) {
+                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log disponibile</div>';
+                    return;
+                }
+                
+                // Format logs for display
+                let html = '';
+                data.logs.forEach((log, index) => {
+                    const timestamp = new Date(log.timestamp).toLocaleTimeString('it-IT');
+                    const runId = log.runId || 'unknown';
+                    const location = log.location || 'unknown';
+                    const message = log.message || '';
+                    const dataStr = log.data ? JSON.stringify(log.data, null, 2) : '';
+                    
+                    // Color coding by runId
+                    let color = '#86868b';
+                    if (runId === 'update') color = '#34a853';
+                    else if (runId === 'celery_task') color = '#4285f4';
+                    else if (runId === 'sync_update') color = '#fbbc04';
+                    else if (runId === 'sync') color = '#ea4335';
+                    else if (runId === 'get_inventory') color = '#9aa0a6';
+                    
+                    html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid ${color};">
+                        <div style="color: ${color}; font-weight: bold; margin-bottom: 4px;">
+                            [${timestamp}] ${runId.toUpperCase()} - ${location}
+                        </div>
+                        <div style="color: #f5f5f7; margin-bottom: 4px;">${message}</div>
+                        ${dataStr ? `<div style="color: #9aa0a6; font-size: 10px; margin-top: 4px; white-space: pre;">${dataStr}</div>` : ''}
+                    </div>`;
+                });
+                
+                logsElement.innerHTML = html;
+                // Auto-scroll to top (newest logs)
+                logsElement.scrollTop = 0;
+            } catch (error) {
+                logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore caricamento log: ${error.message}</div>`;
+            }
+        }
+        
+        function toggleAutoRefresh() {
+            const btn = document.getElementById('auto-refresh-btn');
+            autoRefreshEnabled = !autoRefreshEnabled;
+            
+            if (autoRefreshEnabled) {
+                btn.textContent = '⏸️ Auto-refresh ON';
+                btn.style.background = '#34a853';
+                autoRefreshInterval = setInterval(loadDebugLogs, 2000); // Refresh every 2 seconds
+                loadDebugLogs(); // Load immediately
+            } else {
+                btn.textContent = '▶️ Auto-refresh OFF';
+                btn.style.background = '';
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                }
+            }
+        }
+        
+        // ============================================
+        // WEBHOOK FUNCTIONS
+        // ============================================
+        let webhookAutoRefreshEnabled = false;
+        let webhookAutoRefreshInterval = null;
+        
+        function useConfiguredUserId() {
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            if (userId) {
+                document.getElementById('webhook-user-id').value = userId;
+                showStatus('webhook-status', `✅ User ID configurato: ${userId}`, 'success');
+            } else {
+                showStatus('webhook-status', '⚠️ Nessun User ID configurato. Configura prima l\'utente.', 'warning');
+            }
+        }
+        
+        async function getWebhookUrl() {
+            const userId = document.getElementById('webhook-user-id').value || 
+                          document.getElementById('user-id').value || 
+                          localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                showStatus('webhook-status', '❌ Inserisci un User ID', 'error');
+                return;
+            }
+            
+            try {
+                showStatus('webhook-status', '⏳ Caricamento URL webhook...', 'info');
+                
+                const response = await fetch(`/api/v1/sync/webhook-url/${userId}`);
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || data.message || 'Errore sconosciuto');
+                }
+                
+                // Mostra URL webhook
+                document.getElementById('webhook-url-input').value = data.webhook_url;
+                document.getElementById('webhook-url-display').style.display = 'block';
+                
+                // Mostra stato
+                const statusHtml = `
+                    <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
+                        <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ URL Webhook Ottenuto</div>
+                        <div style="font-size: 12px; color: #155724;">
+                            <strong>User ID:</strong> ${data.user_id}<br>
+                            <strong>Webhook Secret Configurato:</strong> ${data.webhook_secret_configured ? '✅ Sì' : '⚠️ No'}<br>
+                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745;">
+                                <strong>📋 Prossimi Passi:</strong><br>
+                                ${data.instructions.step_1}<br>
+                                ${data.instructions.step_2}<br>
+                                ${data.instructions.step_3}<br>
+                                ${data.instructions.step_4}
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('webhook-status').innerHTML = statusHtml;
+                
+                // Carica log webhook
+                loadWebhookLogs();
+                document.getElementById('webhook-logs').style.display = 'block';
+                
+                console.log('✅ Webhook URL ottenuto:', data);
+            } catch (error) {
+                console.error('❌ Errore ottenimento URL webhook:', error);
+                showStatus('webhook-status', `❌ Errore: ${error.message}`, 'error');
+            }
+        }
+        
+        function copyWebhookUrl() {
+            const input = document.getElementById('webhook-url-input');
+            input.select();
+            input.setSelectionRange(0, 99999);
+            
+            try {
+                document.execCommand('copy');
+                showStatus('webhook-status', '✅ URL copiato negli appunti!', 'success');
+                
+                const btn = event.target;
+                const originalText = btn.textContent;
+                btn.textContent = '✅ Copiato!';
+                btn.style.background = '#34a853';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = '#007aff';
+                }, 2000);
+            } catch (err) {
+                showStatus('webhook-status', '❌ Errore durante la copia', 'error');
+            }
+        }
+        
+        async function testWebhookConnection() {
+            const userId = document.getElementById('webhook-user-id').value || 
+                          document.getElementById('user-id').value || 
+                          localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                showStatus('webhook-status', '❌ Inserisci un User ID', 'error');
+                return;
+            }
+            
+            try {
+                showStatus('webhook-status', '⏳ Test connessione webhook...', 'info');
+                
+                const webhookUrl = document.getElementById('webhook-url-input').value;
+                if (!webhookUrl) {
+                    showStatus('webhook-status', '⚠️ Ottieni prima l\'URL webhook', 'warning');
+                    return;
+                }
+                
+                const testPayload = {
+                    id: `test-${Date.now()}`,
+                    time: Math.floor(Date.now() / 1000),
+                    cause: "order.create",
+                    object_class: "Order",
+                    object_id: 999999,
+                    mode: "test",
+                    data: {
+                        id: 999999,
+                        state: "paid",
+                        seller: { id: 12345 },
+                        order_items: [{ product_id: "392763065", quantity: 1 }]
+                    }
+                };
+                
+                const response = await fetch(webhookUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Signature': 'test-signature' },
+                    body: JSON.stringify(testPayload)
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const statusHtml = `
+                        <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
+                            <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ Test Webhook Completato</div>
+                            <div style="font-size: 12px; color: #155724;">
+                                <strong>Status:</strong> ${data.status}<br>
+                                <strong>Webhook ID:</strong> ${data.webhook_id || data.id || 'N/A'}<br>
+                                <strong>Tempo di Risposta:</strong> ${data.processing_time_ms || 'N/A'}ms<br>
+                                ${data.user_id ? `<strong>User ID:</strong> ${data.user_id}<br>` : ''}
+                            </div>
+                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745; font-size: 11px; color: #666;">
+                                <strong>Nota:</strong> Questo è un test. Il webhook reale verrà chiamato da CardTrader quando ci sono ordini o prodotti modificati.
+                            </div>
+                        </div>
+                    `;
+                    document.getElementById('webhook-status').innerHTML = statusHtml;
+                    console.log('✅ Test webhook completato:', data);
+                } else {
+                    throw new Error(data.message || data.detail || 'Errore sconosciuto');
+                }
+            } catch (error) {
+                console.error('❌ Errore test webhook:', error);
+                showStatus('webhook-status', `❌ Errore test: ${error.message}`, 'error');
+            }
+        }
+        
+        async function syncFromCardTrader() {
+            const userId = document.getElementById('webhook-user-id').value || 
+                          document.getElementById('user-id').value || 
+                          localStorage.getItem('brx_user_id');
+            
+            if (!userId) {
+                showStatus('webhook-status', '❌ Inserisci un User ID', 'error');
+                return;
+            }
+            
+            try {
+                showStatus('webhook-status', '⏳ Sincronizzazione da CardTrader in corso...', 'info');
+                
+                const response = await fetch(`/api/v1/sync/sync-from-cardtrader/${userId}`, { method: 'POST' });
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || data.message || 'Errore sconosciuto');
+                }
+                
+                const statusHtml = `
+                    <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
+                        <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ Sync da CardTrader Avviato</div>
+                        <div style="font-size: 12px; color: #155724;">
+                            <strong>Status:</strong> ${data.status}<br>
+                            <strong>Task ID:</strong> ${data.task_id}<br>
+                            <strong>User ID:</strong> ${data.user_id}<br>
+                            ${data.blueprint_id ? `<strong>Blueprint ID:</strong> ${data.blueprint_id}<br>` : ''}
+                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745;">
+                                <strong>ℹ️ Nota:</strong> La sincronizzazione è asincrona. Controlla i log per vedere lo stato.
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.getElementById('webhook-status').innerHTML = statusHtml;
+                loadWebhookLogs();
+                document.getElementById('webhook-logs').style.display = 'block';
+                console.log('✅ Sync da CardTrader avviato:', data);
+            } catch (error) {
+                console.error('❌ Errore sync da CardTrader:', error);
+                showStatus('webhook-status', `❌ Errore: ${error.message}`, 'error');
+            }
+        }
+        
+        async function loadWebhookLogs() {
+            const logsElement = document.getElementById('webhook-logs-content');
+            if (!logsElement) return;
+            
+            try {
+                const response = await fetch('/api/v1/sync/debug-logs?limit=100');
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.detail || 'Errore caricamento log');
+                }
+                
+                if (!data.logs || data.logs.length === 0) {
+                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log webhook disponibile</div>';
+                    return;
+                }
+                
+                const webhookLogs = data.logs.filter(log => 
+                    log.message && (
+                        log.message.toLowerCase().includes('webhook') ||
+                        log.message.toLowerCase().includes('order.create') ||
+                        log.message.toLowerCase().includes('order.update') ||
+                        log.message.toLowerCase().includes('order.destroy') ||
+                        (log.location && log.location.toLowerCase().includes('webhook'))
+                    )
+                );
+                
+                if (webhookLogs.length === 0) {
+                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log webhook disponibile. I log appariranno qui quando CardTrader invierà webhook.</div>';
+                    return;
+                }
+                
+                let html = '';
+                webhookLogs.slice(0, 50).forEach((log) => {
+                    const timestamp = new Date(log.timestamp).toLocaleTimeString('it-IT');
+                    const runId = log.runId || 'webhook';
+                    const location = log.location || 'unknown';
+                    const message = log.message || '';
+                    const dataStr = log.data ? JSON.stringify(log.data, null, 2) : '';
+                    
+                    let color = '#86868b';
+                    if (message.includes('accepted') || message.includes('processed')) color = '#34a853';
+                    else if (message.includes('error') || message.includes('failed')) color = '#ea4335';
+                    else if (message.includes('ignored')) color = '#fbbc04';
+                    else color = '#4285f4';
+                    
+                    html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid ${color};">
+                        <div style="color: ${color}; font-weight: bold; margin-bottom: 4px;">
+                            [${timestamp}] ${runId.toUpperCase()} - ${location}
+                        </div>
+                        <div style="color: #f5f5f7; margin-bottom: 4px;">${escapeHtml(message)}</div>
+                        ${dataStr ? `<div style="color: #9aa0a6; font-size: 10px; margin-top: 4px; white-space: pre; max-height: 200px; overflow-y: auto;">${escapeHtml(dataStr)}</div>` : ''}
+                    </div>`;
+                });
+                
+                logsElement.innerHTML = html;
+                logsElement.scrollTop = 0;
+            } catch (error) {
+                logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore caricamento log webhook: ${error.message}</div>`;
+            }
+        }
+        
+        function toggleWebhookAutoRefresh() {
+            const btn = document.getElementById('webhook-auto-refresh-btn');
+            webhookAutoRefreshEnabled = !webhookAutoRefreshEnabled;
+            
+            if (webhookAutoRefreshEnabled) {
+                btn.textContent = '⏸️ Auto-refresh ON';
+                btn.style.background = '#34a853';
+                webhookAutoRefreshInterval = setInterval(loadWebhookLogs, 3000);
+                loadWebhookLogs();
+            } else {
+                btn.textContent = '▶️ Auto-refresh OFF';
+                btn.style.background = '';
+                if (webhookAutoRefreshInterval) {
+                    clearInterval(webhookAutoRefreshInterval);
+                    webhookAutoRefreshInterval = null;
+                }
+            }
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Carica configurazione e log al caricamento pagina
+        window.addEventListener('DOMContentLoaded', () => {
+            loadConfig();
+            loadDebugLogs();
+            const userId = document.getElementById('user-id').value || localStorage.getItem('brx_user_id');
+            if (userId) {
+                document.getElementById('webhook-user-id').value = userId;
+            }
+        });
+    </script>
+</body>
+</html>
