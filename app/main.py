@@ -48,10 +48,16 @@ app = FastAPI(
 )
 
 # CORS middleware
-# In production, replace "*" with specific allowed origins
-allowed_origins = settings.ALLOWED_ORIGINS.split(",") if hasattr(settings, "ALLOWED_ORIGINS") else ["*"]
+# Parse ALLOWED_ORIGINS (comma-separated, no spaces around URLs)
+_raw = (settings.ALLOWED_ORIGINS or "").strip()
+allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()] if _raw else ["*"]
+# Always include Amplify frontend origin if not already present (avoid "Failed to fetch" from Amplify)
+_amplify_origin = "https://main.d8ry9s45st8bf.amplifyapp.com"
+if allowed_origins != ["*"] and _amplify_origin not in allowed_origins:
+    allowed_origins.append(_amplify_origin)
 if "*" in allowed_origins and settings.ENVIRONMENT == "production":
     logger.warning("CORS allow_origins is set to '*' in production! This is a security risk.")
+logger.info("CORS allowed_origins: %s", allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,6 +65,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 

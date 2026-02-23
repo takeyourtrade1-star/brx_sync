@@ -34,31 +34,30 @@ CHUNK_SIZE = 5000
 
 
 def _log_to_file(message: str, data: dict = None):
-    """Helper to log to file safely."""
+    """Helper to log to file safely. Disabled when SYNC_LOG_TO_FILE=False (recommended in production with many workers to avoid file contention)."""
+    from app.core.config import get_settings
+    if not get_settings().SYNC_LOG_TO_FILE:
+        return
     import json
     import os
     from datetime import datetime
-    
+
     log_file = os.path.join(
         os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-        'logs',
-        'brx_sync.log'
+        "logs",
+        "brx_sync.log",
     )
-    
-    # Create logs directory if it doesn't exist
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-    
     log_entry = {
         "timestamp": datetime.utcnow().isoformat(),
         "message": message,
-        "data": data or {}
+        "data": data or {},
     }
-    
     try:
-        with open(log_file, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry) + '\n')
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry) + "\n")
     except Exception:
-        pass  # Don't fail if logging fails
+        pass
 
 
 def run_async(coro):
@@ -98,8 +97,27 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
         Dict with sync results
     """
     user_uuid = uuid.UUID(user_id)
-    operation_id = str(uuid.uuid4())
-    
+    # Use Celery task id so GET /task/{task_id} can verify ownership via SyncOperation.operation_id
+    operation_id = self.request.id
+
+    # Create SyncOperation immediately so get_task_status can verify ownership before async work runs
+    from app.core.database import get_sync_db_engine
+    from sqlalchemy import text
+    try:
+        engine = get_sync_db_engine()
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO sync_operations (user_id, operation_id, operation_type, status)
+                    VALUES (CAST(:user_id AS uuid), :operation_id, 'bulk_sync', 'pending')
+                    ON CONFLICT (operation_id) DO NOTHING
+                """),
+                {"user_id": str(user_uuid), "operation_id": operation_id}
+            )
+    except Exception as e:
+        logger.warning(f"Could not pre-create SyncOperation for task {operation_id}: {e}")
+        # Continue anyway; async path will create it (may cause brief 403 on early polls)
+
     try:
         # Run async code in sync context - use helper to avoid event loop conflicts
         result = run_async(_initial_bulk_sync_async(user_uuid, operation_id))
@@ -172,15 +190,10 @@ async def _initial_bulk_sync_async(
         await session.execute(update_stmt)
         await session.commit()
         
-        # Create sync operation record
-        sync_op = SyncOperation(
-            user_id=user_uuid,
-            operation_id=operation_id,
-            operation_type="bulk_sync",
-            status="pending",
-        )
-        session.add(sync_op)
-        await session.commit()
+        # Load SyncOperation (created at task start) for progress/metadata updates
+        stmt_op = select(SyncOperation).where(SyncOperation.operation_id == operation_id)
+        res_op = await session.execute(stmt_op)
+        sync_op = res_op.scalar_one_or_none()
         
         try:
             # Initialize CardTrader client
@@ -236,17 +249,18 @@ async def _initial_bulk_sync_async(
                         )
                     
                     # Update progress in sync operation (using main session)
-                    progress_pct = int((batch_start + len(batch_chunks)) / total_chunks * 100)
-                    sync_op.operation_metadata = {
-                        "total_products": len(products),
-                        "total_chunks": total_chunks,
-                        "processed_chunks": batch_start + len(batch_chunks),
-                        "progress_percent": progress_pct,
-                        "processed": total_processed,
-                        "created": total_created,
-                        "updated": total_updated,
-                        "skipped": total_skipped,
-                    }
+                    if sync_op:
+                        progress_pct = int((batch_start + len(batch_chunks)) / total_chunks * 100)
+                        sync_op.operation_metadata = {
+                            "total_products": len(products),
+                            "total_chunks": total_chunks,
+                            "processed_chunks": batch_start + len(batch_chunks),
+                            "progress_percent": progress_pct,
+                            "processed": total_processed,
+                            "created": total_created,
+                            "updated": total_updated,
+                            "skipped": total_skipped,
+                        }
                     await session.commit()
                 
                 # Update sync status - use update statement with cast for PostgreSQL enum
@@ -264,16 +278,17 @@ async def _initial_bulk_sync_async(
                 )
                 await session.execute(update_stmt)
                 
-                # Update sync operation
-                sync_op.status = "completed"
-                sync_op.completed_at = datetime.utcnow()
-                sync_op.operation_metadata = {
-                    "total_products": len(products),
-                    "processed": total_processed,
-                    "created": total_created,
-                    "updated": total_updated,
-                    "skipped": total_skipped,
-                }
+                # Update sync operation (sync_op loaded above)
+                if sync_op:
+                    sync_op.status = "completed"
+                    sync_op.completed_at = datetime.utcnow()
+                    sync_op.operation_metadata = {
+                        "total_products": len(products),
+                        "processed": total_processed,
+                        "created": total_created,
+                        "updated": total_updated,
+                        "skipped": total_skipped,
+                    }
                 
                 await session.commit()
                 
@@ -301,8 +316,6 @@ async def _initial_bulk_sync_async(
                     )
                 )
                 await session.execute(update_stmt)
-                sync_op.status = "failed"
-                sync_op.completed_at = datetime.utcnow()
                 await session.commit()
             except Exception as update_error:
                 # If async update fails, use sync connection as fallback
@@ -362,6 +375,10 @@ async def _process_products_chunk(
         product_id = product.get("id")
         
         if not blueprint_id or not product_id:
+            logger.debug(
+                "Sync skip: prodotto senza blueprint_id o id (blueprint_id=%s, product_id=%s)",
+                blueprint_id, product_id
+            )
             skipped += 1
             continue
         
@@ -385,13 +402,20 @@ async def _process_products_chunk(
     # Step 2: Batch map blueprint_ids
     mappings = blueprint_mapper.batch_map_blueprint_ids(blueprint_ids)
     
-    # Step 3: Filter products that have valid blueprint mappings
+    # Step 3: Filter products that have valid blueprint mappings (escludi One Piece per ora)
     products_to_process = []
     for product in valid_products:
         blueprint_id = product["blueprint_id"]
-        if mappings.get(blueprint_id):
+        mapping = mappings.get(blueprint_id)
+        # mapping is (print_id, table_name); escludi op_prints (One Piece)
+        if mapping and mapping[1] != "op_prints":
             products_to_process.append(product)
         else:
+            reason = "One Piece (op_prints)" if mapping and mapping[1] == "op_prints" else "nessun mapping nel catalogo"
+            logger.info(
+                "Sync skip: blueprint_id=%s external_stock_id=%s — %s",
+                blueprint_id, product.get("external_stock_id"), reason
+            )
             skipped += 1
     
     if not products_to_process:
@@ -452,11 +476,19 @@ async def _process_products_chunk(
                     "created_at": now,
                     "updated_at": now,
                 })
+        from sqlalchemy import insert
+
         if items_to_insert:
-            await session.bulk_insert_mappings(UserInventoryItem, items_to_insert)
+            # Nuova sintassi per bulk insert in SQLAlchemy 2.0 Async
+            await session.execute(insert(UserInventoryItem), items_to_insert)
             created = len(items_to_insert)
+
         if items_to_update:
-            await session.bulk_update_mappings(UserInventoryItem, items_to_update)
+            # Nuova sintassi per bulk update in SQLAlchemy 2.0 Async
+            for item_data in items_to_update:
+                item_id = item_data.pop('id')
+                stmt = update(UserInventoryItem).where(UserInventoryItem.id == item_id).values(**item_data)
+                await session.execute(stmt)
             updated = len(items_to_update)
         # commit is done by get_isolated_db_session context
 
@@ -721,10 +753,6 @@ async def _sync_update_product_async(
             f"condition_from_db={item.properties.get('condition') if item.properties else None}"
         )
         
-        # #region agent log
-        import json; open('/Users/julianrovera/Desktop/EBARTEX_AWS_Terraform-MacBook/Main-app/backend/.cursor/debug.log', 'a').write(json.dumps({"runId":"sync_update","hypothesisId":"B","location":"sync_tasks.py:579","message":"Reading item in sync_update_product_async","data":{"item_id":item_id,"external_stock_id":item.external_stock_id,"external_stock_id_type":type(item.external_stock_id).__name__ if item.external_stock_id else None,"external_stock_id_repr":repr(item.external_stock_id)},"timestamp":int(__import__('time').time()*1000)})+'\n')
-        # #endregion
-        
         # Get user sync settings for token
         stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
         result = await session.execute(stmt)
@@ -833,18 +861,33 @@ async def _sync_update_product_async(
                         f"Played, Heavily Played, Poor"
                     )
             
-            # CRITICAL: Always include boolean properties (even if False)
-            # CardTrader needs explicit values for boolean properties
-            for bool_prop in ("mtg_foil", "signed", "altered"):
+            # Boolean properties: signed and altered can be sent as true or false.
+            # mtg_foil: CardTrader ignores "mtg_foil: false" ("Not allowed value false for mtg_foil has been ignored").
+            # To remove foil you must OMIT mtg_foil from the payload; send mtg_foil only when True.
+            for bool_prop in ("signed", "altered"):
                 if bool_prop in final_properties:
-                    # Ensure it's a boolean
                     value = final_properties[bool_prop]
                     if isinstance(value, bool):
-                        properties_to_send[bool_prop] = value
+                        bool_val = value
                     elif isinstance(value, str):
-                        properties_to_send[bool_prop] = value.lower() in ("true", "1", "yes", "on")
+                        bool_val = value.lower() in ("true", "1", "yes", "on")
                     else:
-                        properties_to_send[bool_prop] = bool(value)
+                        bool_val = bool(value)
+                    properties_to_send[bool_prop] = bool_val
+            if "mtg_foil" in final_properties:
+                value = final_properties["mtg_foil"]
+                if isinstance(value, bool):
+                    foil_val = value
+                elif isinstance(value, str):
+                    foil_val = value.lower() in ("true", "1", "yes", "on")
+                else:
+                    foil_val = bool(value)
+                if foil_val:
+                    properties_to_send["mtg_foil"] = True  # Only send when True
+                else:
+                    properties_to_send.pop("mtg_foil", None)  # Omit = non-foil (CardTrader ignores false)
+            elif properties_to_send.get("mtg_foil") is False:
+                properties_to_send.pop("mtg_foil", None)  # In case filter added it; never send false
             
             # CRITICAL: Always include mtg_language if present
             if "mtg_language" in final_properties:
@@ -862,7 +905,7 @@ async def _sync_update_product_async(
                 print(f"Condition value: {properties_to_send.get('condition')}")
                 print(f"Has signed: {'signed' in properties_to_send}")
                 print(f"Has altered: {'altered' in properties_to_send}")
-                print(f"Has mtg_foil: {'mtg_foil' in properties_to_send}")
+                print(f"mtg_foil: {'sent=True' if properties_to_send.get('mtg_foil') else 'omitted (non-foil)'}")
                 print(f"Has mtg_language: {'mtg_language' in properties_to_send}")
                 print(f"{'='*80}\n")
                 
@@ -875,7 +918,7 @@ async def _sync_update_product_async(
                     "signed_value": properties_to_send.get("signed"),
                     "has_altered": "altered" in properties_to_send,
                     "altered_value": properties_to_send.get("altered"),
-                    "has_mtg_foil": "mtg_foil" in properties_to_send,
+                    "mtg_foil_sent": "mtg_foil" in properties_to_send,
                     "mtg_foil_value": properties_to_send.get("mtg_foil"),
                     "has_mtg_language": "mtg_language" in properties_to_send,
                     "mtg_language_value": properties_to_send.get("mtg_language"),
@@ -887,7 +930,7 @@ async def _sync_update_product_async(
                     f"condition={properties_to_send.get('condition')}, "
                     f"signed={properties_to_send.get('signed')}, "
                     f"altered={properties_to_send.get('altered')}, "
-                    f"mtg_foil={properties_to_send.get('mtg_foil')}, "
+                    f"mtg_foil={'sent' if 'mtg_foil' in properties_to_send else 'omitted'}, "
                     f"mtg_language={properties_to_send.get('mtg_language')}"
                 )
             else:
@@ -915,13 +958,11 @@ async def _sync_update_product_async(
                     f"condition_value={final_properties.get('condition') if final_properties else None}"
                 )
         
-        # Ensure graded is not in properties (it's top-level only)
-        # If graded was in properties, it's already handled above as top-level
-        # Remove it from properties if present to avoid conflicts
-        if "properties" in update_data and "graded" in update_data.get("properties", {}):
-            del update_data["properties"]["graded"]
-            # If properties is now empty, remove it
-            if not update_data["properties"]:
+        # Ensure graded is not in properties (graded is top-level). Keep both foil and mtg_foil for CardTrader.
+        if "properties" in update_data:
+            props = update_data["properties"]
+            props.pop("graded", None)
+            if not props:
                 del update_data["properties"]
         
         # Update on CardTrader
@@ -943,80 +984,34 @@ async def _sync_update_product_async(
                 "job_result": job_result
             })
             
-            # Poll job status until completion (max 30 seconds, 1 second intervals)
+            # No polling: CardTrader rate limit (429) su GET job status allunga la sync di ~13s.
+            # Ritorniamo subito dopo 202 Accepted; l'update è in coda su CardTrader e viene processato.
             if job_uuid:
-                _log_to_file("Starting job status polling", {
-                    "item_id": item_id,
-                    "job_uuid": job_uuid
-                })
-                
-                max_polls = 30
-                poll_interval = 1.0
-                job_state = "unknown"
-                
-                for poll_count in range(max_polls):
-                    await asyncio.sleep(poll_interval)
-                    job_status = await client.get_job_status(job_uuid)
-                    job_state = job_status.get("state", "unknown")
-                    
-                    _log_to_file("Job status poll result", {
-                        "item_id": item_id,
-                        "job_uuid": job_uuid,
-                        "poll_count": poll_count + 1,
-                        "job_state": job_state,
-                        "job_status": job_status
-                    })
-                    
-                    if job_state == "completed":
-                        _log_to_file("Job completed successfully", {
-                            "item_id": item_id,
-                            "job_uuid": job_uuid,
-                            "poll_count": poll_count + 1
-                        })
-                        break
-                    elif job_state in ("failed", "error"):
-                        error_msg = job_status.get("error", "Unknown error")
-                        _log_to_file("Job failed", {
-                            "item_id": item_id,
-                            "job_uuid": job_uuid,
-                            "job_state": job_state,
-                            "error": error_msg
-                        })
-                        raise ValueError(f"CardTrader job {job_uuid} failed: {error_msg}")
-                else:
-                    # Timeout - job still processing
-                    _log_to_file("Job polling timeout", {
-                        "item_id": item_id,
-                        "job_uuid": job_uuid,
-                        "max_polls": max_polls,
-                        "final_state": job_state
-                    })
-                    logger.warning(
-                        f"CardTrader job {job_uuid} still processing after {max_polls} polls. "
-                        f"Update may still be in progress."
-                    )
-            
                 logger.info(
                     f"Product update synced to CardTrader: item_id={item_id}, "
                     f"external_stock_id={item.external_stock_id}, job={job_uuid}"
                 )
-                
+                _log_to_file("Product update queued (no poll)", {
+                    "item_id": item_id,
+                    "job_uuid": job_uuid,
+                })
                 result = {
                     "status": "synced",
                     "item_id": item_id,
                     "external_stock_id": item.external_stock_id,
                     "job_uuid": job_uuid,
-                    "message": "Update queued on CardTrader"
+                    "message": "Update queued on CardTrader",
                 }
-                
-                _log_to_file("Product update synced successfully", {
-                    "item_id": item_id,
-                    "external_stock_id": item.external_stock_id,
-                    "job_uuid": job_uuid,
-                    "result": result
-                })
-                
                 return result
+
+            result = {
+                "status": "synced",
+                "item_id": item_id,
+                "external_stock_id": item.external_stock_id,
+                "job_uuid": None,
+                "message": "Update sent to CardTrader",
+            }
+            return result
 
 
 @celery_app.task(bind=True, max_retries=5, default_retry_delay=30)
@@ -1091,10 +1086,11 @@ async def _sync_delete_product_async(
                     "external_stock_id": external_stock_id
                 })
                 
-                await client.delete_product(external_stock_id)
+                delete_response = await client.delete_product(external_stock_id)
+                # delete_response is a dict from the API (or empty dict if no body)
+                response_data = delete_response if isinstance(delete_response, dict) else {}
                 
-                # Check if product was already deleted (404 handled gracefully)
-                if result.get("status") == "already_deleted":
+                if response_data.get("status") == "already_deleted":
                     logger.info(
                         f"Product {external_stock_id} was already deleted on CardTrader. "
                         f"Sync completed successfully."
@@ -1115,8 +1111,8 @@ async def _sync_delete_product_async(
                 return {
                     "status": "success",
                     "external_stock_id": external_stock_id,
-                    "message": result.get("message", "Product deleted from CardTrader"),
-                    "already_deleted": result.get("status") == "already_deleted"
+                    "message": response_data.get("message", "Product deleted from CardTrader"),
+                    "already_deleted": response_data.get("status") == "already_deleted"
                 }
         except CardTraderAPIError as e:
             # Check if it's a 404 error (product not found)

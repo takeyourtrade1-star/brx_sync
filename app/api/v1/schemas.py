@@ -4,9 +4,18 @@ Pydantic schemas for API request/response models.
 All schemas include validation, examples, and descriptions for OpenAPI documentation.
 """
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class DisconnectSyncRequest(BaseModel):
+    """Request schema for disconnecting/suspending CardTrader sync."""
+
+    action: Literal["suspend", "remove"] = Field(
+        "suspend",
+        description="suspend = set status to idle (keep token); remove = set idle and clear token/webhook",
+    )
 
 
 # Request Schemas
@@ -152,11 +161,15 @@ class SetupTestUserRequest(BaseModel):
 
 class SyncStatusResponse(BaseModel):
     """Response schema for sync status."""
-    
+
     user_id: str = Field(..., description="User UUID")
     sync_status: str = Field(..., description="Current sync status")
     last_sync_at: Optional[str] = Field(None, description="Last sync timestamp (ISO format)")
     last_error: Optional[str] = Field(None, description="Last error message if any")
+    disconnected: Optional[bool] = Field(
+        None,
+        description="True if CardTrader link was removed (no token); re-configure to sync again",
+    )
     
     class Config:
         """Pydantic config."""
@@ -291,6 +304,14 @@ class UpdateInventoryItemResponse(BaseModel):
         ...,
         description="Whether item has external_stock_id (for debugging)",
     )
+    sync_queue_error: Optional[str] = Field(
+        None,
+        description="Error message if sync to CardTrader could not be queued (e.g. worker unavailable)",
+    )
+    sync_task_id: Optional[str] = Field(
+        None,
+        description="Celery task ID to poll for sync completion (only when cardtrader_sync_queued=True)",
+    )
 
 
 class DeleteInventoryItemResponse(BaseModel):
@@ -306,6 +327,32 @@ class DeleteInventoryItemResponse(BaseModel):
         None,
         description="CardTrader product ID that was deleted",
     )
+    sync_queue_error: Optional[str] = Field(
+        None,
+        description="Error message if sync to CardTrader could not be queued",
+    )
+    sync_task_id: Optional[str] = Field(
+        None,
+        description="Celery task ID to poll for sync completion (only when cardtrader_sync_queued=True)",
+    )
+
+
+class ListingItemResponse(BaseModel):
+    """Single listing (item for sale) for marketplace by blueprint."""
+    item_id: int = Field(..., description="Inventory item ID")
+    seller_id: str = Field(..., description="Seller user UUID")
+    seller_display_name: str = Field(..., description="Display name for seller (e.g. Venditore #abc12345)")
+    country: Optional[str] = Field(None, description="Seller country code (IT, DE, etc.)")
+    quantity: int = Field(..., description="Available quantity")
+    price_cents: int = Field(..., description="Price in cents")
+    condition: Optional[str] = Field(None, description="Condition (e.g. Near Mint)")
+    mtg_language: Optional[str] = Field(None, description="Language code (e.g. en, it)")
+
+
+class ListingsByBlueprintResponse(BaseModel):
+    """Listings for a given blueprint (card/print) from all sellers."""
+    blueprint_id: int = Field(..., description="CardTrader blueprint ID")
+    listings: List[ListingItemResponse] = Field(default_factory=list, description="List of listings")
 
 
 class PurchaseItemRequest(BaseModel):

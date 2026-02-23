@@ -14,8 +14,11 @@ from sqlalchemy.orm import selectinload
 
 from app.api.v1.schemas import (
     DeleteInventoryItemResponse,
+    DisconnectSyncRequest,
     InventoryItemResponse,
     InventoryResponse,
+    ListingItemResponse,
+    ListingsByBlueprintResponse,
     PurchaseItemRequest,
     PurchaseItemResponse,
     SetupTestUserRequest,
@@ -102,7 +105,7 @@ async def apply_composite_index_migration(
 async def start_sync(
     user_id: str,
     force: bool = False,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> SyncStartResponse:
     """
@@ -130,6 +133,24 @@ async def start_sync(
     
     if not sync_settings:
         raise SyncNotFoundError(user_id=user_id)
+
+    # Reject if CardTrader link was removed (empty token)
+    try:
+        from app.core.crypto import get_encryption_manager
+        enc = get_encryption_manager()
+        token = enc.decrypt(sync_settings.cardtrader_token_encrypted)
+        if not (token and token.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Collegamento CardTrader non configurato. Inserisci il token nello Step 1 e salva.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Collegamento CardTrader non configurato. Inserisci il token nello Step 1 e salva.",
+        )
     
     # Check if sync is already in progress (unless force=True)
     if not force:
@@ -253,7 +274,7 @@ async def get_task_status(
 @router.get("/progress/{user_id}")
 async def get_sync_progress(
     user_id: str,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
@@ -324,7 +345,7 @@ async def get_sync_progress(
 @router.get("/status/{user_id}")
 async def get_sync_status(
     user_id: str,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> SyncStatusResponse:
     """
@@ -354,12 +375,105 @@ async def get_sync_status(
             detail=f"User {user_id} not found in sync settings"
         )
     
+    # Check if token was cleared (disconnected)
+    disconnected = False
+    try:
+        from app.core.crypto import get_encryption_manager
+        enc = get_encryption_manager()
+        token = enc.decrypt(sync_settings.cardtrader_token_encrypted)
+        if not (token and token.strip()):
+            disconnected = True
+    except Exception:
+        disconnected = True
+
     return SyncStatusResponse(
         user_id=user_id,
         sync_status=sync_settings.sync_status.value if hasattr(sync_settings.sync_status, 'value') else str(sync_settings.sync_status),
         last_sync_at=sync_settings.last_sync_at.isoformat() if sync_settings.last_sync_at else None,
         last_error=sync_settings.last_error,
+        disconnected=disconnected if disconnected else None,
     )
+
+
+@router.post("/disconnect/{user_id}", status_code=status.HTTP_200_OK)
+async def disconnect_sync(
+    user_id: str,
+    body: DisconnectSyncRequest,
+    verified_user_id: str = Depends(verify_user_id_match),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """
+    Suspend or remove CardTrader sync for the user.
+
+    - suspend: set sync_status to idle (keeps token; user can start sync again).
+    - remove: set sync_status to idle and clear token/webhook (user must re-enter token).
+    """
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid user_id format",
+        )
+
+    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
+    result = await session.execute(stmt)
+    sync_settings = result.scalar_one_or_none()
+
+    if not sync_settings:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User {user_id} not found in sync settings",
+        )
+
+    from sqlalchemy import text
+
+    if body.action == "suspend":
+        conn = await session.connection()
+        await conn.execute(
+            text("""
+                UPDATE user_sync_settings
+                SET sync_status = CAST(:status AS sync_status_enum),
+                    updated_at = NOW()
+                WHERE user_id = CAST(:user_id AS uuid)
+            """),
+            {"status": SyncStatusEnum.IDLE.value, "user_id": str(user_uuid)},
+        )
+        await session.commit()
+        return {
+            "status": "success",
+            "message": "Sincronizzazione sospesa. Puoi riavviarla quando vuoi.",
+            "action": "suspend",
+            "sync_status": SyncStatusEnum.IDLE.value,
+        }
+    else:
+        # remove: clear token and webhook
+        from app.core.crypto import get_encryption_manager
+        enc = get_encryption_manager()
+        empty_token_encrypted = enc.encrypt("")
+        conn = await session.connection()
+        await conn.execute(
+            text("""
+                UPDATE user_sync_settings
+                SET sync_status = CAST(:status AS sync_status_enum),
+                    cardtrader_token_encrypted = :token,
+                    webhook_secret = NULL,
+                    updated_at = NOW()
+                WHERE user_id = CAST(:user_id AS uuid)
+            """),
+            {
+                "status": SyncStatusEnum.IDLE.value,
+                "token": empty_token_encrypted,
+                "user_id": str(user_uuid),
+            },
+        )
+        await session.commit()
+        return {
+            "status": "success",
+            "message": "Collegamento CardTrader rimosso. Inserisci di nuovo il token per sincronizzare.",
+            "action": "remove",
+            "sync_status": SyncStatusEnum.IDLE.value,
+        }
 
 
 @router.post("/webhook/user/{user_id}", status_code=status.HTTP_200_OK)
@@ -539,7 +653,7 @@ async def receive_webhook_legacy(
 async def get_webhook_url(
     user_id: str,
     request: Request,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
@@ -721,7 +835,7 @@ async def setup_test_user(
 async def delete_inventory_item(
     user_id: str,
     item_id: int,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> DeleteInventoryItemResponse:
     """
@@ -761,26 +875,41 @@ async def delete_inventory_item(
     await session.commit()
     
     # Queue async sync to CardTrader (if external_stock_id exists)
+    delete_sync_queued = False
+    delete_sync_queue_error = None
+    delete_sync_task_id = None
     if external_stock_id:
         try:
-            # Pass external_stock_id directly since item is already deleted
-            sync_delete_product_to_cardtrader.delay(user_id, int(external_stock_id))
+            task_result = sync_delete_product_to_cardtrader.delay(user_id, int(external_stock_id))
+            delete_sync_task_id = task_result.id
+            delete_sync_queued = True
+            # Register task so get_task_status can verify ownership when frontend polls
+            sync_op = SyncOperation(
+                user_id=user_uuid,
+                operation_id=task_result.id,
+                operation_type="sync_delete",
+                status="pending",
+            )
+            session.add(sync_op)
+            await session.commit()
             logger.info(
                 f"Queued CardTrader deletion sync for item {item_id}, "
-                f"external_stock_id {external_stock_id}"
+                f"external_stock_id {external_stock_id}, task_id={task_result.id}"
             )
         except Exception as sync_error:
             logger.error(
                 f"Failed to queue CardTrader deletion sync: {sync_error}",
                 exc_info=True
             )
-            # Don't fail the request if sync queue fails
+            delete_sync_queue_error = str(sync_error)
     
     return DeleteInventoryItemResponse(
         status="deleted",
         item_id=item_id,
-        cardtrader_sync_queued=external_stock_id is not None,
+        cardtrader_sync_queued=delete_sync_queued,
         external_stock_id=external_stock_id,
+        sync_queue_error=delete_sync_queue_error,
+        sync_task_id=delete_sync_task_id,
     )
 
 
@@ -793,7 +922,7 @@ async def purchase_item(
     user_id: str,
     item_id: int,
     request: PurchaseItemRequest,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> PurchaseItemResponse:
     """
@@ -872,28 +1001,28 @@ async def purchase_item(
                 if sync_settings:
                     encryption_manager = get_encryption_manager()
                     token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
-                    
-                    # Check availability on CardTrader (outside transaction)
-                    async with CardTraderClient(token, user_id) as client:
-                        availability = await client.check_product_availability(external_stock_id_str)
-                        cardtrader_quantity = availability.get("quantity", 0)
-                        
-                        # Update local DB with CardTrader quantity (new transaction)
-                        async with session.begin():
-                            stmt = (
-                                select(UserInventoryItem)
-                                .where(
-                                    UserInventoryItem.id == item_id,
-                                    UserInventoryItem.user_id == user_uuid
+                    if token and token.strip():
+                        # Check availability on CardTrader (outside transaction)
+                        async with CardTraderClient(token, user_id) as client:
+                            availability = await client.check_product_availability(external_stock_id_str)
+                            cardtrader_quantity = availability.get("quantity", 0)
+                            
+                            # Update local DB with CardTrader quantity (new transaction)
+                            async with session.begin():
+                                stmt = (
+                                    select(UserInventoryItem)
+                                    .where(
+                                        UserInventoryItem.id == item_id,
+                                        UserInventoryItem.user_id == user_uuid
+                                    )
                                 )
-                            )
-                            result = await session.execute(stmt)
-                            item = result.scalar_one_or_none()
-                            if item:
-                                item.quantity = cardtrader_quantity
-                                await session.commit()
-                        
-                        available_quantity = cardtrader_quantity
+                                result = await session.execute(stmt)
+                                item = result.scalar_one_or_none()
+                                if item:
+                                    item.quantity = cardtrader_quantity
+                                    await session.commit()
+                            
+                            available_quantity = cardtrader_quantity
             except Exception as e:
                 logger.error(f"Error syncing from CardTrader during purchase: {e}")
                 available_quantity = quantity_before
@@ -948,11 +1077,16 @@ async def purchase_item(
         
         encryption_manager = get_encryption_manager()
         token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
-        
+        if not (token and token.strip()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Collegamento CardTrader non configurato. Configura il token nella pagina Sincronizzazione.",
+            )
+
         # Step 4: Check availability and update CardTrader (OUTSIDE transaction)
         cardtrader_updated = False
         cardtrader_quantity_after = None
-        
+
         async with CardTraderClient(token, user_id) as client:
             availability = await client.check_product_availability(external_stock_id_str)
             cardtrader_quantity = availability.get("quantity", 0)
@@ -1123,7 +1257,7 @@ async def update_inventory_item(
     user_id: str,
     item_id: int,
     update_data: UpdateInventoryItemRequest,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> UpdateInventoryItemResponse:
     """
@@ -1338,6 +1472,8 @@ async def update_inventory_item(
         quantity_changed or price_changed or properties_changed or 
         description_changed or user_data_field_changed or graded_changed
     )
+    sync_queue_error = None
+    sync_task_id = None
     
     # Log for debugging
     logger.info(
@@ -1364,6 +1500,16 @@ async def update_inventory_item(
                 graded=None,
                 properties=None,
             )
+            sync_task_id = task_result.id
+            # Register task so get_task_status can verify ownership when frontend polls
+            sync_op = SyncOperation(
+                user_id=user_uuid,
+                operation_id=task_result.id,
+                operation_type="sync_update",
+                status="pending",
+            )
+            session.add(sync_op)
+            await session.commit()
             logger.info(
                 f"Queued CardTrader update sync for item {item_id}, "
                 f"external_stock_id {item.external_stock_id}, "
@@ -1377,7 +1523,8 @@ async def update_inventory_item(
                 f"Failed to queue CardTrader update sync: {sync_error}",
                 exc_info=True
             )
-            # Don't fail the request if sync queue fails
+            sync_needed = False
+            sync_queue_error = str(sync_error)
     
     return UpdateInventoryItemResponse(
         status="updated",
@@ -1391,13 +1538,63 @@ async def update_inventory_item(
         cardtrader_sync_queued=sync_needed,
         external_stock_id=item.external_stock_id,
         has_external_id=has_external_id,
+        sync_queue_error=sync_queue_error,
+        sync_task_id=sync_task_id,
     )
+@router.get(
+    "/listings/blueprint/{blueprint_id}",
+    response_model=ListingsByBlueprintResponse,
+    summary="Listings by blueprint (public)",
+)
+async def get_listings_by_blueprint(
+    blueprint_id: int,
+    limit: int = 100,
+    session: AsyncSession = Depends(get_db_session),
+) -> ListingsByBlueprintResponse:
+    """
+    Get all listings (items for sale) for a given blueprint (card/print).
+    Public endpoint: no auth required. Returns sellers who have this print in inventory with quantity > 0.
+    """
+    limit = min(max(1, limit), 200)
+    stmt = (
+        select(UserInventoryItem)
+        .where(
+            UserInventoryItem.blueprint_id == blueprint_id,
+            UserInventoryItem.quantity > 0,
+        )
+        .order_by(UserInventoryItem.price_cents.asc())
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    items = result.scalars().all()
+    listings: List[ListingItemResponse] = []
+    for item in items:
+        props = item.properties or {}
+        condition = props.get("condition") if isinstance(props.get("condition"), str) else None
+        mtg_lang = props.get("mtg_language") if isinstance(props.get("mtg_language"), str) else None
+        seller_id_str = str(item.user_id)
+        display_name = f"Venditore #{seller_id_str[:8]}"
+        listings.append(
+            ListingItemResponse(
+                item_id=item.id,
+                seller_id=seller_id_str,
+                seller_display_name=display_name,
+                country=None,
+                quantity=item.quantity,
+                price_cents=item.price_cents,
+                condition=condition,
+                mtg_language=mtg_lang,
+            )
+        )
+    return ListingsByBlueprintResponse(blueprint_id=blueprint_id, listings=listings)
+
+
 @router.get("/inventory/{user_id}", response_model=InventoryResponse)
 async def get_inventory(
     user_id: str,
     limit: int = 100,
     offset: int = 0,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> InventoryResponse:
     """
@@ -1467,7 +1664,7 @@ async def get_inventory(
 async def trigger_sync_from_cardtrader(
     user_id: str,
     blueprint_id: Optional[int] = None,
-    verified_user_id: str = Depends(verify_user_id_match(user_id)),
+    verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """

@@ -113,6 +113,12 @@ class Settings(BaseSettings):
         default=None, description="Celery result backend (defaults to REDIS_URL)"
     )
 
+    # Scalability: disable sync file logging in production (many workers = contention on one file)
+    SYNC_LOG_TO_FILE: bool = Field(
+        default=True,
+        description="If False, skip _log_to_file() in sync tasks (use logger only). Set to False in production with many Celery workers.",
+    )
+
     @field_validator("DATABASE_URL")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

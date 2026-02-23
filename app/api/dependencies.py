@@ -117,46 +117,32 @@ async def get_current_user_id(
     return str(user_id)
 
 
-def verify_user_id_match(user_id_from_path: str):
+async def verify_user_id_match(
+    user_id: str,  # FastAPI injects this from the URL path at request time
+    user_id_from_token: str = Depends(get_current_user_id),
+) -> str:
     """
-    Dependency factory to verify that user_id from JWT token matches user_id from URL path.
-    
-    This prevents users from accessing other users' resources.
-    
-    Usage:
-        @router.get("/inventory/{user_id}")
-        async def get_inventory(
-            user_id: str,
-            verified_user_id: str = Depends(verify_user_id_match(user_id)),
-        ):
-            # verified_user_id is guaranteed to match user_id from path
+    Verify that user_id from JWT token matches user_id from URL path.
+    Use as: Depends(verify_user_id_match) (no parentheses with user_id).
     """
-    async def _verify(
-        user_id_from_token: str = Depends(get_current_user_id),
-    ) -> str:
-        # Normalize UUIDs for comparison (handle both UUID and string formats)
-        try:
-            token_uuid = UUID(user_id_from_token)
-            path_uuid = UUID(user_id_from_path)
-            if token_uuid != path_uuid:
-                logger.warning(
-                    f"User ID mismatch: token={user_id_from_token}, path={user_id_from_path}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: User ID mismatch",
-                )
-        except ValueError:
-            # If not UUIDs, compare as strings
-            if user_id_from_token != user_id_from_path:
-                logger.warning(
-                    f"User ID mismatch: token={user_id_from_token}, path={user_id_from_path}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: User ID mismatch",
-                )
-        
-        return user_id_from_token
-    
-    return _verify
+    try:
+        token_uuid = UUID(user_id_from_token)
+        path_uuid = UUID(user_id)
+        if token_uuid != path_uuid:
+            logger.warning(
+                f"User ID mismatch: token={user_id_from_token}, path={user_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: User ID mismatch",
+            )
+    except ValueError:
+        if user_id_from_token != user_id:
+            logger.warning(
+                f"User ID mismatch: token={user_id_from_token}, path={user_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied: User ID mismatch",
+            )
+    return user_id_from_token
