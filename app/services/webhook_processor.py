@@ -53,25 +53,36 @@ class WebhookProcessor:
         cause = payload.get("cause", "")
         data = payload.get("data", {})
         mode = payload.get("mode", "live")
-        
+
         # If user_id not provided, try to extract from payload
         if not user_id:
             if isinstance(data, dict):
                 seller = data.get("seller", {})
                 if isinstance(seller, dict) and seller.get("id"):
                     user_id = str(seller.get("id"))
-        
+
         logger.info(
             f"Processing webhook {webhook_id}: cause={cause}, mode={mode}, user_id={user_id}"
         )
-        
+
+        # Webhook di test di CardTrader: non devono mai toccare l'inventario reale.
+        if str(mode).lower() == "test":
+            logger.info(f"Webhook {webhook_id} mode=test: ignorato (nessuna modifica inventario reale)")
+            return {"status": "ignored", "webhook_id": webhook_id, "reason": "test mode"}
+
+        # Idempotenza: se questo webhook è già stato applicato con successo, non
+        # riapplicare il delta (i retry CardTrader/Celery non devono decrementare due volte).
+        if await self._already_processed(webhook_id):
+            logger.info(f"Webhook {webhook_id} già processato: skip idempotente")
+            return {"status": "duplicate", "webhook_id": webhook_id, "reason": "already processed"}
+
         # Handle different webhook causes
         if cause == "order.create":
-            return await self._handle_order_create(webhook_id, data, user_id)
+            result = await self._handle_order_create(webhook_id, data, user_id)
         elif cause == "order.update":
-            return await self._handle_order_update(webhook_id, data, user_id)
+            result = await self._handle_order_update(webhook_id, data, user_id)
         elif cause == "order.destroy":
-            return await self._handle_order_destroy(webhook_id, data, user_id)
+            result = await self._handle_order_destroy(webhook_id, data, user_id)
         else:
             return {
                 "status": "ignored",
@@ -79,6 +90,40 @@ class WebhookProcessor:
                 "cause": cause,
                 "reason": "Unsupported webhook cause"
             }
+
+        # Marca come processato solo dopo applicazione riuscita del delta.
+        if isinstance(result, dict) and result.get("status") not in ("error", "failed"):
+            await self._mark_processed(webhook_id)
+        return result
+
+    # Marker idempotenza in Redis (fail-open: se Redis è giù, si processa —
+    # un duplicato è meno grave di un ordine reale perso). TTL 7 giorni.
+    _DEDUP_TTL_SECONDS = 7 * 24 * 3600
+
+    async def _already_processed(self, webhook_id: str) -> bool:
+        if not webhook_id or webhook_id == "unknown":
+            return False
+        try:
+            from app.core.redis_client import get_redis
+            redis = await get_redis()
+            if redis is None:
+                return False
+            return bool(await redis.get(f"webhook:done:{webhook_id}"))
+        except Exception as exc:
+            logger.warning(f"Dedup check non disponibile per {webhook_id}: {exc}")
+            return False
+
+    async def _mark_processed(self, webhook_id: str) -> None:
+        if not webhook_id or webhook_id == "unknown":
+            return
+        try:
+            from app.core.redis_client import get_redis
+            redis = await get_redis()
+            if redis is None:
+                return
+            await redis.set(f"webhook:done:{webhook_id}", "1", ex=self._DEDUP_TTL_SECONDS)
+        except Exception as exc:
+            logger.warning(f"Impossibile marcare webhook {webhook_id} come processato: {exc}")
     
     async def _handle_order_create(
         self,

@@ -537,24 +537,33 @@ async def receive_webhook(
         # Extract webhook_id from payload
         webhook_id = payload.get("id", "unknown")
         
-        # Validate signature using user's shared_secret
+        # Validazione firma OBBLIGATORIA (fail-closed): senza secret o con firma
+        # non valida il webhook viene rifiutato e NON accodato. Evita che chiunque
+        # conosca l'URL possa alterare le quantità di inventario.
         shared_secret = sync_settings.webhook_secret
-        if shared_secret and signature_header:
-            try:
-                verify_webhook(body, signature_header, shared_secret)
-                logger.debug(f"Webhook signature validated for user {user_id}")
-            except WebhookValidationError as e:
-                logger.warning(
-                    f"Webhook signature validation failed for user {user_id}: {e}"
-                )
-                # In production, you might want to reject invalid signatures
-                # For now, we'll still process but log the warning
-        elif not shared_secret:
-            logger.warning(
-                f"No webhook_secret configured for user {user_id}. "
-                f"Webhook will be processed without signature validation."
+        if not shared_secret:
+            logger.error(
+                f"Webhook rifiutato: nessun webhook_secret per user {user_id}. "
+                f"L'utente deve ricollegare CardTrader."
             )
-        
+            return {
+                "status": "rejected",
+                "user_id": user_id,
+                "message": "Webhook secret not configured; re-link CardTrader",
+            }
+        try:
+            verify_webhook(body, signature_header, shared_secret)
+        except WebhookValidationError as e:
+            logger.warning(
+                f"Webhook rifiutato: firma non valida per user {user_id}: {e}"
+            )
+            return {
+                "status": "rejected",
+                "user_id": user_id,
+                "webhook_id": webhook_id,
+                "message": "Invalid webhook signature",
+            }
+
         # Queue async processing with user_id
         process_webhook_notification.delay(webhook_id, payload, str(user_uuid))
         
@@ -598,55 +607,19 @@ async def receive_webhook_legacy(
     Returns:
         Acknowledgment response
     """
-    start_time = time.time()
-    
-    try:
-        # Get raw body for signature validation
-        body = await request.body()
-        
-        # Get signature header
-        signature_header = request.headers.get("Signature", "")
-        
-        # Get webhook payload
-        payload = await request.json()
-        
-        # Extract user_id from payload (fallback method)
-        data = payload.get("data", {})
-        user_id_str = None
-        
-        # Try to extract seller ID from order
-        if isinstance(data, dict):
-            seller = data.get("seller", {})
-            if isinstance(seller, dict):
-                user_id_str = str(seller.get("id", "")) if seller.get("id") else None
-        
-        if not user_id_str:
-            logger.warning(
-                f"Could not extract user_id from webhook {webhook_id}. "
-                f"Payload structure: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}"
-            )
-            # Still process, but without user-specific validation
-            process_webhook_notification.delay(webhook_id, payload, None)
-        else:
-            # Process with extracted user_id
-            process_webhook_notification.delay(webhook_id, payload, user_id_str)
-        
-        elapsed = (time.time() - start_time) * 1000  # milliseconds
-        logger.info(f"Webhook {webhook_id} acknowledged in {elapsed:.2f}ms")
-        
-        return {
-            "status": "accepted",
-            "webhook_id": webhook_id,
-            "processing_time_ms": round(elapsed, 2),
-        }
-        
-    except Exception as e:
-        logger.error(f"Error processing webhook {webhook_id}: {e}", exc_info=True)
-        return {
-            "status": "error",
-            "webhook_id": webhook_id,
-            "message": str(e),
-        }
+    # Endpoint legacy non firmabile: non esiste modo di risolvere il webhook_secret
+    # dell'utente dal payload, quindi la firma non è verificabile. Per sicurezza
+    # (fail-closed) NON viene più processato. L'URL fornito agli utenti è sempre
+    # /webhook/user/{user_id}. Se questo log compare, un utente va ricollegato lì.
+    logger.error(
+        f"Webhook legacy rifiutato (non validabile): webhook_id={webhook_id}. "
+        f"Riconfigurare l'URL su /api/v1/sync/webhook/user/{{user_id}}."
+    )
+    return {
+        "status": "rejected",
+        "webhook_id": webhook_id,
+        "message": "Legacy webhook endpoint disabled; reconfigure to /webhook/user/{user_id}",
+    }
 
 
 @router.get("/webhook-url/{user_id}")
