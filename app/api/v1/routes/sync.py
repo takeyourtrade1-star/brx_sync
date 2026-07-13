@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -924,41 +924,74 @@ async def purchase_item(
             detail="Invalid user_id format"
         )
     
-    # SAGA PATTERN: Split transaction to avoid long locks with external API calls
-    # Step 1: Lock DB and verify availability (SHORT transaction)
+    # PRENOTAZIONE ATOMICA (anti doppia vendita): il decremento locale avviene
+    # subito, in transazione breve, con condizione quantity >= richiesta.
+    # CardTrader viene chiamato DOPO, fuori da ogni lock; su fallimento la
+    # prenotazione viene ripristinata. Due acquisti concorrenti non possono
+    # più vendere lo stesso stock (UPDATE condizionale, niente read-then-write).
+    reservation_open = False
+    quantity_after_reserve: Optional[int] = None
     async with session.begin():
-        # Lock row to prevent concurrent purchases
-        stmt = (
-            select(UserInventoryItem)
-            .where(
-                UserInventoryItem.id == item_id,
-                UserInventoryItem.user_id == user_uuid
-            )
-            .with_for_update()  # Row-level lock
+        stmt = select(UserInventoryItem).where(
+            UserInventoryItem.id == item_id,
+            UserInventoryItem.user_id == user_uuid,
         )
         result = await session.execute(stmt)
         item = result.scalar_one_or_none()
-        
+
         if not item:
             raise InventoryItemNotFoundError(item_id=item_id, user_id=user_id)
-        
+
         quantity_before = item.quantity
         external_stock_id_str = str(item.external_stock_id) if item.external_stock_id else None
-        
-        # Check local DB availability
-        if item.quantity < purchase_quantity:
-            logger.info(
-                f"Purchase failed: Item {item_id} has quantity {item.quantity} in local DB, "
-                f"but {purchase_quantity} requested"
+
+        if external_stock_id_str and item.quantity >= purchase_quantity:
+            reserve_result = await session.execute(
+                update(UserInventoryItem)
+                .where(
+                    UserInventoryItem.id == item_id,
+                    UserInventoryItem.user_id == user_uuid,
+                    UserInventoryItem.quantity >= purchase_quantity,
+                )
+                .values(quantity=UserInventoryItem.quantity - purchase_quantity)
+                .returning(UserInventoryItem.quantity)
             )
-            # Transaction will commit and release lock
-            available_quantity = item.quantity
-            # Will return error after transaction closes
-    
-    # Transaction closed - lock released
-    
+            quantity_after_reserve = reserve_result.scalar_one_or_none()
+            reservation_open = quantity_after_reserve is not None
+            if reservation_open:
+                quantity_before = quantity_after_reserve + purchase_quantity
+
+    async def _restore_reservation() -> None:
+        """Ripristina la quantità prenotata (fallimento CardTrader o errore imprevisto)."""
+        nonlocal reservation_open
+        if not reservation_open:
+            return
+        reservation_open = False
+        try:
+            # execute+commit espliciti: compatibili con l'autobegin della sessione
+            # (session.begin() fallirebbe se una select precedente ha già aperto la tx).
+            await session.execute(
+                update(UserInventoryItem)
+                .where(
+                    UserInventoryItem.id == item_id,
+                    UserInventoryItem.user_id == user_uuid,
+                )
+                .values(quantity=UserInventoryItem.quantity + purchase_quantity)
+            )
+            await session.commit()
+        except Exception as restore_error:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.error(
+                f"RIPRISTINO PRENOTAZIONE FALLITO per item {item_id} (+{purchase_quantity}): "
+                f"{restore_error} — intervento manuale necessario",
+                exc_info=True,
+            )
+
     # If insufficient quantity in local DB, sync from CardTrader and return error
-    if quantity_before < purchase_quantity:
+    if not reservation_open and quantity_before < purchase_quantity:
         if external_stock_id_str:
             try:
                 from app.core.crypto import get_encryption_manager
@@ -979,22 +1012,23 @@ async def purchase_item(
                         async with CardTraderClient(token, user_id) as client:
                             availability = await client.check_product_availability(external_stock_id_str)
                             cardtrader_quantity = availability.get("quantity", 0)
-                            
-                            # Update local DB with CardTrader quantity (new transaction)
-                            async with session.begin():
-                                stmt = (
-                                    select(UserInventoryItem)
-                                    .where(
-                                        UserInventoryItem.id == item_id,
-                                        UserInventoryItem.user_id == user_uuid
+
+                            # Riallinea verso il basso alla verità CardTrader senza
+                            # sovrascrivere eventuali prenotazioni concorrenti (LEAST).
+                            await session.execute(
+                                update(UserInventoryItem)
+                                .where(
+                                    UserInventoryItem.id == item_id,
+                                    UserInventoryItem.user_id == user_uuid,
+                                )
+                                .values(
+                                    quantity=func.least(
+                                        UserInventoryItem.quantity, cardtrader_quantity
                                     )
                                 )
-                                result = await session.execute(stmt)
-                                item = result.scalar_one_or_none()
-                                if item:
-                                    item.quantity = cardtrader_quantity
-                                    await session.commit()
-                            
+                            )
+                            await session.commit()
+
                             available_quantity = cardtrader_quantity
             except Exception as e:
                 logger.error(f"Error syncing from CardTrader during purchase: {e}")
@@ -1072,21 +1106,24 @@ async def purchase_item(
                     f"Requested: {purchase_quantity}"
                 )
                 
-                # Update local DB with CardTrader quantity (new transaction)
-                async with session.begin():
-                    stmt = (
-                        select(UserInventoryItem)
-                        .where(
-                            UserInventoryItem.id == item_id,
-                            UserInventoryItem.user_id == user_uuid
+                # Ripristina la prenotazione locale senza superare la verità
+                # CardTrader (LEAST: non sovrascrive prenotazioni concorrenti).
+                reservation_open = False
+                await session.execute(
+                    update(UserInventoryItem)
+                    .where(
+                        UserInventoryItem.id == item_id,
+                        UserInventoryItem.user_id == user_uuid,
+                    )
+                    .values(
+                        quantity=func.least(
+                            UserInventoryItem.quantity + purchase_quantity,
+                            cardtrader_quantity,
                         )
                     )
-                    result = await session.execute(stmt)
-                    item = result.scalar_one_or_none()
-                    if item:
-                        item.quantity = cardtrader_quantity
-                        await session.commit()
-                
+                )
+                await session.commit()
+
                 return PurchaseItemResponse(
                     status="error",
                     item_id=item_id,
@@ -1123,94 +1160,41 @@ async def purchase_item(
                 cardtrader_updated = True
                 cardtrader_quantity_after = 0
         
-        # Step 6: Update local DB (new transaction) - COMPENSATION if this fails
-        try:
-            async with session.begin():
-                stmt = (
-                    select(UserInventoryItem)
-                    .where(
-                        UserInventoryItem.id == item_id,
-                        UserInventoryItem.user_id == user_uuid
-                    )
-                )
-                result = await session.execute(stmt)
-                item = result.scalar_one_or_none()
-                
-                if not item:
-                    raise InventoryItemNotFoundError(item_id=item_id, user_id=user_id)
-                
-                # Update quantity
-                item.quantity = quantity_before - purchase_quantity
-                await session.commit()
-            
-            logger.info(
-                f"Purchase successful: Item {item_id} (product {external_stock_id_str}) "
-                f"purchased {purchase_quantity} units. Quantity: {quantity_before} -> {item.quantity}"
-            )
-            
-            return PurchaseItemResponse(
-                status="success",
-                item_id=item_id,
-                message=f"Acquisto completato con successo: {purchase_quantity} unità",
-                available=True,
-                quantity_purchased=purchase_quantity,
-                quantity_before=quantity_before,
-                quantity_after=quantity_before - purchase_quantity,
-                cardtrader_sync_queued=False,
-                external_stock_id=external_stock_id_str,
-                error=None,
-            )
-            
-        except Exception as db_error:
-            # COMPENSATION: DB update failed, but CardTrader was already updated
-            # Try to compensate by restoring CardTrader quantity
-            logger.error(
-                f"DB update failed after CardTrader update for item {item_id}. "
-                f"Attempting compensation... Error: {db_error}",
-                exc_info=True
-            )
-            
-            try:
-                async with CardTraderClient(token, user_id) as client:
-                    if cardtrader_quantity_after == 0:
-                        # Product was deleted, try to restore by creating with original quantity
-                        # Note: This is best-effort, CardTrader may not support direct creation
-                        logger.warning(
-                            f"Cannot fully compensate: product {external_stock_id_str} was deleted. "
-                            f"Manual intervention may be required."
-                        )
-                    else:
-                        # Restore quantity by incrementing back
-                        logger.info(
-                            f"Compensating: restoring {purchase_quantity} units to product {external_stock_id_str}"
-                        )
-                        await client.increment_product_quantity(int(external_stock_id_str), purchase_quantity)
-            except Exception as compensation_error:
-                logger.error(
-                    f"Compensation failed for item {item_id}: {compensation_error}. "
-                    f"Manual intervention required!",
-                    exc_info=True
-                )
-            
-            # Return error - CardTrader may be inconsistent
-            return PurchaseItemResponse(
-                status="error",
-                item_id=item_id,
-                message=f"Errore durante l'aggiornamento del database locale. CardTrader potrebbe essere stato aggiornato. Errore: {str(db_error)}",
-                available=False,
-                quantity_purchased=0,
-                quantity_before=quantity_before,
-                quantity_after=quantity_before,
-                cardtrader_sync_queued=False,
-                external_stock_id=external_stock_id_str,
-                error=f"Database update failed: {str(db_error)}",
-            )
-            
+        # Step 6: la quantità locale è già stata decrementata dalla prenotazione
+        # atomica: nessuna seconda scrittura, nessuna compensazione necessaria.
+        reservation_open = False
+        logger.info(
+            f"Purchase successful: Item {item_id} (product {external_stock_id_str}) "
+            f"purchased {purchase_quantity} units. "
+            f"Quantity: {quantity_before} -> {quantity_after_reserve} "
+            f"(CardTrader updated: {cardtrader_updated}, qty after: {cardtrader_quantity_after})"
+        )
+
+        return PurchaseItemResponse(
+            status="success",
+            item_id=item_id,
+            message=f"Acquisto completato con successo: {purchase_quantity} unità",
+            available=True,
+            quantity_purchased=purchase_quantity,
+            quantity_before=quantity_before,
+            quantity_after=quantity_after_reserve if quantity_after_reserve is not None else quantity_before - purchase_quantity,
+            cardtrader_sync_queued=False,
+            external_stock_id=external_stock_id_str,
+            error=None,
+        )
+
     except HTTPException:
+        # Config mancante (settings/token): rilascia la prenotazione e propaga.
+        await _restore_reservation()
         raise
     except Exception as e:
         logger.error(f"Error during purchase for item {item_id}: {e}", exc_info=True)
-        
+        # Fallimento CardTrader (anche incerto): rilascia la prenotazione locale.
+        # Nota: se CardTrader avesse comunque applicato il decremento (timeout
+        # dopo accettazione), la riconciliazione periodica riallinea — non si
+        # ritenta alla cieca.
+        await _restore_reservation()
+
         return PurchaseItemResponse(
             status="error",
             item_id=item_id,
