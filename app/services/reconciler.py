@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_encryption_manager
@@ -58,6 +59,7 @@ def _extract_price_cents(product: Dict[str, Any]) -> Optional[int]:
 def validate_snapshot(
     products: Any,
     previous_snapshot_size: Optional[int],
+    local_active_rows: Optional[int] = None,
 ) -> Tuple[bool, List[str]]:
     """
     Valida l'export prima di usarlo. Ritorna (ok, problemi).
@@ -92,6 +94,18 @@ def validate_snapshot(
     ):
         problems.append(
             f"conteggio implausibile: export={len(ids)} vs snapshot precedente={previous_snapshot_size}"
+        )
+
+    # Plausibilità vs righe locali attive: a differenza della snapshot
+    # precedente (Redis, azzerato a ogni redeploy) questo confronto
+    # sopravvive ai riavvii e protegge anche il primo run.
+    if (
+        local_active_rows is not None
+        and local_active_rows >= 10
+        and len(ids) < local_active_rows * 0.5
+    ):
+        problems.append(
+            f"conteggio implausibile: export={len(ids)} vs righe locali attive={local_active_rows}"
         )
 
     return (len(problems) == 0), problems
@@ -283,6 +297,12 @@ async def _load_local_and_export(
     ).scalars().all()
 
     token = get_encryption_manager().decrypt(sync_settings.cardtrader_token_encrypted)
+
+    # Chiudi la transazione di sola lettura PRIMA dell'HTTP verso CardTrader:
+    # l'export può durare 2-3 minuti e la connessione non deve restare
+    # in transazione per tutto quel tempo.
+    await session.commit()
+
     async with CardTraderClient(token, str(user_id)) as client:
         products = await client.get_products_export()
 
@@ -307,8 +327,9 @@ async def reconcile_user_report(
 
     raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
     previous_size = int(raw_prev) if raw_prev else None
+    local_active_rows = sum(1 for item in local_items if item.quantity > 0)
 
-    ok, problems = validate_snapshot(products, previous_size)
+    ok, problems = validate_snapshot(products, previous_size, local_active_rows)
     if not ok:
         logger.warning("Snapshot RIFIUTATA per %s: %s", user_id, problems)
         return {
@@ -358,8 +379,9 @@ async def reconcile_user_apply(
 
     raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
     previous_size = int(raw_prev) if raw_prev else None
+    local_active_rows = sum(1 for item in local_items if item.quantity > 0)
 
-    ok, problems = validate_snapshot(products, previous_size)
+    ok, problems = validate_snapshot(products, previous_size, local_active_rows)
     if not ok:
         logger.warning(
             "Reconcile apply: snapshot RIFIUTATA per %s, nessuna mutazione: %s",
@@ -410,15 +432,25 @@ async def reconcile_user_apply(
                 if mapping is None or mapping[1] == "op_prints":
                     applied["skipped_unmapped"] += 1
                     continue
-                session.add(UserInventoryItem(
-                    user_id=user_id,
-                    blueprint_id=ct_blueprint_id,
-                    quantity=ct_quantity,
-                    price_cents=ct_price or 0,
-                    properties=product.get("properties_hash", {}),
-                    external_stock_id=pid,
-                ))
-                applied["created"] += 1
+                # Insert idempotente: se un webhook ha creato la stessa riga
+                # nel frattempo, il conflitto viene ignorato invece di far
+                # fallire (e annullare) l'intero giro di riconciliazione.
+                result = await session.execute(
+                    pg_insert(UserInventoryItem)
+                    .values(
+                        user_id=user_id,
+                        blueprint_id=ct_blueprint_id,
+                        quantity=ct_quantity,
+                        price_cents=ct_price or 0,
+                        properties=product.get("properties_hash", {}),
+                        external_stock_id=pid,
+                    )
+                    .on_conflict_do_nothing()
+                )
+                if result.rowcount == 1:
+                    applied["created"] += 1
+                else:
+                    applied["skipped_concurrent"] += 1
                 continue
 
             # NB: l'UPDATE ORM sincronizza anche l'oggetto in memoria, quindi
