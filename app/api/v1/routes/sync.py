@@ -1657,7 +1657,13 @@ async def trigger_sync_from_cardtrader(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {user_id} not found in sync settings"
         )
-    
+
+    if str(sync_settings.sync_status) != "active":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Sync non attivo per l'utente (stato: {sync_settings.sync_status})"
+        )
+
     # Riconciliazione completa dell'inventario utente (reconciler v2).
     # blueprint_id è accettato per compatibilità ma il reconciler lavora
     # sempre sull'export completo (più sicuro: vede anche gli articoli spariti).

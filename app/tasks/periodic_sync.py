@@ -133,4 +133,13 @@ async def _reconcile_single_user_async(user_id: str) -> Dict[str, Any]:
         if settings_row is None:
             return {"user_id": user_id, "status": "error", "error": "utente non trovato"}
 
+        # Difesa in profondità: la route fa già questo check, ma il task può
+        # essere accodato anche direttamente.
+        if str(settings_row.sync_status) != "active":
+            return {
+                "user_id": user_id,
+                "status": "skipped",
+                "reason": f"sync_status={settings_row.sync_status}",
+            }
+
         return await _reconcile_one(session, settings_row, redis, map_blueprint)

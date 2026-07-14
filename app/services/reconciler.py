@@ -406,6 +406,7 @@ async def reconcile_user_apply(
         "archived": 0,
         "skipped_concurrent": 0,  # riga cambiata da un acquisto durante il run
         "skipped_unmapped": 0,    # blueprint senza mapping catalogo (o One Piece)
+        "skipped_zero_qty": 0,    # nuovo su CT ma già esaurito: non creato
     }
 
     try:
@@ -416,6 +417,10 @@ async def reconcile_user_apply(
             ct_price = _extract_price_cents(product)
 
             if local is None:
+                # Già esaurito su CT: creare una riga a quantità 0 è solo rumore
+                if ct_quantity <= 0:
+                    applied["skipped_zero_qty"] += 1
+                    continue
                 # Nuovo su CT: crea solo se il blueprint è mappato nel catalogo
                 # (stessa regola del bulk sync iniziale; One Piece escluso).
                 ct_blueprint_id = product.get("blueprint_id")
