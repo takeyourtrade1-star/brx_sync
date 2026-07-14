@@ -159,6 +159,11 @@ docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-api \
   sh -c 'DB_URL=$(printf "%s" "$DATABASE_URL" | sed "s#^postgresql+asyncpg:#postgresql:#"); psql "$DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_foundations.sql'
 log_ok "Migrazione inventario scambi applicata"
 
+log_step "Applico visibilita' stock bloccato negli scambi..."
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-api \
+  sh -c 'DB_URL=$(printf "%s" "$DATABASE_URL" | sed "s#^postgresql+asyncpg:#postgresql:#"); psql "$DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_visibility.sql'
+log_ok "Migrazione visibilita' stock scambi applicata"
+
 # ── Avvio container ───────────────────────────────────────────────────────────
 log_header "AVVIO CONTAINER"
 

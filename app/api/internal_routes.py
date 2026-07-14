@@ -15,6 +15,7 @@ from app.api.internal_schemas import (
 from app.core.database import get_db_session
 from app.services.inventory_operations import (
     InventoryOperationError,
+    consume_inventory,
     credit_inventory,
     release_inventory,
     reserve_inventory,
@@ -53,6 +54,18 @@ async def release_reservation(
 ) -> InventoryOperationResponse:
     try:
         result = await release_inventory(session, request)
+    except InventoryOperationError as error:
+        _raise_operation_error(error)
+    return InventoryOperationResponse.model_validate(result)
+
+
+@router.post("/reservations/consume", response_model=InventoryOperationResponse)
+async def consume_reservation(
+    request: ReleaseInventoryRequest,
+    session: AsyncSession = Depends(get_db_session),
+) -> InventoryOperationResponse:
+    try:
+        result = await consume_inventory(session, request)
     except InventoryOperationError as error:
         _raise_operation_error(error)
     return InventoryOperationResponse.model_validate(result)

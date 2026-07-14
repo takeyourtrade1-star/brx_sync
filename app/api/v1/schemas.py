@@ -188,6 +188,9 @@ class InventoryItemResponse(BaseModel):
     id: int = Field(..., description="Item ID")
     blueprint_id: int = Field(..., description="CardTrader blueprint ID")
     quantity: int = Field(..., description="Current quantity")
+    reserved_quantity: int = Field(
+        0, description="Quantity locked by accepted trades"
+    )
     price_cents: int = Field(..., description="Price in cents")
     properties: Optional[Dict[str, Any]] = Field(None, description="Product properties")
     external_stock_id: Optional[str] = Field(
@@ -347,6 +350,9 @@ class ListingItemResponse(BaseModel):
     seller_display_name: str = Field(..., description="Display name for seller (e.g. Venditore #abc12345)")
     country: Optional[str] = Field(None, description="Seller country code (IT, DE, etc.)")
     quantity: int = Field(..., description="Available quantity")
+    reserved_quantity: int = Field(
+        0, description="Quantity visible but locked in accepted trades"
+    )
     price_cents: int = Field(..., description="Price in cents")
     source: Literal["cardtrader", "trade", "internal_test"] = Field(
         ..., description="Inventory origin"

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 ClientFactory = Callable[[str, str], Any]
 TokenDecryptor = Callable[[str], str]
-TRADABLE_SOURCES = ("cardtrader", "trade")
+TRADABLE_SOURCES = ("cardtrader",)
 
 
 class InventoryOperationError(Exception):
@@ -195,6 +195,7 @@ def _snapshot_from_row(row: Any, requested_quantity: int) -> Dict[str, Any]:
         "quantity": requested_quantity,
         "quantity_before": quantity_after + requested_quantity,
         "quantity_after": quantity_after,
+        "reserved_quantity_after": int(row.reserved_quantity),
         "blueprint_id": int(row.blueprint_id),
         "price_cents": int(row.price_cents),
         "properties": row.properties,
@@ -251,6 +252,18 @@ async def _compensate_failed_reservation(
             target_item_id = item_id
 
             if item_id in compensation_failed:
+                await session.execute(
+                    update(UserInventoryItem)
+                    .where(
+                        UserInventoryItem.id == item_id,
+                        UserInventoryItem.user_id == user_id,
+                        UserInventoryItem.reserved_quantity >= quantity,
+                    )
+                    .values(
+                        reserved_quantity=UserInventoryItem.reserved_quantity - quantity,
+                        updated_at=func.now(),
+                    )
+                )
                 fallback = await _insert_trade_row(session, user_id=user_id, snapshot=snapshot)
                 outcome = "returned_as_new_row"
                 target_item_id = fallback.id
@@ -271,8 +284,13 @@ async def _compensate_failed_reservation(
                     .where(
                         UserInventoryItem.id == item_id,
                         UserInventoryItem.user_id == user_id,
+                        UserInventoryItem.reserved_quantity >= quantity,
                     )
-                    .values(quantity=quantity_value, updated_at=func.now())
+                    .values(
+                        quantity=quantity_value,
+                        reserved_quantity=UserInventoryItem.reserved_quantity - quantity,
+                        updated_at=func.now(),
+                    )
                     .returning(UserInventoryItem.id)
                 )
                 if restored.scalar_one_or_none() is None:
@@ -341,11 +359,15 @@ async def reserve_inventory(
                     )
                     .values(
                         quantity=UserInventoryItem.quantity - requested.quantity,
+                        reserved_quantity=(
+                            UserInventoryItem.reserved_quantity + requested.quantity
+                        ),
                         updated_at=func.now(),
                     )
                     .returning(
                         UserInventoryItem.id,
                         UserInventoryItem.quantity,
+                        UserInventoryItem.reserved_quantity,
                         UserInventoryItem.blueprint_id,
                         UserInventoryItem.price_cents,
                         UserInventoryItem.properties,
@@ -578,9 +600,13 @@ async def release_inventory(
                             UserInventoryItem.id == snapshot["item_id"],
                             UserInventoryItem.user_id == request.user_id,
                             UserInventoryItem.source == "trade",
+                            UserInventoryItem.reserved_quantity >= snapshot["quantity"],
                         )
                         .values(
                             quantity=UserInventoryItem.quantity + snapshot["quantity"],
+                            reserved_quantity=(
+                                UserInventoryItem.reserved_quantity - snapshot["quantity"]
+                            ),
                             updated_at=func.now(),
                         )
                         .returning(UserInventoryItem.id)
@@ -604,9 +630,13 @@ async def release_inventory(
                             UserInventoryItem.user_id == request.user_id,
                             UserInventoryItem.source == "cardtrader",
                             UserInventoryItem.external_stock_id == snapshot["external_stock_id"],
+                            UserInventoryItem.reserved_quantity >= snapshot["quantity"],
                         )
                         .values(
                             quantity=UserInventoryItem.quantity + snapshot["quantity"],
+                            reserved_quantity=(
+                                UserInventoryItem.reserved_quantity - snapshot["quantity"]
+                            ),
                             updated_at=func.now(),
                         )
                         .returning(UserInventoryItem.id)
@@ -700,6 +730,83 @@ async def release_inventory(
         stored.result_json = result
         stored.completed_at = _now()
     return result
+
+
+async def consume_inventory(
+    session: AsyncSession,
+    request: ReleaseInventoryRequest,
+) -> Dict[str, Any]:
+    """Finalize a successful reservation without returning it to the seller."""
+    payload = _release_payload(request)
+    snapshots = await _load_reservation_result(session, request)
+    operation = InventoryOperation(
+        op_key=request.op_key,
+        kind="consume",
+        payload_json=payload,
+        status="processing",
+    )
+    consumed: List[Dict[str, Any]] = []
+    try:
+        async with session.begin():
+            session.add(operation)
+            await session.flush()
+            for snapshot in snapshots:
+                finalized = await session.execute(
+                    update(UserInventoryItem)
+                    .where(
+                        UserInventoryItem.id == snapshot["item_id"],
+                        UserInventoryItem.user_id == request.user_id,
+                        UserInventoryItem.reserved_quantity >= snapshot["quantity"],
+                    )
+                    .values(
+                        reserved_quantity=(
+                            UserInventoryItem.reserved_quantity - snapshot["quantity"]
+                        ),
+                        updated_at=func.now(),
+                    )
+                    .returning(UserInventoryItem.id)
+                )
+                target_id = finalized.scalar_one_or_none()
+                if target_id is None:
+                    raise InventoryOperationError(
+                        "RESERVATION_CONSUME_FAILED",
+                        f"Prenotazione item {snapshot['item_id']} non finalizzabile",
+                    )
+                consumed.append(
+                    {
+                        "original_item_id": snapshot["item_id"],
+                        "target_item_id": target_id,
+                        "quantity": snapshot["quantity"],
+                        "outcome": "receiver_credited",
+                    }
+                )
+            result = {
+                "op_key": request.op_key,
+                "kind": "consume",
+                "status": "succeeded",
+                "user_id": str(request.user_id),
+                "items": consumed,
+                "replayed": False,
+            }
+            operation.status = "succeeded"
+            operation.result_json = result
+            operation.completed_at = _now()
+        return result
+    except IntegrityError:
+        await session.rollback()
+        return await _replay_or_raise(
+            session, op_key=request.op_key, kind="consume", payload=payload
+        )
+    except InventoryOperationError as error:
+        await session.rollback()
+        await _record_failed_claim(
+            session,
+            op_key=request.op_key,
+            kind="consume",
+            payload=payload,
+            error=error,
+        )
+        raise error
 
 
 async def credit_inventory(

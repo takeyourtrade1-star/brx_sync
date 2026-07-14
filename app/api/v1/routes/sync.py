@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.schemas import (
@@ -836,6 +836,11 @@ async def delete_inventory_item(
     
     if not item:
         raise InventoryItemNotFoundError(item_id=item_id, user_id=user_id)
+    if item.reserved_quantity > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Oggetto bloccato in uno scambio attivo",
+        )
     
     # Store external_stock_id before deletion for CardTrader sync
     external_stock_id = item.external_stock_id
@@ -1269,6 +1274,11 @@ async def update_inventory_item(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Inventory item not found"
         )
+    if item.reserved_quantity > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Oggetto bloccato in uno scambio attivo",
+        )
     
     # Store old values for comparison
     old_quantity = item.quantity
@@ -1507,14 +1517,19 @@ async def get_listings_by_blueprint(
 ) -> ListingsByBlueprintResponse:
     """
     Get all listings (items for sale) for a given blueprint (card/print).
-    Public endpoint: no auth required. Returns sellers who have this print in inventory with quantity > 0.
+    Public endpoint: no auth required. Trade-locked CardTrader rows stay visible,
+    while cards received from a trade are not listed automatically.
     """
     limit = min(max(1, limit), 200)
     stmt = (
         select(UserInventoryItem)
         .where(
             UserInventoryItem.blueprint_id == blueprint_id,
-            UserInventoryItem.quantity > 0,
+            UserInventoryItem.source == "cardtrader",
+            or_(
+                UserInventoryItem.quantity > 0,
+                UserInventoryItem.reserved_quantity > 0,
+            ),
         )
         .order_by(UserInventoryItem.price_cents.asc())
         .limit(limit)
@@ -1535,6 +1550,7 @@ async def get_listings_by_blueprint(
                 seller_display_name=display_name,
                 country=None,
                 quantity=item.quantity,
+                reserved_quantity=item.reserved_quantity,
                 price_cents=item.price_cents,
                 source=item.source,
                 condition=condition,
@@ -1601,6 +1617,7 @@ async def get_inventory(
                 id=item.id,
                 blueprint_id=item.blueprint_id,
                 quantity=item.quantity,
+                reserved_quantity=item.reserved_quantity,
                 price_cents=item.price_cents,
                 properties=item.properties,
                 external_stock_id=item.external_stock_id,

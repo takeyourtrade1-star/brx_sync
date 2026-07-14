@@ -115,6 +115,13 @@ class UserInventoryItem(Base):
         default=0,
         comment="Current quantity in stock"
     )
+    reserved_quantity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="Quantity held by accepted trades and temporarily unavailable",
+    )
     price_cents: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -176,6 +183,10 @@ class UserInventoryItem(Base):
             "source IN ('cardtrader', 'trade', 'internal_test')",
             name="ck_user_inventory_items_source",
         ),
+        CheckConstraint(
+            "reserved_quantity >= 0",
+            name="ck_user_inventory_items_reserved_quantity",
+        ),
         Index(
             "idx_inventory_user_source_quantity",
             "user_id",
@@ -211,7 +222,7 @@ class InventoryOperation(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('reserve', 'release', 'credit')",
+            "kind IN ('reserve', 'release', 'consume', 'credit')",
             name="ck_inventory_ops_kind",
         ),
         CheckConstraint(

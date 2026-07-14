@@ -23,6 +23,7 @@ from app.models.inventory import (
 from app.services import reconciler
 from app.services.inventory_operations import (
     InventoryOperationError,
+    consume_inventory,
     credit_inventory,
     release_inventory,
     reserve_inventory,
@@ -104,10 +105,22 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
     user_id = uuid.uuid4()
     async with test_session_factory() as setup_session:
         async with setup_session.begin():
+            setup_session.add(
+                UserSyncSettings(
+                    user_id=user_id,
+                    cardtrader_token_encrypted="encrypted",
+                    sync_status=SyncStatusEnum.ACTIVE.value,
+                )
+            )
             item = await add_inventory_item(
-                setup_session, user_id=user_id, quantity=1, source="trade"
+                setup_session,
+                user_id=user_id,
+                quantity=1,
+                source="cardtrader",
+                external_stock_id="11",
             )
             item_id = item.id
+    fake = FakeCardTraderClient({11: 1})
 
     async def attempt(op_key: str):
         async with test_session_factory() as session:
@@ -118,6 +131,8 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
                     user_id=user_id,
                     items=[ReservationItemRequest(item_id=item_id, quantity=1)],
                 ),
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
             )
 
     results = await asyncio.gather(
@@ -136,6 +151,7 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
         stored = await session.get(UserInventoryItem, item_id)
         assert stored is not None
         assert stored.quantity == 0
+        assert stored.reserved_quantity == 1
 
 
 @pytest.mark.asyncio
@@ -363,22 +379,39 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
 
     async with test_session_factory() as setup_session:
         async with setup_session.begin():
+            setup_session.add_all(
+                [
+                    UserSyncSettings(
+                        user_id=proposer_id,
+                        cardtrader_token_encrypted="encrypted",
+                        sync_status=SyncStatusEnum.ACTIVE.value,
+                    ),
+                    UserSyncSettings(
+                        user_id=receiver_id,
+                        cardtrader_token_encrypted="encrypted",
+                        sync_status=SyncStatusEnum.ACTIVE.value,
+                    ),
+                ]
+            )
             offered = await add_inventory_item(
                 setup_session,
                 user_id=proposer_id,
                 quantity=2,
-                source="trade",
+                source="cardtrader",
+                external_stock_id="70101",
                 blueprint_id=701,
             )
             requested = await add_inventory_item(
                 setup_session,
                 user_id=receiver_id,
                 quantity=3,
-                source="trade",
+                source="cardtrader",
+                external_stock_id="70202",
                 blueprint_id=702,
             )
             offered_id = offered.id
             requested_id = requested.id
+    fake = FakeCardTraderClient({70101: 2, 70202: 3})
 
     async with test_session_factory() as session:
         proposer_reservation = await reserve_inventory(
@@ -388,6 +421,8 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
                 user_id=proposer_id,
                 items=[ReservationItemRequest(item_id=offered_id, quantity=1)],
             ),
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
         )
     async with test_session_factory() as session:
         receiver_reservation = await reserve_inventory(
@@ -397,6 +432,8 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
                 user_id=receiver_id,
                 items=[ReservationItemRequest(item_id=requested_id, quantity=2)],
             ),
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
         )
 
     offered_snapshot = proposer_reservation["items"][0]
@@ -435,6 +472,24 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
     async with test_session_factory() as session:
         await credit_inventory(session, receiver_credit)
     async with test_session_factory() as session:
+        await consume_inventory(
+            session,
+            ReleaseInventoryRequest(
+                op_key=f"trade:{op_suffix}:consume:proposer",
+                reservation_op_key=f"trade:{op_suffix}:reserve:proposer",
+                user_id=proposer_id,
+            ),
+        )
+    async with test_session_factory() as session:
+        await consume_inventory(
+            session,
+            ReleaseInventoryRequest(
+                op_key=f"trade:{op_suffix}:consume:receiver",
+                reservation_op_key=f"trade:{op_suffix}:reserve:receiver",
+                user_id=receiver_id,
+            ),
+        )
+    async with test_session_factory() as session:
         proposer_replay = await credit_inventory(session, proposer_credit)
         receiver_replay = await credit_inventory(session, receiver_credit)
 
@@ -456,9 +511,28 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
 
     assert sum(row.quantity for row in rows) == 5
     assert all(row.quantity >= 0 for row in rows)
+    assert all(row.reserved_quantity == 0 for row in rows)
     credited_rows = [row for row in rows if row.id not in {offered_id, requested_id}]
     assert len(credited_rows) == 2
     assert all(row.source == "trade" and row.external_stock_id is None for row in credited_rows)
+    proposer_received = next(row for row in credited_rows if row.user_id == proposer_id)
+
+    async with test_session_factory() as session:
+        with pytest.raises(InventoryOperationError) as not_published:
+            await reserve_inventory(
+                session,
+                ReserveInventoryRequest(
+                    op_key=f"trade:{op_suffix}:reserve:received-unlisted",
+                    user_id=proposer_id,
+                    items=[
+                        ReservationItemRequest(
+                            item_id=proposer_received.id,
+                            quantity=1,
+                        )
+                    ],
+                ),
+            )
+    assert not_published.value.code == "INVENTORY_UNAVAILABLE"
 
 
 class FakeRedis:

@@ -31,6 +31,7 @@ CREATE TABLE user_inventory_items (
     user_id UUID NOT NULL,
     blueprint_id INTEGER NOT NULL,
     quantity INTEGER NOT NULL DEFAULT 0,
+    reserved_quantity INTEGER NOT NULL DEFAULT 0 CHECK (reserved_quantity >= 0),
     price_cents INTEGER NOT NULL,
     properties JSONB,
     external_stock_id VARCHAR(255),
@@ -74,7 +75,7 @@ CREATE INDEX idx_sync_ops_status ON sync_operations(status);
 CREATE TABLE inventory_ops (
     id BIGSERIAL PRIMARY KEY,
     op_key VARCHAR(255) NOT NULL UNIQUE,
-    kind VARCHAR(32) NOT NULL CHECK (kind IN ('reserve', 'release', 'credit')),
+    kind VARCHAR(32) NOT NULL CHECK (kind IN ('reserve', 'release', 'consume', 'credit')),
     payload_json JSONB NOT NULL,
     result_json JSONB,
     status VARCHAR(32) NOT NULL CHECK (status IN ('processing', 'succeeded', 'failed')),
