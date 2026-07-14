@@ -34,6 +34,8 @@ CREATE TABLE user_inventory_items (
     price_cents INTEGER NOT NULL,
     properties JSONB,
     external_stock_id VARCHAR(255),
+    source VARCHAR(32) NOT NULL DEFAULT 'internal_test'
+        CHECK (source IN ('cardtrader', 'trade', 'internal_test')),
     description TEXT,
     user_data_field TEXT,
     graded BOOLEAN,
@@ -46,6 +48,7 @@ CREATE INDEX idx_inventory_user_id ON user_inventory_items(user_id);
 CREATE INDEX idx_inventory_blueprint_id ON user_inventory_items(blueprint_id);
 CREATE INDEX idx_inventory_external_stock_id ON user_inventory_items(external_stock_id);
 CREATE INDEX idx_inventory_updated_at ON user_inventory_items(updated_at);
+CREATE INDEX idx_inventory_user_source_quantity ON user_inventory_items(user_id, source, quantity);
 
 -- ==========================================
 -- 3. SYNC OPERATIONS
@@ -64,3 +67,21 @@ CREATE TABLE sync_operations (
 CREATE INDEX idx_sync_ops_user_id ON sync_operations(user_id);
 CREATE INDEX idx_sync_ops_operation_id ON sync_operations(operation_id);
 CREATE INDEX idx_sync_ops_status ON sync_operations(status);
+
+-- ==========================================
+-- 4. INTERNAL INVENTORY OPERATIONS
+-- ==========================================
+CREATE TABLE inventory_ops (
+    id BIGSERIAL PRIMARY KEY,
+    op_key VARCHAR(255) NOT NULL UNIQUE,
+    kind VARCHAR(32) NOT NULL CHECK (kind IN ('reserve', 'release', 'credit')),
+    payload_json JSONB NOT NULL,
+    result_json JSONB,
+    status VARCHAR(32) NOT NULL CHECK (status IN ('processing', 'succeeded', 'failed')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_inventory_ops_kind ON inventory_ops(kind);
+CREATE INDEX idx_inventory_ops_status ON inventory_ops(status);

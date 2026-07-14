@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional
 # We use isolated event loops in run_async() instead.
 
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_encryption_manager
 from app.core.database import get_db_session_context, get_isolated_db_session
@@ -388,6 +387,7 @@ async def _process_products_chunk(
             "quantity": product.get("quantity", 0),
             "price_cents": product.get("price_cents", 0),
             "properties": product.get("properties_hash", {}),
+            "source": "cardtrader",
         })
         blueprint_ids.append(blueprint_id)
     
@@ -463,6 +463,7 @@ async def _process_products_chunk(
                     "price_cents": product["price_cents"],
                     "properties": product["properties"],
                     "external_stock_id": product["external_stock_id"],
+                    "source": "cardtrader",
                     "updated_at": now,
                 })
             else:
@@ -473,6 +474,7 @@ async def _process_products_chunk(
                     "price_cents": product["price_cents"],
                     "properties": product["properties"],
                     "external_stock_id": product["external_stock_id"],
+                    "source": "cardtrader",
                     "created_at": now,
                     "updated_at": now,
                 })

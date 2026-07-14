@@ -54,6 +54,9 @@ services:
       
       # Fernet Key
       FERNET_KEY: ${FERNET_KEY}
+
+      # Private service-to-service routes
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       
       # Application
       DEBUG: "true"

@@ -82,6 +82,13 @@ class Settings(BaseSettings):
         description="JWT signing algorithm (must match Auth Service)",
     )
 
+    # Internal service-to-service API. No insecure default: internal routes
+    # fail closed when the token is absent.
+    INTERNAL_API_TOKEN: Optional[SecretStr] = Field(
+        default=None,
+        description="Shared token required by /internal/* endpoints",
+    )
+
     # AWS Integration (optional)
     AWS_REGION: str = Field(default="eu-south-1", description="AWS region for SSM")
     AWS_SSM_ENABLED: bool = Field(

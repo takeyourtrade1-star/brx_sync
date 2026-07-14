@@ -3,7 +3,6 @@ Pydantic schemas for API request/response models.
 
 All schemas include validation, examples, and descriptions for OpenAPI documentation.
 """
-from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -195,6 +194,9 @@ class InventoryItemResponse(BaseModel):
         None,
         description="CardTrader product ID (for targeted updates)",
     )
+    source: Literal["cardtrader", "trade", "internal_test"] = Field(
+        ..., description="Inventory origin"
+    )
     description: Optional[str] = Field(None, description="Product description")
     user_data_field: Optional[str] = Field(None, description="Custom metadata field")
     graded: Optional[bool] = Field(None, description="Whether the product is graded")
@@ -214,6 +216,7 @@ class InventoryItemResponse(BaseModel):
                     "mtg_foil": True,
                 },
                 "external_stock_id": "392763036",
+                "source": "cardtrader",
                 "description": "Near Mint condition",
                 "user_data_field": "Warehouse A",
                 "graded": True,
@@ -345,6 +348,9 @@ class ListingItemResponse(BaseModel):
     country: Optional[str] = Field(None, description="Seller country code (IT, DE, etc.)")
     quantity: int = Field(..., description="Available quantity")
     price_cents: int = Field(..., description="Price in cents")
+    source: Literal["cardtrader", "trade", "internal_test"] = Field(
+        ..., description="Inventory origin"
+    )
     condition: Optional[str] = Field(None, description="Condition (e.g. Near Mint)")
     mtg_language: Optional[str] = Field(None, description="Language code (e.g. en, it)")
 

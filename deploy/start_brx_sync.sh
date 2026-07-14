@@ -53,6 +53,7 @@ cleanup() {
   unset REDIS_URL
   unset FERNET_KEY
   unset JWT_PUBLIC_KEY
+  unset INTERNAL_API_TOKEN
   unset WEBHOOK_PUBLIC_URL
 }
 trap cleanup EXIT
@@ -117,6 +118,10 @@ log_step "JWT_PUBLIC_KEY (/prod/ebartex/jwt_public_key)..."
 export JWT_PUBLIC_KEY="$(get_ssm "/prod/ebartex/jwt_public_key")"
 log_ok "JWT_PUBLIC_KEY recuperato"
 
+log_step "INTERNAL_API_TOKEN (/prod/ebartex/internal_api_token)..."
+export INTERNAL_API_TOKEN="$(get_ssm "/prod/ebartex/internal_api_token")"
+log_ok "INTERNAL_API_TOKEN recuperato"
+
 export REDIS_URL="$REDIS_URL_VALUE"
 export WEBHOOK_PUBLIC_URL="$WEBHOOK_PUBLIC_URL_VALUE"
 log_ok "REDIS_URL=${REDIS_URL}"
@@ -146,6 +151,13 @@ log_header "PULL IMMAGINE"
 log_step "Scarico ultima immagine da ECR..."
 docker compose -f "$COMPOSE_FILE" pull
 log_ok "Immagine aggiornata"
+
+log_header "MIGRAZIONI DATABASE"
+
+log_step "Applico fondazioni inventario scambi..."
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-api \
+  sh -c 'DB_URL=$(printf "%s" "$DATABASE_URL" | sed "s#^postgresql+asyncpg:#postgresql:#"); psql "$DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_foundations.sql'
+log_ok "Migrazione inventario scambi applicata"
 
 # ── Avvio container ───────────────────────────────────────────────────────────
 log_header "AVVIO CONTAINER"

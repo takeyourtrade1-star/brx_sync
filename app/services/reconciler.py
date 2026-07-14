@@ -449,6 +449,7 @@ async def reconcile_user_apply(
                         price_cents=ct_price or 0,
                         properties=product.get("properties_hash", {}),
                         external_stock_id=pid,
+                        source="cardtrader",
                     )
                     .on_conflict_do_nothing()
                 )

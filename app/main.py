@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.routes import sync as sync_router
+from app.api import internal_routes
 from app.core.config import get_settings
 from app.core.database import close_mysql_connection
 from app.core.exception_handlers import EXCEPTION_HANDLERS
@@ -130,6 +131,7 @@ async def metrics():
 
 # Include routers
 app.include_router(sync_router.router, prefix=settings.API_V1_STR)
+app.include_router(internal_routes.router)
 
 # Serve static files (frontend test)
 try:

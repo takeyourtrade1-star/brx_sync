@@ -9,12 +9,11 @@ Handles bidirectional synchronization:
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from app.core.database import get_isolated_db_session, get_db_session_context
+from app.core.database import get_db_session_context
 from app.models.inventory import UserInventoryItem, UserSyncSettings
 from app.services.cardtrader_client import CardTraderClient
 from app.core.crypto import get_encryption_manager
@@ -472,6 +471,7 @@ class WebhookProcessor:
                         inventory_item.user_data_field = user_data_field
                         inventory_item.graded = graded
                         inventory_item.properties = properties_hash
+                        inventory_item.source = "cardtrader"
                         inventory_item.updated_at = datetime.utcnow()
                         updated += 1
                     else:
@@ -494,6 +494,7 @@ class WebhookProcessor:
                                 graded=graded,
                                 properties=properties_hash,
                                 external_stock_id=product_id,
+                                source="cardtrader",
                                 created_at=datetime.utcnow(),
                                 updated_at=datetime.utcnow()
                             )

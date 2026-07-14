@@ -10,7 +10,6 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.api.v1.schemas import (
     DeleteInventoryItemResponse,
@@ -24,7 +23,6 @@ from app.api.v1.schemas import (
     SetupTestUserRequest,
     SyncStartResponse,
     SyncStatusResponse,
-    TaskStatusResponse,
     UpdateInventoryItemRequest,
     UpdateInventoryItemResponse,
 )
@@ -34,7 +32,6 @@ from sqlalchemy import text
 from app.core.exceptions import (
     InventoryItemMissingExternalIdError,
     InventoryItemNotFoundError,
-    NotFoundError,
     SyncInProgressError,
     SyncNotFoundError,
     ValidationError as BRXValidationError,
@@ -1539,6 +1536,7 @@ async def get_listings_by_blueprint(
                 country=None,
                 quantity=item.quantity,
                 price_cents=item.price_cents,
+                source=item.source,
                 condition=condition,
                 mtg_language=mtg_lang,
             )
@@ -1606,6 +1604,7 @@ async def get_inventory(
                 price_cents=item.price_cents,
                 properties=item.properties,
                 external_stock_id=item.external_stock_id,
+                source=item.source,
                 description=item.description,
                 user_data_field=item.user_data_field,
                 graded=item.graded,

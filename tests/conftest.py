@@ -2,15 +2,18 @@
 Pytest configuration and shared fixtures for BRX Sync tests.
 """
 import asyncio
+import os
 from typing import AsyncGenerator, Generator
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from app.core.config import get_settings
-from app.core.database import Base
-
-settings = get_settings()
+from app.models.inventory import Base
 
 
 @pytest.fixture(scope="session")
@@ -22,16 +25,12 @@ def event_loop() -> Generator:
 
 
 @pytest.fixture(scope="function")
-async def test_db_session() -> AsyncGenerator[AsyncSession, None]:
-    """
-    Create a test database session.
-    
-    Uses a separate test database (configure via TEST_DATABASE_URL env var).
-    """
-    # Use test database URL if available, otherwise use main DB
-    test_db_url = getattr(settings, "TEST_DATABASE_URL", None) or settings.DATABASE_URL.replace(
-        "/brx_sync", "/brx_sync_test"
-    )
+async def test_db_engine() -> AsyncGenerator[AsyncEngine, None]:
+    """Create a clean schema only on the explicitly configured disposable DB."""
+    # Mai ripiegare sul DB applicativo: questi test creano e distruggono tabelle.
+    test_db_url = os.getenv("TEST_DATABASE_URL")
+    if not test_db_url:
+        pytest.skip("TEST_DATABASE_URL non configurato")
     
     engine = create_async_engine(
         test_db_url,
@@ -43,15 +42,7 @@ async def test_db_session() -> AsyncGenerator[AsyncSession, None]:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    async_session = async_sessionmaker(
-        engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
-    
-    async with async_session() as session:
-        yield session
-        await session.rollback()
+    yield engine
     
     # Cleanup
     async with engine.begin() as conn:
@@ -60,10 +51,26 @@ async def test_db_session() -> AsyncGenerator[AsyncSession, None]:
     await engine.dispose()
 
 
+@pytest.fixture(scope="function")
+def test_session_factory(test_db_engine: AsyncEngine):
+    return async_sessionmaker(
+        test_db_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+
+@pytest.fixture(scope="function")
+async def test_db_session(test_session_factory) -> AsyncGenerator[AsyncSession, None]:
+    async with test_session_factory() as session:
+        yield session
+        await session.rollback()
+
+
 @pytest.fixture
 def mock_redis():
     """Mock Redis client."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock
     
     redis_mock = AsyncMock()
     redis_mock.ping = AsyncMock(return_value=True)
@@ -80,7 +87,7 @@ def mock_redis():
 @pytest.fixture
 def mock_cardtrader_client():
     """Mock CardTrader client."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock
     
     client_mock = AsyncMock()
     client_mock.get_products_export = AsyncMock(return_value=[])

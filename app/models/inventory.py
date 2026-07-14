@@ -4,13 +4,13 @@ SQLAlchemy models for BRX Sync database tables.
 import enum
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from sqlalchemy import (
     BigInteger,
-    Boolean,
-    Enum,
+    CheckConstraint,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -99,10 +99,9 @@ class UserInventoryItem(Base):
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("user_sync_settings.user_id", ondelete="CASCADE"),
         nullable=False,
         index=True,
-        comment="User UUID"
+        comment="User UUID (FK reale verso users.id, posseduta dal DB condiviso)"
     )
     blueprint_id: Mapped[int] = mapped_column(
         Integer,
@@ -131,6 +130,13 @@ class UserInventoryItem(Base):
         nullable=True,
         index=True,
         comment="CardTrader product.id for targeted updates"
+    )
+    source: Mapped[Literal["cardtrader", "trade", "internal_test"]] = mapped_column(
+        String(32),
+        nullable=False,
+        default="internal_test",
+        server_default="internal_test",
+        comment="Inventory origin: cardtrader, trade, or internal_test",
     )
     description: Mapped[Optional[str]] = mapped_column(
         Text,
@@ -165,6 +171,52 @@ class UserInventoryItem(Base):
             "blueprint_id",
             "external_stock_id",
             name="uq_user_blueprint_external_stock"
+        ),
+        CheckConstraint(
+            "source IN ('cardtrader', 'trade', 'internal_test')",
+            name="ck_user_inventory_items_source",
+        ),
+        Index(
+            "idx_inventory_user_source_quantity",
+            "user_id",
+            "source",
+            "quantity",
+        ),
+    )
+
+
+class InventoryOperation(Base):
+    """Idempotency and audit log for internal inventory mutations."""
+
+    __tablename__ = "inventory_ops"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    op_key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    result_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('reserve', 'release', 'credit')",
+            name="ck_inventory_ops_kind",
+        ),
+        CheckConstraint(
+            "status IN ('processing', 'succeeded', 'failed')",
+            name="ck_inventory_ops_status",
         ),
     )
 

@@ -19,6 +19,7 @@ services:
       - REDIS_URL
       - FERNET_KEY
       - JWT_PUBLIC_KEY
+      - INTERNAL_API_TOKEN
       - WEBHOOK_PUBLIC_URL
       - AWS_REGION
       - ENVIRONMENT
