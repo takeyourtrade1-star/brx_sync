@@ -13,7 +13,7 @@ celery_app = Celery(
     "brx_sync",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.sync_tasks"],
+    include=["app.tasks.sync_tasks", "app.tasks.periodic_sync"],
 )
 
 # Celery configuration
@@ -32,7 +32,18 @@ celery_app.conf.update(
         "app.tasks.sync_tasks.initial_bulk_sync": {"queue": "bulk-sync"},
         "app.tasks.sync_tasks.sync_update_product_to_cardtrader": {"queue": "high-priority"},
         "app.tasks.sync_tasks.sync_delete_product_to_cardtrader": {"queue": "high-priority"},
+        "app.tasks.periodic_sync.reconcile_all_users": {"queue": "bulk-sync"},
     },
+
+    # Riconciliazione periodica CardTrader → locale (reconciler v2, solo letture CT)
+    beat_schedule={
+        "reconcile-all-users": {
+            "task": "app.tasks.periodic_sync.reconcile_all_users",
+            "schedule": crontab(minute=15, hour="*/6"),  # ogni 6 ore
+        },
+    },
+    # Il beat gira embedded nel worker (-B): file di stato in /tmp
+    beat_schedule_filename="/tmp/celerybeat-schedule",
     
     # Retry configuration with exponential backoff
     task_acks_late=True,

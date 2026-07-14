@@ -1,18 +1,22 @@
 """
-Esegue il reconciler v2 in modalità SOLO REPORT su tutti gli utenti sync
-attivi e stampa il report JSON su stdout.
+Esegue il reconciler v2 su tutti gli utenti sync attivi e stampa il report JSON.
 
-Non scrive nulla su database né su CardTrader (vedi app/services/reconciler.py).
-Uso (dentro il container): python scripts/reconcile_report.py
+Default: SOLO REPORT, nessuna scrittura su database né su CardTrader.
+Con --apply: applica il diff al database locale (mai scritture su CardTrader).
+
+Uso (dentro il container):
+  python scripts/reconcile_report.py           # solo report
+  python scripts/reconcile_report.py --apply   # applica
 """
 import asyncio
 import json
+import sys
 
 from sqlalchemy import String, cast, select
 
 from app.core.database import get_db_session_context
 from app.models.inventory import UserSyncSettings
-from app.services.reconciler import reconcile_user_report
+from app.services.reconciler import reconcile_user_apply, reconcile_user_report
 
 
 def _build_blueprint_mapper():
@@ -27,6 +31,10 @@ def _build_blueprint_mapper():
 
 
 async def main() -> None:
+    apply_mode = "--apply" in sys.argv
+    reconcile = reconcile_user_apply if apply_mode else reconcile_user_report
+    print(f"# modalità: {'APPLY (scrive sul DB locale)' if apply_mode else 'solo report'}")
+
     map_blueprint = _build_blueprint_mapper()
     reports = []
     async with get_db_session_context() as session:
@@ -43,9 +51,7 @@ async def main() -> None:
         print(f"# utenti sync da riconciliare: {len(rows)}")
         for settings_row in rows:
             try:
-                report = await reconcile_user_report(
-                    session, settings_row, map_blueprint
-                )
+                report = await reconcile(session, settings_row, map_blueprint)
             except Exception as exc:  # noqa: BLE001 — un utente rotto non blocca gli altri
                 report = {
                     "user_id": str(settings_row.user_id),

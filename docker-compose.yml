@@ -76,7 +76,8 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: brx-sync-worker
-    command: celery -A app.tasks.celery_app worker --loglevel=info --queues=high-priority,bulk-sync,default
+    # -B: beat embedded per la riconciliazione periodica (un solo worker → nessun beat duplicato)
+    command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,default
     environment:
       # Same environment as API
       DATABASE_URL: postgresql+asyncpg://brx_sync_user:brx_sync_pass@postgres:5432/brx_sync_db

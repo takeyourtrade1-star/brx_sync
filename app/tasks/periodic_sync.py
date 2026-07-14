@@ -1,60 +1,103 @@
 """
-Periodic sync tasks for bidirectional synchronization.
+Riconciliazione periodica CardTrader → database locale (reconciler v2).
 
-These tasks run periodically to sync changes from CardTrader
-that might not come through webhooks (e.g., direct edits on CardTrader UI).
+Gira via Celery beat (vedi celery_app.py). Per ogni utente sync attivo:
+scarica l'export CardTrader, lo valida e applica il diff al database locale
+(vedi app/services/reconciler.py). Non scrive MAI su CardTrader.
+
+Single-flight per utente tramite lock Redis: se una riconciliazione per lo
+stesso utente è già in corso, il giro viene saltato.
 """
 import logging
-import uuid
-from typing import Dict, Any
+from typing import Any, Dict, List
 
+from sqlalchemy import String, cast, select
+
+from app.core.database import get_isolated_db_session
+from app.core.redis_client import get_redis_sync
+from app.models.inventory import UserSyncSettings
+from app.services.reconciler import reconcile_user_apply
 from app.tasks.celery_app import celery_app
-from app.services.webhook_processor import WebhookProcessor
 from app.tasks.sync_tasks import run_async
 
 logger = logging.getLogger(__name__)
 
+LOCK_KEY = "reconcile:lock:{user_id}"
+LOCK_TTL_SECONDS = 1800  # 30 minuti: oltre il peggior export CardTrader
 
-@celery_app.task(bind=True, max_retries=3)
-def periodic_sync_from_cardtrader(
-    self,
-    user_id: str,
-    blueprint_id: int = None,
-) -> Dict[str, Any]:
-    """
-    Periodically sync products from CardTrader to local database.
-    
-    This catches changes made directly on CardTrader (not via our API)
-    and ensures our local database stays in sync.
-    
-    Args:
-        user_id: User UUID string
-        blueprint_id: Optional blueprint_id to sync specific product
-        
-    Returns:
-        Sync result
-    """
+
+def _build_blueprint_mapper():
+    """Mapping opzionale: se MySQL/Redis non rispondono si salta solo il create."""
     try:
-        user_uuid = uuid.UUID(user_id)
-        result = run_async(
-            _periodic_sync_from_cardtrader_async(user_uuid, blueprint_id)
-        )
-        return result
-    except Exception as e:
-        logger.error(
-            f"Error in periodic sync for user {user_id}: {e}",
-            exc_info=True
-        )
-        raise self.retry(exc=e, countdown=300)  # Retry after 5 minutes
+        from app.services.blueprint_mapper import get_blueprint_mapper
+        mapper = get_blueprint_mapper()
+        return lambda ct_blueprint_id: mapper.map_blueprint_id(ct_blueprint_id)
+    except Exception as exc:  # noqa: BLE001 — il mapping serve solo ai create
+        logger.warning("Blueprint mapper non disponibile: %s", exc)
+        return None
 
 
-async def _periodic_sync_from_cardtrader_async(
-    user_uuid: uuid.UUID,
-    blueprint_id: int = None,
-) -> Dict[str, Any]:
-    """Async implementation of periodic sync."""
-    processor = WebhookProcessor()
-    return await processor.sync_products_from_cardtrader(
-        user_uuid,
-        blueprint_id=blueprint_id
-    )
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=600)
+def reconcile_all_users(self) -> Dict[str, Any]:
+    """Riconcilia tutti gli utenti sync attivi. Pianificato da Celery beat."""
+    try:
+        return run_async(_reconcile_all_users_async())
+    except Exception as exc:
+        logger.error("Riconciliazione periodica fallita: %s", exc, exc_info=True)
+        raise self.retry(exc=exc)
+
+
+async def _reconcile_all_users_async() -> Dict[str, Any]:
+    redis = get_redis_sync()
+    map_blueprint = _build_blueprint_mapper()
+    results: List[Dict[str, Any]] = []
+
+    async with get_isolated_db_session() as session:
+        rows = (
+            await session.execute(
+                select(UserSyncSettings).where(
+                    # la colonna è un enum Postgres: confronto come testo
+                    cast(UserSyncSettings.sync_status, String) == "active"
+                )
+            )
+        ).scalars().all()
+
+        logger.info("Riconciliazione periodica: %d utenti attivi", len(rows))
+
+        for settings_row in rows:
+            user_id = settings_row.user_id
+            lock_key = LOCK_KEY.format(user_id=user_id)
+            if not redis.set(lock_key, "1", nx=True, ex=LOCK_TTL_SECONDS):
+                logger.info("Reconcile %s saltata: già in corso", user_id)
+                results.append({"user_id": str(user_id), "status": "locked"})
+                continue
+
+            try:
+                result = await reconcile_user_apply(
+                    session, settings_row, map_blueprint
+                )
+            except Exception as exc:  # noqa: BLE001 — un utente rotto non blocca gli altri
+                logger.error(
+                    "Reconcile fallita per %s: %s", user_id, exc, exc_info=True
+                )
+                result = {
+                    "user_id": str(user_id),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            finally:
+                redis.delete(lock_key)
+
+            results.append(result)
+
+    summary = {
+        "users": len(results),
+        "ok": sum(1 for r in results if r.get("status") == "ok"),
+        "rejected": sum(1 for r in results if r.get("status") == "rejected"),
+        "errors": sum(1 for r in results if r.get("status") == "error"),
+        "results": results,
+    }
+    logger.info("Riconciliazione periodica conclusa: %s", {
+        k: v for k, v in summary.items() if k != "results"
+    })
+    return summary
