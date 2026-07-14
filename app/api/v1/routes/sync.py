@@ -53,7 +53,7 @@ from app.tasks.sync_tasks import (
     sync_delete_product_to_cardtrader,
     sync_update_product_to_cardtrader,
 )
-from app.tasks.periodic_sync import periodic_sync_from_cardtrader
+from app.tasks.periodic_sync import reconcile_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
@@ -1658,17 +1658,16 @@ async def trigger_sync_from_cardtrader(
             detail=f"User {user_id} not found in sync settings"
         )
     
-    # Queue periodic sync task
-    task = periodic_sync_from_cardtrader.delay(
-        user_id=user_id,
-        blueprint_id=blueprint_id
-    )
-    
+    # Riconciliazione completa dell'inventario utente (reconciler v2).
+    # blueprint_id è accettato per compatibilità ma il reconciler lavora
+    # sempre sull'export completo (più sicuro: vede anche gli articoli spariti).
+    task = reconcile_user.delay(user_id=user_id)
+
     logger.info(
-        f"Queued periodic sync from CardTrader for user {user_id}, "
+        f"Queued reconcile from CardTrader for user {user_id}, "
         f"task_id={task.id}"
     )
-    
+
     return {
         "status": "accepted",
         "task_id": task.id,

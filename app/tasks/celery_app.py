@@ -33,6 +33,7 @@ celery_app.conf.update(
         "app.tasks.sync_tasks.sync_update_product_to_cardtrader": {"queue": "high-priority"},
         "app.tasks.sync_tasks.sync_delete_product_to_cardtrader": {"queue": "high-priority"},
         "app.tasks.periodic_sync.reconcile_all_users": {"queue": "bulk-sync"},
+        "app.tasks.periodic_sync.reconcile_user": {"queue": "bulk-sync"},
     },
 
     # Riconciliazione periodica CardTrader → locale (reconciler v2, solo letture CT)
