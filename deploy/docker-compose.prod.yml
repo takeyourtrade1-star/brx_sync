@@ -11,11 +11,16 @@ services:
       - "8002:8000"
     environment:
       - DATABASE_URL
+      # 2 uvicorn workers x (3 pool + 2 overflow) = 10 connessioni massime.
+      - DB_POOL_SIZE=3
+      - DB_MAX_OVERFLOW=2
       - MYSQL_HOST
       - MYSQL_PORT
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
+      - MYSQL_POOL_SIZE=5
+      - MYSQL_POOL_MAX_OVERFLOW=5
       - REDIS_URL
       - FERNET_KEY
       - JWT_PUBLIC_KEY
@@ -26,6 +31,7 @@ services:
       - DEBUG
       - AWS_SSM_ENABLED
       - ALLOWED_ORIGINS
+      - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:
         condition: service_healthy
@@ -50,11 +56,16 @@ services:
     command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,default --concurrency=4
     environment:
       - DATABASE_URL
+      # Celery ha quattro processi: pool piccolo per processo, con backpressure.
+      - DB_POOL_SIZE=2
+      - DB_MAX_OVERFLOW=1
       - MYSQL_HOST
       - MYSQL_PORT
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
+      - MYSQL_POOL_SIZE=5
+      - MYSQL_POOL_MAX_OVERFLOW=5
       - REDIS_URL
       - FERNET_KEY
       - JWT_PUBLIC_KEY
@@ -63,6 +74,7 @@ services:
       - ENVIRONMENT
       - DEBUG
       - AWS_SSM_ENABLED
+      - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:
         condition: service_healthy
@@ -80,7 +92,7 @@ services:
     restart: unless-stopped
     # Redis listen on 6381 on host to avoid conflict with other services
     ports:
-      - "6381:6379"
+      - "127.0.0.1:6381:6379"
     # Persistenza: i contatori del reconciler e il dedup webhook devono
     # sopravvivere ai redeploy
     command: redis-server --appendonly yes

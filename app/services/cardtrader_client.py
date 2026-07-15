@@ -22,7 +22,10 @@ logger = logging.getLogger(__name__)
 
 class CardTraderAPIError(Exception):
     """Base exception for CardTrader API errors."""
-    pass
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class RateLimitError(CardTraderAPIError):
@@ -186,7 +189,10 @@ class CardTraderClient:
                 self.circuit_breaker.record_failure(error_type)
                 error_msg = f"CardTrader API error {e.response.status_code}: {e.response.text}"
                 logger.error(error_msg)
-                raise CardTraderAPIError(error_msg) from e
+                raise CardTraderAPIError(
+                    error_msg,
+                    status_code=e.response.status_code,
+                ) from e
             
             except httpx.RequestError as e:
                 # Record failure for circuit breaker

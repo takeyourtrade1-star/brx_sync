@@ -21,10 +21,13 @@ from app.models.inventory import (
     UserSyncSettings,
 )
 from app.services import reconciler
+from app.services.cardtrader_client import CardTraderAPIError
 from app.services.inventory_operations import (
     InventoryOperationError,
     consume_inventory,
     credit_inventory,
+    recover_stale_reservations,
+    recover_stale_releases,
     release_inventory,
     reserve_inventory,
 )
@@ -42,6 +45,7 @@ class FakeCardTraderClient:
         self.products = products
         self.fail_negative_for = set(fail_negative_for)
         self.calls: list[tuple[int, int]] = []
+        self.export_calls = 0
 
     async def __aenter__(self) -> "FakeCardTraderClient":
         return self
@@ -50,6 +54,7 @@ class FakeCardTraderClient:
         return None
 
     async def get_products_export(self) -> list[dict[str, int]]:
+        self.export_calls += 1
         return [
             {"id": product_id, "quantity": quantity}
             for product_id, quantity in self.products.items()
@@ -62,7 +67,7 @@ class FakeCardTraderClient:
         if delta_quantity < 0 and product_id in self.fail_negative_for:
             raise RuntimeError("CardTrader test failure")
         if product_id not in self.products:
-            raise RuntimeError("CardTrader product missing")
+            raise CardTraderAPIError("CardTrader product missing", status_code=404)
         new_quantity = self.products[product_id] + delta_quantity
         if new_quantity <= 0:
             del self.products[product_id]
@@ -155,7 +160,7 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
 
 
 @pytest.mark.asyncio
-async def test_cardtrader_mid_batch_failure_compensates_and_replays(
+async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
     test_session_factory,
 ):
     user_id = uuid.uuid4()
@@ -204,8 +209,8 @@ async def test_cardtrader_mid_batch_failure_compensates_and_replays(
                 client_factory=client_factory(fake),
                 decrypt_token=lambda value: value,
             )
-    assert failed.value.code == "CARDTRADER_RESERVATION_FAILED"
-    assert fake.products == {101: 2, 202: 2}
+    assert failed.value.code == "CARDTRADER_RESERVATION_PENDING"
+    assert fake.products == {101: 1, 202: 2}
     calls_after_failure = list(fake.calls)
 
     async with test_session_factory() as session:
@@ -220,13 +225,14 @@ async def test_cardtrader_mid_batch_failure_compensates_and_replays(
             .scalars()
             .all()
         )
-        assert [row.quantity for row in rows] == [1, 1]
+        assert [row.quantity for row in rows] == [0, 0]
+        assert [row.reserved_quantity for row in rows] == [1, 1]
         operation = (
             await session.execute(
                 select(InventoryOperation).where(InventoryOperation.op_key == request.op_key)
             )
         ).scalar_one()
-        assert operation.status == "failed"
+        assert operation.status == "processing"
 
     async with test_session_factory() as session:
         with pytest.raises(InventoryOperationError) as replay:
@@ -236,8 +242,29 @@ async def test_cardtrader_mid_batch_failure_compensates_and_replays(
                 client_factory=client_factory(fake),
                 decrypt_token=lambda value: value,
             )
-    assert replay.value.code == "CARDTRADER_RESERVATION_FAILED"
+    assert replay.value.code == "OPERATION_IN_PROGRESS"
     assert fake.calls == calls_after_failure
+
+    fake.fail_negative_for.clear()
+    async with test_session_factory() as session:
+        recovered = await recover_stale_reservations(
+            session,
+            stale_minutes=0,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+    assert recovered == {"scanned": 1, "recovered": 1, "pending": 0, "ambiguous": 0}
+    assert fake.products == {101: 1, 202: 1}
+
+    async with test_session_factory() as session:
+        replayed = await reserve_inventory(
+            session,
+            request,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+    assert replayed["replayed"] is True
+    assert fake.calls[-1] == (202, -1)
 
 
 @pytest.mark.asyncio
@@ -289,31 +316,39 @@ async def test_release_falls_back_to_trade_when_cardtrader_deleted(
     assert reserve_replay["items"][0]["item_id"] == reserved["items"][0]["item_id"]
     assert fake.calls == calls_after_reserve
 
+    release_request = ReleaseInventoryRequest(
+        op_key="trade:4:release",
+        reservation_op_key=reserve_request.op_key,
+        user_id=user_id,
+    )
     async with test_session_factory() as session:
-        result = await release_inventory(
+        with pytest.raises(InventoryOperationError) as pending_release:
+            await release_inventory(
+                session,
+                release_request,
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+    assert pending_release.value.code == "CARDTRADER_RELEASE_PENDING"
+
+    async with test_session_factory() as session:
+        recovery = await recover_stale_releases(
             session,
-            ReleaseInventoryRequest(
-                op_key="trade:4:release",
-                reservation_op_key=reserve_request.op_key,
-                user_id=user_id,
-            ),
+            stale_minutes=0,
             client_factory=client_factory(fake),
             decrypt_token=lambda value: value,
         )
-    assert result["items"][0]["outcome"] == "returned_as_new_row"
+    assert recovery == {"scanned": 1, "recovered": 1, "pending": 0, "ambiguous": 0}
     calls_after_release = list(fake.calls)
     async with test_session_factory() as session:
         release_replay = await release_inventory(
             session,
-            ReleaseInventoryRequest(
-                op_key="trade:4:release",
-                reservation_op_key=reserve_request.op_key,
-                user_id=user_id,
-            ),
+            release_request,
             client_factory=client_factory(fake),
             decrypt_token=lambda value: value,
         )
     assert release_replay["replayed"] is True
+    assert release_replay["items"][0]["outcome"] == "returned_as_new_row"
     assert fake.calls == calls_after_release
 
     async with test_session_factory() as session:
@@ -332,6 +367,72 @@ async def test_release_falls_back_to_trade_when_cardtrader_deleted(
             ("cardtrader", 0),
             ("trade", 1),
         ]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_cardtrader_quantity_never_reopens_stock(
+    test_session_factory,
+):
+    user_id = uuid.uuid4()
+    async with test_session_factory() as setup_session:
+        async with setup_session.begin():
+            setup_session.add(
+                UserSyncSettings(
+                    user_id=user_id,
+                    cardtrader_token_encrypted="encrypted",
+                    sync_status=SyncStatusEnum.ACTIVE.value,
+                )
+            )
+            item = await add_inventory_item(
+                setup_session,
+                user_id=user_id,
+                quantity=2,
+                source="cardtrader",
+                external_stock_id="350",
+            )
+            item_id = item.id
+
+    fake = FakeCardTraderClient({350: 2}, fail_negative_for={350})
+    request = ReserveInventoryRequest(
+        op_key="trade:ambiguous:reserve",
+        user_id=user_id,
+        items=[ReservationItemRequest(item_id=item_id, quantity=2)],
+    )
+    async with test_session_factory() as session:
+        with pytest.raises(InventoryOperationError) as pending:
+            await reserve_inventory(
+                session,
+                request,
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+    assert pending.value.code == "CARDTRADER_RESERVATION_PENDING"
+
+    # A concurrent CardTrader sale moved stock to neither the before nor the
+    # expected after value. Recovery must not guess which mutation landed.
+    fake.fail_negative_for.clear()
+    fake.products[350] = 1
+    async with test_session_factory() as session:
+        recovery = await recover_stale_reservations(
+            session,
+            stale_minutes=0,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+    assert recovery == {"scanned": 1, "recovered": 0, "pending": 0, "ambiguous": 1}
+
+    async with test_session_factory() as session:
+        stored_item = await session.get(UserInventoryItem, item_id)
+        operation = (
+            await session.execute(
+                select(InventoryOperation).where(InventoryOperation.op_key == request.op_key)
+            )
+        ).scalar_one()
+        assert stored_item is not None
+        assert stored_item.quantity == 0
+        assert stored_item.reserved_quantity == 2
+        assert operation.status == "processing"
+        assert operation.result_json["phase"] == "manual_review_required"
 
 
 @pytest.mark.asyncio

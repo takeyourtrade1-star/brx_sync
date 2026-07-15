@@ -57,7 +57,7 @@ _amplify_origin = "https://main.d8ry9s45st8bf.amplifyapp.com"
 if allowed_origins != ["*"] and _amplify_origin not in allowed_origins:
     allowed_origins.append(_amplify_origin)
 if "*" in allowed_origins and settings.ENVIRONMENT == "production":
-    logger.warning("CORS allow_origins is set to '*' in production! This is a security risk.")
+    raise RuntimeError("ALLOWED_ORIGINS='*' is forbidden in production")
 logger.info("CORS allowed_origins: %s", allowed_origins)
 
 app.add_middleware(
@@ -65,8 +65,8 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
 
 

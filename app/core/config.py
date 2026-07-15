@@ -88,6 +88,12 @@ class Settings(BaseSettings):
         default=None,
         description="Shared token required by /internal/* endpoints",
     )
+    INTERNAL_API_RATE_LIMIT_PER_MINUTE: int = Field(
+        default=300,
+        ge=10,
+        le=5000,
+        description="Aggregate per-peer limit for internal inventory mutations.",
+    )
 
     # AWS Integration (optional)
     AWS_REGION: str = Field(default="eu-south-1", description="AWS region for SSM")
@@ -102,6 +108,15 @@ class Settings(BaseSettings):
     CARDTRADER_API_BASE_URL: str = Field(
         default="https://api.cardtrader.com/api/v2",
         description="CardTrader V2 API base URL",
+    )
+    TRADE_CARDTRADER_MUTATION_TIMEOUT_SECONDS: float = Field(
+        default=15.0,
+        ge=1.0,
+        le=30.0,
+        description=(
+            "Bound for synchronous trade stock mutations. Unknown outcomes are "
+            "kept reserved and resolved by the recovery task."
+        ),
     )
 
     # Rate Limiting

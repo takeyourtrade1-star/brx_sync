@@ -20,6 +20,10 @@ from sqlalchemy import String, cast, select
 from app.core.database import get_isolated_db_session
 from app.core.redis_client import get_redis_sync
 from app.models.inventory import UserSyncSettings
+from app.services.inventory_operations import (
+    recover_stale_releases,
+    recover_stale_reservations,
+)
 from app.services.reconciler import reconcile_user_apply
 from app.tasks.celery_app import celery_app
 from app.tasks.sync_tasks import run_async
@@ -143,3 +147,34 @@ async def _reconcile_single_user_async(user_id: str) -> Dict[str, Any]:
             }
 
         return await _reconcile_one(session, settings_row, redis, map_blueprint)
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
+def recover_inventory_reservations(self) -> Dict[str, Any]:
+    """Resolve stale trade reservations left by timeout/process crashes."""
+    try:
+        return run_async(_recover_inventory_reservations_async())
+    except Exception as exc:
+        logger.error(
+            "Recupero prenotazioni inventario fallito: %s",
+            exc,
+            exc_info=True,
+        )
+        raise self.retry(exc=exc)
+
+
+async def _recover_inventory_reservations_async() -> Dict[str, Any]:
+    async with get_isolated_db_session() as session:
+        reservations = await recover_stale_reservations(
+            session,
+            stale_minutes=5,
+            limit=50,
+        )
+        releases = await recover_stale_releases(
+            session,
+            stale_minutes=5,
+            limit=50,
+        )
+    result = {"reservations": reservations, "releases": releases}
+    logger.info("Recupero prenotazioni inventario concluso: %s", result)
+    return result

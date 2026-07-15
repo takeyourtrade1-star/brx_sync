@@ -15,6 +15,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Runtime least privilege: API, Celery and migration helpers do not need root.
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --create-home --shell /usr/sbin/nologin app \
+    && chown -R app:app /app
+
+USER app
+
 # Expose port
 EXPOSE 8000
 

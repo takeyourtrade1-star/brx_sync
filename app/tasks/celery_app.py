@@ -34,6 +34,7 @@ celery_app.conf.update(
         "app.tasks.sync_tasks.sync_delete_product_to_cardtrader": {"queue": "high-priority"},
         "app.tasks.periodic_sync.reconcile_all_users": {"queue": "bulk-sync"},
         "app.tasks.periodic_sync.reconcile_user": {"queue": "bulk-sync"},
+        "app.tasks.periodic_sync.recover_inventory_reservations": {"queue": "high-priority"},
     },
 
     # Riconciliazione periodica CardTrader → locale (reconciler v2, solo letture CT)
@@ -41,6 +42,10 @@ celery_app.conf.update(
         "reconcile-all-users": {
             "task": "app.tasks.periodic_sync.reconcile_all_users",
             "schedule": crontab(minute=15, hour="*/6"),  # ogni 6 ore
+        },
+        "recover-stale-inventory-reservations": {
+            "task": "app.tasks.periodic_sync.recover_inventory_reservations",
+            "schedule": crontab(minute="*/5"),
         },
     },
     # Il beat gira embedded nel worker (-B): file di stato in /tmp
