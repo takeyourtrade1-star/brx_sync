@@ -108,6 +108,8 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         user_id=user_id,
                         cardtrader_token_encrypted="encrypted",
                         sync_status=SyncStatusEnum.ACTIVE.value,
+                        execution_mode="real",
+                        writes_enabled=True,
                     )
                 )
                 item = UserInventoryItem(
@@ -118,6 +120,7 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     properties={"condition": "Near Mint"},
                     external_stock_id=external_stock_id,
                     source="cardtrader",
+                    environment="real",
                 )
                 session.add(item)
                 await session.flush()

@@ -13,7 +13,7 @@ celery_app = Celery(
     "brx_sync",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.sync_tasks", "app.tasks.periodic_sync"],
+    include=["app.tasks.sync_tasks", "app.tasks.periodic_sync", "app.tasks.outbox_tasks"],
 )
 
 # Celery configuration
@@ -28,13 +28,12 @@ celery_app.conf.update(
     # Queue configuration
     task_routes={
         "app.tasks.sync_tasks.process_webhook_notification": {"queue": "high-priority"},
-        "app.tasks.sync_tasks.update_product_quantity": {"queue": "high-priority"},
         "app.tasks.sync_tasks.initial_bulk_sync": {"queue": "bulk-sync"},
-        "app.tasks.sync_tasks.sync_update_product_to_cardtrader": {"queue": "high-priority"},
-        "app.tasks.sync_tasks.sync_delete_product_to_cardtrader": {"queue": "high-priority"},
         "app.tasks.periodic_sync.reconcile_all_users": {"queue": "bulk-sync"},
         "app.tasks.periodic_sync.reconcile_user": {"queue": "bulk-sync"},
         "app.tasks.periodic_sync.recover_inventory_reservations": {"queue": "high-priority"},
+        "app.tasks.outbox_tasks.process_cardtrader_outbox_command": {"queue": "sync-real"},
+        "app.tasks.outbox_tasks.dispatch_pending_cardtrader_outbox": {"queue": "sync-real"},
     },
 
     # Riconciliazione periodica CardTrader → locale (reconciler v2, solo letture CT)
@@ -46,6 +45,10 @@ celery_app.conf.update(
         "recover-stale-inventory-reservations": {
             "task": "app.tasks.periodic_sync.recover_inventory_reservations",
             "schedule": crontab(minute="*/5"),
+        },
+        "dispatch-cardtrader-outbox": {
+            "task": "app.tasks.outbox_tasks.dispatch_pending_cardtrader_outbox",
+            "schedule": crontab(minute="*"),
         },
     },
     # Il beat gira embedded nel worker (-B): file di stato in /tmp

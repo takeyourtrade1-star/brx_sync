@@ -31,6 +31,7 @@ services:
       - DEBUG
       - AWS_SSM_ENABLED
       - ALLOWED_ORIGINS
+      - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
       - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:
@@ -53,7 +54,7 @@ services:
     image: 000876600482.dkr.ecr.eu-south-1.amazonaws.com/ebartex-sync:latest
     container_name: brx-sync-worker
     restart: unless-stopped
-    command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,default --concurrency=4
+    command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,sync-real,default --concurrency=4
     environment:
       - DATABASE_URL
       # Celery ha quattro processi: pool piccolo per processo, con backpressure.
@@ -74,6 +75,9 @@ services:
       - ENVIRONMENT
       - DEBUG
       - AWS_SSM_ENABLED
+      - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
+      - CARDTRADER_JOB_POLL_TIMEOUT_SECONDS=${CARDTRADER_JOB_POLL_TIMEOUT_SECONDS:-180}
+      - CARDTRADER_JOB_POLL_INTERVAL_SECONDS=${CARDTRADER_JOB_POLL_INTERVAL_SECONDS:-1.1}
       - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:

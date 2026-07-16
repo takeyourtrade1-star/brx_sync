@@ -19,30 +19,51 @@ Regole di sicurezza:
   ripreso al giro successivo.
 - Le righe interne (external_stock_id NULL) non vengono mai toccate.
 """
+import hashlib
 import json
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_encryption_manager
 from app.core.redis_client import get_redis_sync
-from app.models.inventory import UserInventoryItem, UserSyncSettings
+from app.models.inventory import (
+    CardTraderOutbox,
+    SyncSnapshot,
+    UserInventoryItem,
+    UserSyncSettings,
+)
 from app.services.cardtrader_client import CardTraderClient
+from app.services.marketplace_projection import project_inventory_to_marketplace
 
 logger = logging.getLogger(__name__)
 
 # Redis: contatori di assenza consecutiva e dimensione ultima snapshot valida
-MISSING_KEY = "reconcile_report:missing:{user_id}"
-LAST_SNAPSHOT_SIZE_KEY = "reconcile_report:last_snapshot_size:{user_id}"
+MISSING_KEY = "reconcile_report:missing:{user_id}:{environment}"
+LAST_SNAPSHOT_SIZE_KEY = "reconcile_report:last_snapshot_size:{user_id}:{environment}"
 STATE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 giorni
 
 # Limite voci dettagliate per categoria nel report (i conteggi restano completi)
 DETAIL_LIMIT = 50
+
+
+def _snapshot_checksum(products: List[Dict[str, Any]]) -> str:
+    canonical = sorted(
+        (
+            str(product.get("id")),
+            int(product.get("quantity") or 0),
+            _extract_price_cents(product),
+        )
+        for product in products
+    )
+    return hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _extract_price_cents(product: Dict[str, Any]) -> Optional[int]:
@@ -125,7 +146,6 @@ def diff_inventory(
     """
     ct_by_pid = {str(p["id"]): p for p in products}
     local_by_pid = {item.external_stock_id: item for item in local_items}
-
     identical = 0
     quantity_diffs: List[Dict[str, Any]] = []
     price_diffs: List[Dict[str, Any]] = []
@@ -233,8 +253,8 @@ def diff_inventory(
     }
 
 
-def _load_missing_counts(redis, user_id: uuid.UUID) -> Dict[str, int]:
-    raw = redis.get(MISSING_KEY.format(user_id=user_id))
+def _load_missing_counts(redis, user_id: uuid.UUID, environment: str) -> Dict[str, int]:
+    raw = redis.get(MISSING_KEY.format(user_id=user_id, environment=environment))
     if not raw:
         return {}
     try:
@@ -248,6 +268,7 @@ def _load_missing_counts(redis, user_id: uuid.UUID) -> Dict[str, int]:
 def _save_snapshot_state(
     redis,
     user_id: uuid.UUID,
+    environment: str,
     ct_pids: set,
     local_pids: set,
     missing_counts: Dict[str, int],
@@ -259,12 +280,12 @@ def _save_snapshot_state(
             new_counts[pid] = missing_counts.get(pid, 0) + 1
         # presente di nuovo → contatore azzerato (semplicemente non salvato)
     redis.set(
-        MISSING_KEY.format(user_id=user_id),
+        MISSING_KEY.format(user_id=user_id, environment=environment),
         json.dumps(new_counts),
         ex=STATE_TTL_SECONDS,
     )
     redis.set(
-        LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id),
+        LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id, environment=environment),
         str(len(ct_pids)),
         ex=STATE_TTL_SECONDS,
     )
@@ -277,24 +298,32 @@ async def _load_local_and_export(
 ) -> Tuple[List[UserInventoryItem], int, Any]:
     """Carica righe locali collegate, conteggio righe interne ed export CT."""
     user_id = sync_settings.user_id
+    environment = sync_settings.execution_mode
+    if environment not in {"partial", "real"}:
+        raise PermissionError("DEMO mode cannot read the CardTrader inventory")
 
     result = await session.execute(
         select(UserInventoryItem).where(
             UserInventoryItem.user_id == user_id,
+            UserInventoryItem.source == "cardtrader",
+            UserInventoryItem.environment == environment,
             UserInventoryItem.external_stock_id.isnot(None),
             UserInventoryItem.external_stock_id != "",
         )
     )
     local_items = list(result.scalars().all())
 
-    internal_rows = (
+    internal_count = (
         await session.execute(
-            select(UserInventoryItem.id).where(
+            select(func.count())
+            .select_from(UserInventoryItem)
+            .where(
                 UserInventoryItem.user_id == user_id,
+                UserInventoryItem.environment == environment,
                 UserInventoryItem.external_stock_id.is_(None),
             )
         )
-    ).scalars().all()
+    ).scalar_one()
 
     token = get_encryption_manager().decrypt(sync_settings.cardtrader_token_encrypted)
 
@@ -306,7 +335,7 @@ async def _load_local_and_export(
     async with CardTraderClient(token, str(user_id)) as client:
         products = await client.get_products_export()
 
-    return local_items, len(internal_rows), products
+    return local_items, internal_count, products
 
 
 async def reconcile_user_report(
@@ -324,9 +353,32 @@ async def reconcile_user_report(
     local_items, internal_count, products = await _load_local_and_export(
         session, sync_settings
     )
+    current_policy = (
+        await session.execute(
+            select(
+                UserSyncSettings.execution_mode,
+                UserSyncSettings.mode_version,
+            ).where(UserSyncSettings.user_id == user_id)
+        )
+    ).one()
+    if (
+        current_policy.execution_mode != sync_settings.execution_mode
+        or current_policy.mode_version != sync_settings.mode_version
+    ):
+        raise RuntimeError("Sync mode changed during CardTrader export")
 
-    raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
-    previous_size = int(raw_prev) if raw_prev else None
+    previous_size = (
+        await session.execute(
+            select(SyncSnapshot.product_count)
+            .where(
+                SyncSnapshot.user_id == user_id,
+                SyncSnapshot.environment == sync_settings.execution_mode,
+                SyncSnapshot.status == "applied",
+            )
+            .order_by(SyncSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     local_active_rows = sum(1 for item in local_items if item.quantity > 0)
 
     ok, problems = validate_snapshot(products, previous_size, local_active_rows)
@@ -341,12 +393,19 @@ async def reconcile_user_report(
             "local_internal_rows": internal_count,
         }
 
-    missing_counts = _load_missing_counts(redis, user_id)
+    missing_counts = _load_missing_counts(redis, user_id, sync_settings.execution_mode)
     diff = diff_inventory(products, local_items, missing_counts, map_blueprint)
 
     ct_pids = {str(p["id"]) for p in products}
     local_pids = {item.external_stock_id for item in local_items}
-    _save_snapshot_state(redis, user_id, ct_pids, local_pids, missing_counts)
+    _save_snapshot_state(
+        redis,
+        user_id,
+        sync_settings.execution_mode,
+        ct_pids,
+        local_pids,
+        missing_counts,
+    )
 
     return {
         "user_id": str(user_id),
@@ -371,15 +430,40 @@ async def reconcile_user_apply(
     (l'HTTP verso CardTrader è già concluso quando si inizia a scrivere).
     """
     user_id = sync_settings.user_id
-    redis = get_redis_sync()
 
     local_items, internal_count, products = await _load_local_and_export(
         session, sync_settings
     )
 
-    raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
-    previous_size = int(raw_prev) if raw_prev else None
+    current_policy = (
+        await session.execute(
+            select(
+                UserSyncSettings.execution_mode,
+                UserSyncSettings.mode_version,
+            ).where(UserSyncSettings.user_id == user_id)
+        )
+    ).one()
+    if (
+        current_policy.execution_mode != sync_settings.execution_mode
+        or current_policy.mode_version != sync_settings.mode_version
+    ):
+        raise RuntimeError("Sync mode changed during CardTrader export")
+
+    previous_size = (
+        await session.execute(
+            select(SyncSnapshot.product_count)
+            .where(
+                SyncSnapshot.user_id == user_id,
+                SyncSnapshot.environment == sync_settings.execution_mode,
+                SyncSnapshot.status == "applied",
+            )
+            .order_by(SyncSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
     local_active_rows = sum(1 for item in local_items if item.quantity > 0)
+    snapshot_id = uuid.uuid4()
+    checksum = _snapshot_checksum(products) if isinstance(products, list) else None
 
     ok, problems = validate_snapshot(products, previous_size, local_active_rows)
     if not ok:
@@ -388,16 +472,45 @@ async def reconcile_user_apply(
             user_id,
             problems,
         )
-        return {
+        rejected = {
             "user_id": str(user_id),
             "status": "rejected",
             "problems": problems,
             "export_size": len(products) if isinstance(products, list) else None,
         }
+        session.add(
+            SyncSnapshot(
+                id=snapshot_id,
+                user_id=user_id,
+                environment=sync_settings.execution_mode,
+                status="rejected",
+                product_count=len(products) if isinstance(products, list) else None,
+                checksum=checksum,
+                problems_json=problems,
+                result_json=rejected,
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+        return rejected
 
-    missing_counts = _load_missing_counts(redis, user_id)
+    missing_counts = {
+        str(item.external_stock_id): item.missing_snapshot_count
+        for item in local_items
+        if item.external_stock_id
+    }
     ct_by_pid = {str(p["id"]): p for p in products}
     local_by_pid = {item.external_stock_id: item for item in local_items}
+    uncertain_commands = list(
+        (
+            await session.execute(
+                select(CardTraderOutbox.id, CardTraderOutbox.target_product_id).where(
+                    CardTraderOutbox.user_id == user_id,
+                    CardTraderOutbox.status == "uncertain",
+                )
+            )
+        ).all()
+    )
 
     applied = {
         "updated": 0,
@@ -407,6 +520,9 @@ async def reconcile_user_apply(
         "skipped_concurrent": 0,  # riga cambiata da un acquisto durante il run
         "skipped_unmapped": 0,    # blueprint senza mapping catalogo (o One Piece)
         "skipped_zero_qty": 0,    # nuovo su CT ma già esaurito: non creato
+        "uncertain_verified": 0,
+        "uncertain_failed": 0,
+        "uncertain_errors": 0,
     }
 
     try:
@@ -450,6 +566,12 @@ async def reconcile_user_apply(
                         properties=product.get("properties_hash", {}),
                         external_stock_id=pid,
                         source="cardtrader",
+                        environment=sync_settings.execution_mode,
+                        lifecycle_status="sold_out" if ct_quantity == 0 else "active",
+                        sync_state="synced",
+                        mapping_status="mapped",
+                        missing_snapshot_count=0,
+                        last_seen_snapshot_id=snapshot_id,
                     )
                     .on_conflict_do_nothing()
                 )
@@ -462,13 +584,23 @@ async def reconcile_user_apply(
             # NB: l'UPDATE ORM sincronizza anche l'oggetto in memoria, quindi
             # il valore letto va salvato PRIMA di eseguire l'update.
             quantity_seen = local.quantity
+            if local.sync_state in {"pending", "accepted", "uncertain"}:
+                applied["skipped_concurrent"] += 1
+                continue
             values: Dict[str, Any] = {}
             if quantity_seen != ct_quantity:
                 values["quantity"] = ct_quantity
             if ct_price is not None and local.price_cents != ct_price:
                 values["price_cents"] = ct_price
-            if not values:
-                continue
+            stock_changed = "quantity" in values or "price_cents" in values
+            values.update(
+                {
+                    "missing_snapshot_count": 0,
+                    "last_seen_snapshot_id": snapshot_id,
+                    "lifecycle_status": "sold_out" if ct_quantity == 0 else "active",
+                    "sync_state": "synced",
+                }
+            )
 
             # Update ottimistico: applica solo se la quantità è ancora quella
             # letta a inizio run (un acquisto concorrente la può aver cambiata).
@@ -484,14 +616,18 @@ async def reconcile_user_apply(
                 applied["skipped_concurrent"] += 1
             elif ct_quantity == 0 and quantity_seen > 0:
                 applied["sold_out"] += 1
-            else:
+            elif stock_changed:
                 applied["updated"] += 1
 
         # 2) Articoli spariti dall'export: azzera solo alla 2ª assenza consecutiva
         for pid, local in local_by_pid.items():
             if pid in ct_by_pid or local.quantity == 0:
                 continue
-            if missing_counts.get(pid, 0) + 1 >= 2:
+            if local.sync_state in {"pending", "accepted", "uncertain"}:
+                applied["skipped_concurrent"] += 1
+                continue
+            next_missing_count = missing_counts.get(pid, 0) + 1
+            if next_missing_count >= 2:
                 quantity_seen = local.quantity
                 result = await session.execute(
                     update(UserInventoryItem)
@@ -499,12 +635,28 @@ async def reconcile_user_apply(
                         UserInventoryItem.id == local.id,
                         UserInventoryItem.quantity == quantity_seen,
                     )
-                    .values(quantity=0)
+                    .values(
+                        quantity=0,
+                        missing_snapshot_count=next_missing_count,
+                        lifecycle_status="archived",
+                    )
                 )
                 if result.rowcount == 0:
                     applied["skipped_concurrent"] += 1
                 else:
                     applied["archived"] += 1
+            else:
+                await session.execute(
+                    update(UserInventoryItem)
+                    .where(
+                        UserInventoryItem.id == local.id,
+                        UserInventoryItem.quantity == local.quantity,
+                    )
+                    .values(
+                        missing_snapshot_count=next_missing_count,
+                        lifecycle_status="stale",
+                    )
+                )
 
         # 3) last_sync_at nella stessa transazione
         await session.execute(
@@ -512,23 +664,64 @@ async def reconcile_user_apply(
             .where(UserSyncSettings.user_id == user_id)
             .values(last_sync_at=datetime.now(timezone.utc), last_error=None)
         )
+        await project_inventory_to_marketplace(
+            session,
+            user_id,
+            sync_settings.execution_mode,
+        )
+        snapshot_result = {
+            "user_id": str(user_id),
+            "status": "ok",
+            "export_size": len(products),
+            "previous_snapshot_size": previous_size,
+            "local_linked_rows": len(local_items),
+            "local_internal_rows": internal_count,
+            "applied": applied,
+        }
+        session.add(
+            SyncSnapshot(
+                id=snapshot_id,
+                user_id=user_id,
+                environment=sync_settings.execution_mode,
+                status="applied",
+                product_count=len(products),
+                checksum=checksum,
+                result_json=snapshot_result,
+                completed_at=datetime.now(timezone.utc),
+            )
+        )
         await session.commit()
     except Exception:
         await session.rollback()
         raise
 
-    # Contatori assenza: solo dopo il commit di una snapshot valida applicata
-    ct_pids = set(ct_by_pid.keys())
-    local_pids = set(local_by_pid.keys())
-    _save_snapshot_state(redis, user_id, ct_pids, local_pids, missing_counts)
+    if uncertain_commands:
+        from app.tasks.outbox_tasks import resolve_uncertain_command_from_export
+
+        for command_id, product_id in uncertain_commands:
+            try:
+                resolution = await resolve_uncertain_command_from_export(
+                    command_id,
+                    ct_by_pid.get(str(product_id)),
+                )
+                if resolution == "verified":
+                    applied["uncertain_verified"] += 1
+                elif resolution == "failed":
+                    applied["uncertain_failed"] += 1
+            except Exception as exc:
+                applied["uncertain_errors"] += 1
+                logger.error(
+                    "Unable to resolve uncertain command %s: %s",
+                    command_id,
+                    exc,
+                    exc_info=True,
+                )
+        await session.execute(
+            update(SyncSnapshot)
+            .where(SyncSnapshot.id == snapshot_id)
+            .values(result_json=snapshot_result)
+        )
+        await session.commit()
 
     logger.info("Reconcile apply per %s: %s", user_id, applied)
-    return {
-        "user_id": str(user_id),
-        "status": "ok",
-        "export_size": len(products),
-        "previous_snapshot_size": previous_size,
-        "local_linked_rows": len(local_items),
-        "local_internal_rows": internal_count,
-        "applied": applied,
-    }
+    return snapshot_result

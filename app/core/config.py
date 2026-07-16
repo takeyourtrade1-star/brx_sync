@@ -109,6 +109,12 @@ class Settings(BaseSettings):
         default="https://api.cardtrader.com/api/v2",
         description="CardTrader V2 API base URL",
     )
+    CARDTRADER_WRITES_ENABLED: bool = Field(
+        default=False,
+        description="Global emergency switch for all CardTrader mutations",
+    )
+    CARDTRADER_JOB_POLL_TIMEOUT_SECONDS: int = Field(default=180, ge=5, le=600)
+    CARDTRADER_JOB_POLL_INTERVAL_SECONDS: float = Field(default=1.1, ge=1.0, le=10.0)
     TRADE_CARDTRADER_MUTATION_TIMEOUT_SECONDS: float = Field(
         default=15.0,
         ge=1.0,

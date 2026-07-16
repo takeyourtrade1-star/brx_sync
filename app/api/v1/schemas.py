@@ -169,6 +169,9 @@ class SyncStatusResponse(BaseModel):
         None,
         description="True if CardTrader link was removed (no token); re-configure to sync again",
     )
+    execution_mode: Literal["demo", "partial", "real"] = "demo"
+    mode_version: int = 0
+    writes_enabled: bool = False
     
     class Config:
         """Pydantic config."""
@@ -200,6 +203,13 @@ class InventoryItemResponse(BaseModel):
     source: Literal["cardtrader", "trade", "internal_test"] = Field(
         ..., description="Inventory origin"
     )
+    environment: Literal["demo", "partial", "real"] = "real"
+    lifecycle_status: Literal[
+        "active", "sold_out", "stale", "archived", "pending_delete", "sync_failed"
+    ] = "active"
+    sync_state: Literal["synced", "pending", "accepted", "failed", "uncertain"] = "synced"
+    mapping_status: Literal["mapped", "unsupported", "missing", "error"] = "mapped"
+    row_version: int = 1
     description: Optional[str] = Field(None, description="Product description")
     user_data_field: Optional[str] = Field(None, description="Custom metadata field")
     graded: Optional[bool] = Field(None, description="Whether the product is graded")

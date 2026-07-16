@@ -12,7 +12,6 @@ from app.services.rate_limiter import get_rate_limiter
 from app.services.adaptive_rate_limiter import get_adaptive_rate_limiter
 from app.services.circuit_breaker import (
     get_circuit_breaker,
-    CircuitBreakerOpenError,
     CircuitState,
 )
 
@@ -230,6 +229,18 @@ class CardTraderClient:
             params["expansion_id"] = expansion_id
         
         return await self._make_request("GET", "/products/export", params=params)
+
+    async def get_product(self, product_id: int) -> Optional[Dict[str, Any]]:
+        """Read one product for a last-moment stale-stock guard."""
+
+        try:
+            result = await self._make_request("GET", f"/products/{product_id}")
+        except CardTraderAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        resource = result.get("resource") if isinstance(result, dict) else None
+        return resource if isinstance(resource, dict) else result
 
     async def bulk_create_products(
         self, products: List[Dict[str, Any]]

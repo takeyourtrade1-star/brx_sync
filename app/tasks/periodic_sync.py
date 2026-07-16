@@ -11,6 +11,7 @@ database locale (vedi app/services/reconciler.py). Non scrive MAI su CardTrader.
 Single-flight per utente tramite lock Redis: se una riconciliazione per lo
 stesso utente è già in corso, il giro viene saltato.
 """
+import json
 import logging
 import uuid
 from typing import Any, Dict, List
@@ -32,6 +33,54 @@ logger = logging.getLogger(__name__)
 
 LOCK_KEY = "reconcile:lock:{user_id}"
 LOCK_TTL_SECONDS = 1800  # 30 minuti: oltre il peggior export CardTrader
+LOCK_RELEASE_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _set_reconcile_operation(
+    task_id: str,
+    user_id: str,
+    status: str,
+    result: Dict[str, Any] | None = None,
+) -> None:
+    """Keep ownership/progress durable even when Celery starts immediately."""
+
+    from sqlalchemy import text
+    from app.core.database import get_sync_db_engine
+
+    metadata = json.dumps(result, default=str) if result is not None else None
+    with get_sync_db_engine().begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO sync_operations
+                    (user_id, operation_id, operation_type, status, operation_metadata)
+                VALUES
+                    (CAST(:user_id AS uuid), :task_id, 'reconcile', :status,
+                     CAST(:metadata AS jsonb))
+                ON CONFLICT (operation_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    operation_metadata = COALESCE(
+                        EXCLUDED.operation_metadata,
+                        sync_operations.operation_metadata
+                    ),
+                    completed_at = CASE
+                        WHEN EXCLUDED.status IN ('completed', 'failed') THEN NOW()
+                        ELSE NULL
+                    END
+                """
+            ),
+            {
+                "user_id": user_id,
+                "task_id": task_id,
+                "status": status,
+                "metadata": metadata,
+            },
+        )
 
 
 def _build_blueprint_mapper():
@@ -49,7 +98,8 @@ async def _reconcile_one(session, settings_row, redis, map_blueprint) -> Dict[st
     """Riconcilia un utente con lock single-flight. Non solleva mai."""
     user_id = settings_row.user_id
     lock_key = LOCK_KEY.format(user_id=user_id)
-    if not redis.set(lock_key, "1", nx=True, ex=LOCK_TTL_SECONDS):
+    lock_owner = str(uuid.uuid4())
+    if not redis.set(lock_key, lock_owner, nx=True, ex=LOCK_TTL_SECONDS):
         logger.info("Reconcile %s saltata: già in corso", user_id)
         return {"user_id": str(user_id), "status": "locked"}
 
@@ -63,7 +113,10 @@ async def _reconcile_one(session, settings_row, redis, map_blueprint) -> Dict[st
             "error": f"{type(exc).__name__}: {exc}",
         }
     finally:
-        redis.delete(lock_key)
+        try:
+            redis.eval(LOCK_RELEASE_SCRIPT, 1, lock_key, lock_owner)
+        except Exception as exc:  # lock TTL still prevents a permanent deadlock
+            logger.warning("Impossibile rilasciare lock reconcile %s: %s", user_id, exc)
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=600)
@@ -86,7 +139,8 @@ async def _reconcile_all_users_async() -> Dict[str, Any]:
             await session.execute(
                 select(UserSyncSettings).where(
                     # la colonna è un enum Postgres: confronto come testo
-                    cast(UserSyncSettings.sync_status, String) == "active"
+                    cast(UserSyncSettings.sync_status, String) == "active",
+                    UserSyncSettings.execution_mode.in_(["partial", "real"]),
                 )
             )
         ).scalars().all()
@@ -114,12 +168,24 @@ async def _reconcile_all_users_async() -> Dict[str, Any]:
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
 def reconcile_user(self, user_id: str) -> Dict[str, Any]:
     """Riconciliazione manuale di un singolo utente (trigger da API)."""
+    task_id = self.request.id
     try:
-        return run_async(_reconcile_single_user_async(user_id))
+        _set_reconcile_operation(task_id, user_id, "processing")
+        result = run_async(_reconcile_single_user_async(user_id))
+        final_status = "failed" if result.get("status") == "error" else "completed"
+        _set_reconcile_operation(task_id, user_id, final_status, result)
+        return result
     except Exception as exc:
         logger.error(
             "Riconciliazione manuale fallita per %s: %s", user_id, exc, exc_info=True
         )
+        if self.request.retries >= self.max_retries:
+            _set_reconcile_operation(
+                task_id,
+                user_id,
+                "failed",
+                {"status": "error", "error": f"{type(exc).__name__}: {exc}"},
+            )
         raise self.retry(exc=exc)
 
 
@@ -144,6 +210,12 @@ async def _reconcile_single_user_async(user_id: str) -> Dict[str, Any]:
                 "user_id": user_id,
                 "status": "skipped",
                 "reason": f"sync_status={settings_row.sync_status}",
+            }
+        if settings_row.execution_mode not in {"partial", "real"}:
+            return {
+                "user_id": user_id,
+                "status": "skipped",
+                "reason": f"execution_mode={settings_row.execution_mode}",
             }
 
         return await _reconcile_one(session, settings_row, redis, map_blueprint)

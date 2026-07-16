@@ -16,6 +16,34 @@ from sqlalchemy.ext.asyncio import (
 from app.models.inventory import Base
 
 
+class _MutationLeaseRedis:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def set(self, key: str, value: str, *, nx: bool = False, **_kwargs) -> bool:
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    def eval(self, _script: str, _keys: int, key: str, owner: str, *args) -> int:
+        if self.values.get(key) != owner:
+            return 0
+        if args:
+            return 1
+        del self.values[key]
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def mutation_lease_redis(monkeypatch):
+    redis = _MutationLeaseRedis()
+    monkeypatch.setattr(
+        "app.services.cardtrader_mutation_lease.get_redis_sync",
+        lambda: redis,
+    )
+
+
 @pytest.fixture(scope="session")
 def event_loop() -> Generator:
     """Create event loop for async tests."""

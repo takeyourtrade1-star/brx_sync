@@ -10,11 +10,12 @@ from typing import Any, Dict, List, Optional
 # Note: nest_asyncio is NOT applied at module level to avoid conflicts with uvloop.
 # We use isolated event loops in run_async() instead.
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, text, update
 
 from app.core.crypto import get_encryption_manager
 from app.core.database import get_db_session_context, get_isolated_db_session
 from app.models.inventory import (
+    SyncSnapshot,
     SyncStatusEnum,
     SyncOperation,
     UserInventoryItem,
@@ -26,6 +27,8 @@ from app.services.cardtrader_client import (
     CardTraderClient,
     RateLimitError,
 )
+from app.services.marketplace_projection import project_inventory_to_marketplace
+from app.services.sync_policy import assert_cardtrader_write_allowed
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -101,7 +104,6 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
 
     # Create SyncOperation immediately so get_task_status can verify ownership before async work runs
     from app.core.database import get_sync_db_engine
-    from sqlalchemy import text
     try:
         engine = get_sync_db_engine()
         with engine.begin() as conn:
@@ -131,7 +133,6 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
         try:
             # Use sync database connection to update status without async
             from app.core.database import get_sync_db_engine
-            from sqlalchemy import text
             
             engine = get_sync_db_engine()
             with engine.begin() as conn:  # begin() automatically commits or rolls back
@@ -148,6 +149,22 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
                         "error": str(e),
                         "user_id": str(user_uuid)
                     }
+                )
+                conn.execute(
+                    text(
+                        """
+                        UPDATE sync_operations
+                        SET status = 'failed',
+                            operation_metadata = CAST(:metadata AS jsonb),
+                            completed_at = NOW()
+                        WHERE operation_id = :operation_id
+                          AND status IN ('pending','processing')
+                        """
+                    ),
+                    {
+                        "operation_id": operation_id,
+                        "metadata": '{"error": "initial bulk sync failed"}',
+                    },
                 )
             logger.info(f"Updated sync status to error for user {user_uuid}")
         except Exception as update_error:
@@ -171,7 +188,23 @@ async def _initial_bulk_sync_async(
         
         if not sync_settings:
             raise ValueError(f"User sync settings not found for user {user_uuid}")
-        
+        environment = sync_settings.execution_mode
+        mode_version = sync_settings.mode_version
+        if environment not in {"partial", "real"}:
+            raise PermissionError("DEMO mode cannot read the CardTrader inventory")
+        local_active_rows = (
+            await session.execute(
+                select(func.count())
+                .select_from(UserInventoryItem)
+                .where(
+                    UserInventoryItem.user_id == user_uuid,
+                    UserInventoryItem.source == "cardtrader",
+                    UserInventoryItem.environment == environment,
+                    UserInventoryItem.quantity > 0,
+                )
+            )
+        ).scalar_one()
+
         # Decrypt token
         token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
         
@@ -193,6 +226,9 @@ async def _initial_bulk_sync_async(
         stmt_op = select(SyncOperation).where(SyncOperation.operation_id == operation_id)
         res_op = await session.execute(stmt_op)
         sync_op = res_op.scalar_one_or_none()
+        if sync_op:
+            sync_op.status = "processing"
+            await session.commit()
         
         try:
             # Initialize CardTrader client
@@ -201,6 +237,17 @@ async def _initial_bulk_sync_async(
                 logger.info(f"Starting bulk export for user {user_uuid}")
                 products = await client.get_products_export()
                 logger.info(f"Exported {len(products)} products from CardTrader")
+                from app.services.reconciler import _snapshot_checksum, validate_snapshot
+
+                snapshot_ok, snapshot_problems = validate_snapshot(
+                    products,
+                    previous_snapshot_size=None,
+                    local_active_rows=local_active_rows,
+                )
+                if not snapshot_ok:
+                    raise ValueError(
+                        "CardTrader export rejected: " + "; ".join(snapshot_problems)
+                    )
                 
                 # Process in chunks with optimized commit strategy and parallelization
                 total_processed = 0
@@ -225,12 +272,20 @@ async def _initial_bulk_sync_async(
                     # Process chunks in parallel (each chunk uses its own isolated DB session)
                     chunk_tasks = [
                         _process_products_chunk(
-                            user_uuid, chunk, blueprint_mapper
+                            user_uuid, chunk, blueprint_mapper, environment
                         )
                         for chunk in batch_chunks
                     ]
                     
                     batch_results = await asyncio.gather(*chunk_tasks)
+                    await session.refresh(sync_settings)
+                    if (
+                        sync_settings.execution_mode != environment
+                        or sync_settings.mode_version != mode_version
+                    ):
+                        raise RuntimeError(
+                            "Sync mode changed during initial inventory import"
+                        )
                     
                     # Aggregate results
                     for idx, chunk_result in zip(batch_indices, batch_results):
@@ -276,6 +331,11 @@ async def _initial_bulk_sync_async(
                     )
                 )
                 await session.execute(update_stmt)
+                await project_inventory_to_marketplace(
+                    session,
+                    user_uuid,
+                    environment,
+                )
                 
                 # Update sync operation (sync_op loaded above)
                 if sync_op:
@@ -288,6 +348,24 @@ async def _initial_bulk_sync_async(
                         "updated": total_updated,
                         "skipped": total_skipped,
                     }
+                session.add(
+                    SyncSnapshot(
+                        id=uuid.uuid4(),
+                        user_id=user_uuid,
+                        environment=environment,
+                        status="applied",
+                        product_count=len(products),
+                        checksum=_snapshot_checksum(products),
+                        result_json={
+                            "operation": "initial_bulk_sync",
+                            "processed": total_processed,
+                            "created": total_created,
+                            "updated": total_updated,
+                            "skipped": total_skipped,
+                        },
+                        completed_at=datetime.utcnow(),
+                    )
+                )
                 
                 await session.commit()
                 
@@ -315,6 +393,10 @@ async def _initial_bulk_sync_async(
                     )
                 )
                 await session.execute(update_stmt)
+                if sync_op:
+                    sync_op.status = "failed"
+                    sync_op.completed_at = datetime.utcnow()
+                    sync_op.operation_metadata = {"error": str(e)}
                 await session.commit()
             except Exception as update_error:
                 # If async update fails, use sync connection as fallback
@@ -349,6 +431,7 @@ async def _process_products_chunk(
     user_uuid: uuid.UUID,
     products: List[Dict[str, Any]],
     blueprint_mapper,
+    environment: str,
 ) -> Dict[str, int]:
     """
     Process a chunk of products using optimized batch operations.
@@ -388,6 +471,7 @@ async def _process_products_chunk(
             "price_cents": product.get("price_cents", 0),
             "properties": product.get("properties_hash", {}),
             "source": "cardtrader",
+            "environment": environment,
         })
         blueprint_ids.append(blueprint_id)
     
@@ -430,7 +514,7 @@ async def _process_products_chunk(
     async with get_isolated_db_session() as session:
         # Batch SELECT to find existing items (ONE query instead of N)
         lookup_keys = [
-            (user_uuid, p["blueprint_id"], p["external_stock_id"])
+            (user_uuid, environment, p["blueprint_id"], p["external_stock_id"])
             for p in products_to_process
         ]
         existing_items_stmt = select(
@@ -440,6 +524,7 @@ async def _process_products_chunk(
         ).where(
             tuple_(
                 UserInventoryItem.user_id,
+                UserInventoryItem.environment,
                 UserInventoryItem.blueprint_id,
                 UserInventoryItem.external_stock_id,
             ).in_(lookup_keys)
@@ -464,6 +549,10 @@ async def _process_products_chunk(
                     "properties": product["properties"],
                     "external_stock_id": product["external_stock_id"],
                     "source": "cardtrader",
+                    "environment": environment,
+                    "lifecycle_status": "sold_out" if product["quantity"] == 0 else "active",
+                    "sync_state": "synced",
+                    "missing_snapshot_count": 0,
                     "updated_at": now,
                 })
             else:
@@ -475,6 +564,11 @@ async def _process_products_chunk(
                     "properties": product["properties"],
                     "external_stock_id": product["external_stock_id"],
                     "source": "cardtrader",
+                    "environment": environment,
+                    "lifecycle_status": "sold_out" if product["quantity"] == 0 else "active",
+                    "sync_state": "synced",
+                    "mapping_status": "mapped",
+                    "missing_snapshot_count": 0,
                     "created_at": now,
                     "updated_at": now,
                 })
@@ -546,6 +640,7 @@ def update_product_quantity(
     Returns:
         Dict with update result
     """
+    raise RuntimeError("Legacy quantity task is disabled; use webhook ledger or outbox")
     user_uuid = uuid.UUID(user_id)
     
     try:
@@ -620,6 +715,8 @@ def process_webhook_notification(
         return result
     except Exception as e:
         logger.error(f"Error processing webhook {webhook_id}: {e}", exc_info=True)
+        from app.services.webhook_ledger_processor import mark_webhook_failed
+        run_async(mark_webhook_failed(webhook_id, e))
         raise self.retry(exc=e, countdown=min(60, 2 ** self.request.retries))
 
 
@@ -638,9 +735,9 @@ async def _process_webhook_notification_async(
         payload: Webhook payload
         user_id: Optional user UUID (from URL path or extracted from payload)
     """
-    from app.services.webhook_processor import WebhookProcessor
+    from app.services.webhook_ledger_processor import WebhookLedgerProcessor
     
-    processor = WebhookProcessor()
+    processor = WebhookLedgerProcessor()
     return await processor.process_order_webhook(webhook_id, payload, user_id)
 
 
@@ -655,6 +752,7 @@ def sync_update_product_to_cardtrader(
     user_data_field: Optional[str] = None,
     graded: Optional[bool] = None,
     properties: Optional[Dict[str, Any]] = None,
+    expected_mode_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Synchronize product update to CardTrader.
@@ -672,6 +770,7 @@ def sync_update_product_to_cardtrader(
     Returns:
         Dict with sync result
     """
+    raise RuntimeError("Legacy direct update task is disabled; use CardTrader outbox")
     _log_to_file("Celery task sync_update_product_to_cardtrader started", {
         "user_id": user_id,
         "item_id": item_id,
@@ -690,7 +789,8 @@ def sync_update_product_to_cardtrader(
         result = run_async(
             _sync_update_product_async(
                 user_uuid, item_id, price_cents, quantity,
-                description, user_data_field, graded, properties
+                description, user_data_field, graded, properties,
+                expected_mode_version,
             )
         )
         _log_to_file("Celery task sync_update_product_to_cardtrader completed", {
@@ -725,6 +825,7 @@ async def _sync_update_product_async(
     user_data_field: Optional[str] = None,
     graded: Optional[bool] = None,
     properties: Optional[Dict[str, Any]] = None,
+    expected_mode_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Async implementation of product update sync."""
     encryption_manager = get_encryption_manager()
@@ -762,6 +863,12 @@ async def _sync_update_product_async(
         
         if not sync_settings:
             raise ValueError(f"User sync settings not found for user {user_uuid}")
+        # Fail closed before decrypting credentials or preparing a real write.
+        await assert_cardtrader_write_allowed(
+            session,
+            user_uuid,
+            expected_mode_version=expected_mode_version,
+        )
         
         # Decrypt token
         token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
@@ -974,9 +1081,17 @@ async def _sync_update_product_async(
             "update_data": update_data
         })
         
-        async with CardTraderClient(token, str(user_uuid)) as client:
+        # Re-check immediately before the external request so a mode change
+        # invalidates already queued work.
+        await assert_cardtrader_write_allowed(
+            session,
+            user_uuid,
+            expected_mode_version=expected_mode_version,
+        )
+        async with CardTraderClient(token, str(user_uuid)):
             # Use bulk_update (CardTrader supports single product updates via bulk_update)
-            job_result = await client.bulk_update_products([update_data])
+            job_result: Dict[str, Any] = {}
+            raise AssertionError("Legacy direct update task is disabled; use CardTrader outbox")
             job_uuid = job_result.get("job")
             
             _log_to_file("CardTrader bulk_update_products response", {
@@ -1021,6 +1136,7 @@ def sync_delete_product_to_cardtrader(
     self,
     user_id: str,
     external_stock_id: int,
+    expected_mode_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Synchronize product deletion to CardTrader.
@@ -1032,10 +1148,17 @@ def sync_delete_product_to_cardtrader(
     Returns:
         Dict with sync result
     """
+    raise RuntimeError("Legacy direct delete task is disabled; use CardTrader outbox")
     user_uuid = uuid.UUID(user_id)
     
     try:
-        result = run_async(_sync_delete_product_async(user_uuid, external_stock_id))
+        result = run_async(
+            _sync_delete_product_async(
+                user_uuid,
+                external_stock_id,
+                expected_mode_version,
+            )
+        )
         return result
     except RateLimitError as e:
         logger.warning(f"Rate limit error syncing product deletion: {e}")
@@ -1052,6 +1175,7 @@ def sync_delete_product_to_cardtrader(
 async def _sync_delete_product_async(
     user_uuid: uuid.UUID,
     external_stock_id: int,
+    expected_mode_version: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Async implementation of product deletion sync."""
     encryption_manager = get_encryption_manager()
@@ -1072,6 +1196,12 @@ async def _sync_delete_product_async(
             error_msg = f"User sync settings not found for user {user_uuid}"
             _log_to_file("Error in deletion sync", {"error": error_msg})
             raise ValueError(error_msg)
+
+        await assert_cardtrader_write_allowed(
+            session,
+            user_uuid,
+            expected_mode_version=expected_mode_version,
+        )
         
         # Decrypt token
         try:
@@ -1083,12 +1213,18 @@ async def _sync_delete_product_async(
         
         # Delete from CardTrader
         try:
-            async with CardTraderClient(token, str(user_uuid)) as client:
+            await assert_cardtrader_write_allowed(
+                session,
+                user_uuid,
+                expected_mode_version=expected_mode_version,
+            )
+            async with CardTraderClient(token, str(user_uuid)):
                 _log_to_file("Calling CardTrader delete_product", {
                     "external_stock_id": external_stock_id
                 })
                 
-                delete_response = await client.delete_product(external_stock_id)
+                delete_response: Dict[str, Any] = {}
+                raise AssertionError("Legacy direct delete task is disabled; use CardTrader outbox")
                 # delete_response is a dict from the API (or empty dict if no body)
                 response_data = delete_response if isinstance(delete_response, dict) else {}
                 
