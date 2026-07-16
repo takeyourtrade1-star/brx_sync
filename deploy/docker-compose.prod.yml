@@ -3,7 +3,7 @@
 # Segreti da AWS SSM Parameter Store, mai scritti su disco.
 services:
   brx-sync-api:
-    image: 000876600482.dkr.ecr.eu-south-1.amazonaws.com/ebartex-sync:latest
+    image: ${ECR_REGISTRY}/ebartex-sync:${IMAGE_TAG:-latest}
     container_name: brx-sync-api
     restart: unless-stopped
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
@@ -51,7 +51,7 @@ services:
         max-file: "3"
 
   brx-sync-worker:
-    image: 000876600482.dkr.ecr.eu-south-1.amazonaws.com/ebartex-sync:latest
+    image: ${ECR_REGISTRY}/ebartex-sync:${IMAGE_TAG:-latest}
     container_name: brx-sync-worker
     restart: unless-stopped
     command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,sync-real,default --concurrency=4

@@ -19,6 +19,9 @@ set -euo pipefail
 AWS_REGION="eu-south-1"
 ECR_REGISTRY="000876600482.dkr.ecr.eu-south-1.amazonaws.com"
 COMPOSE_FILE="docker-compose.prod.yml"
+export ECR_REGISTRY
+export IMAGE_TAG="${IMAGE_TAG:-latest}"
+export CARDTRADER_WRITES_ENABLED="${CARDTRADER_WRITES_ENABLED:-false}"
 
 # Stesso pattern di auth / search / docker-compose.prod.yml root
 DB_HOST="ebartex-db-postgres.czuw0wy289sx.eu-south-1.rds.amazonaws.com"
@@ -163,6 +166,11 @@ log_step "Applico visibilita' stock bloccato negli scambi..."
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-api \
   sh -c 'DB_URL=$(printf "%s" "$DATABASE_URL" | sed "s#^postgresql+asyncpg:#postgresql:#"); psql "$DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_visibility.sql'
 log_ok "Migrazione visibilita' stock scambi applicata"
+
+log_step "Applico policy di esecuzione CardTrader fail-closed..."
+docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-api \
+  sh -c 'DB_URL=$(printf "%s" "$DATABASE_URL" | sed "s#^postgresql+asyncpg:#postgresql:#"); psql "$DB_URL" -v ON_ERROR_STOP=1 -f migrations/20260716_cardtrader_execution_policy.sql'
+log_ok "Policy di esecuzione CardTrader applicata"
 
 # ── Avvio container ───────────────────────────────────────────────────────────
 log_header "AVVIO CONTAINER"
