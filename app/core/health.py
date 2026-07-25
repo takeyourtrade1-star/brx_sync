@@ -118,9 +118,16 @@ async def check_celery() -> Dict[str, Any]:
     try:
         from app.tasks.celery_app import celery_app
         
-        # Check broker connection
-        inspect = celery_app.control.inspect()
-        active_queues = inspect.active_queues()
+        # Celery's inspect API is synchronous. Keep it off the event loop and
+        # bound it so a broker outage cannot wedge every readiness worker.
+        def inspect_active_queues():
+            inspect = celery_app.control.inspect(timeout=1.0)
+            return inspect.active_queues()
+
+        active_queues = await asyncio.wait_for(
+            asyncio.to_thread(inspect_active_queues),
+            timeout=2.0,
+        )
         
         if active_queues is None:
             return {
@@ -157,8 +164,8 @@ async def get_health_status() -> Dict[str, Any]:
         return_exceptions=True,
     )
     
-    # MySQL check is synchronous, run separately
-    mysql_status = check_mysql()
+    # The MySQL driver is synchronous; never block the FastAPI event loop.
+    mysql_status = await asyncio.to_thread(check_mysql)
     
     # Handle exceptions
     if isinstance(postgresql_status, Exception):

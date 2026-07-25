@@ -29,6 +29,7 @@ services:
       - AWS_REGION
       - ENVIRONMENT
       - DEBUG
+      - ENABLE_TEST_ENDPOINTS=false
       - AWS_SSM_ENABLED
       - ALLOWED_ORIGINS
       - SYNC_LOG_TO_FILE=false
@@ -73,6 +74,7 @@ services:
       - AWS_REGION
       - ENVIRONMENT
       - DEBUG
+      - ENABLE_TEST_ENDPOINTS=false
       - AWS_SSM_ENABLED
       - SYNC_LOG_TO_FILE=false
     depends_on:

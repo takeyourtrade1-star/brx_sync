@@ -56,8 +56,12 @@ allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()] if _raw else
 _amplify_origin = "https://main.d8ry9s45st8bf.amplifyapp.com"
 if allowed_origins != ["*"] and _amplify_origin not in allowed_origins:
     allowed_origins.append(_amplify_origin)
-if "*" in allowed_origins and settings.ENVIRONMENT == "production":
-    raise RuntimeError("ALLOWED_ORIGINS='*' is forbidden in production")
+if "*" in allowed_origins and settings.ENVIRONMENT.strip().lower() not in {
+    "development",
+    "local",
+    "test",
+}:
+    raise RuntimeError("ALLOWED_ORIGINS='*' is allowed only in local/test environments")
 logger.info("CORS allowed_origins: %s", allowed_origins)
 
 app.add_middleware(
@@ -95,24 +99,18 @@ async def health_ready():
     health_status = await get_health_status()
     
     if health_status["status"] == "healthy":
-        return health_status
+        return {"status": "ready"}
     else:
         return JSONResponse(
             status_code=503,
-            content=health_status,
+            content={"status": "unavailable"},
         )
 
 
 @app.get("/health")
 async def health():
-    """
-    Detailed health check endpoint.
-    
-    Returns detailed status for all components.
-    """
-    from app.core.health import get_health_status
-    
-    return await get_health_status()
+    """Minimal public health response; dependency details stay in server logs."""
+    return {"status": "healthy", "service": settings.APP_NAME}
 
 
 @app.get("/metrics")
@@ -137,7 +135,7 @@ app.include_router(internal_routes.router)
 try:
     import os
     static_dir = os.path.join(os.path.dirname(__file__), "..", "static")
-    if os.path.exists(static_dir):
+    if settings.test_endpoints_enabled and os.path.exists(static_dir):
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
         
         @app.get("/test")

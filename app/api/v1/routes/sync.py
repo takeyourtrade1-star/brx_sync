@@ -1,6 +1,7 @@
 """
 API endpoints for sync operations.
 """
+import json
 import logging
 import time
 import uuid
@@ -27,7 +28,8 @@ from app.api.v1.schemas import (
     UpdateInventoryItemResponse,
 )
 from app.api.dependencies import get_current_user_id, verify_user_id_match
-from app.core.database import get_db_session, get_sync_db_engine
+from app.core.config import get_settings
+from app.core.database import get_db_session
 from sqlalchemy import text
 from app.core.exceptions import (
     InventoryItemMissingExternalIdError,
@@ -54,48 +56,27 @@ from app.tasks.periodic_sync import reconcile_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
+settings = get_settings()
 
 
-@router.post("/migrate/composite-index", status_code=status.HTTP_200_OK)
-async def apply_composite_index_migration(
-    user_id_from_token: str = Depends(get_current_user_id),
-) -> dict:
-    """
-    Apply composite index migration for optimized bulk sync.
-    
-    This endpoint creates the index: idx_inventory_user_blueprint_external
-    on (user_id, blueprint_id, external_stock_id) columns.
-    
-    Requires authentication (admin users only in production).
-    
-    Returns:
-        Migration result
-    """
-    try:
-        engine = get_sync_db_engine()
-        
-        migration_sql = """
-        CREATE INDEX IF NOT EXISTS idx_inventory_user_blueprint_external 
-        ON user_inventory_items(user_id, blueprint_id, external_stock_id);
-        """
-        
-        with engine.begin() as conn:
-            conn.execute(text(migration_sql))
-        
-        engine.dispose()
-        
-        return {
-            "status": "success",
-            "message": "Composite index created successfully",
-            "index_name": "idx_inventory_user_blueprint_external",
-            "columns": ["user_id", "blueprint_id", "external_stock_id"],
-        }
-    except Exception as e:
-        logger.error(f"Error applying composite index migration: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error applying migration: {str(e)}"
-        )
+class WebhookBodyTooLarge(ValueError):
+    pass
+
+
+async def _read_webhook_body(request: Request) -> bytes:
+    limit = settings.WEBHOOK_MAX_BODY_BYTES
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > limit:
+        raise WebhookBodyTooLarge()
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise WebhookBodyTooLarge()
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @router.post("/start/{user_id}", status_code=status.HTTP_202_ACCEPTED)
@@ -501,11 +482,10 @@ async def receive_webhook(
             user_uuid = uuid.UUID(user_id)
         except ValueError as e:
             logger.error(f"Invalid user_id format in webhook: {user_id}")
-            return {
-                "status": "error",
-                "user_id": user_id,
-                "message": f"Invalid user_id format: {str(e)}",
-            }
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid user_id format",
+            ) from e
         
         # Verify user exists and get webhook_secret
         stmt = select(UserSyncSettings).where(
@@ -516,23 +496,23 @@ async def receive_webhook(
         
         if not sync_settings:
             logger.warning(f"Webhook received for unknown user: {user_id}")
-            return {
-                "status": "error",
-                "user_id": user_id,
-                "message": "User not found in sync settings",
-            }
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found in sync settings",
+            )
         
-        # Get raw body for signature validation
-        body = await request.body()
+        # Bound the body before buffering it. The endpoint is public by design
+        # (HMAC-authenticated), so an unbounded request would be a memory DoS.
+        try:
+            body = await _read_webhook_body(request)
+        except WebhookBodyTooLarge as exc:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Webhook body too large",
+            ) from exc
         
         # Get signature header
         signature_header = request.headers.get("Signature", "")
-        
-        # Get webhook payload
-        payload = await request.json()
-        
-        # Extract webhook_id from payload
-        webhook_id = payload.get("id", "unknown")
         
         # Validazione firma OBBLIGATORIA (fail-closed): senza secret o con firma
         # non valida il webhook viene rifiutato e NON accodato. Evita che chiunque
@@ -543,26 +523,63 @@ async def receive_webhook(
                 f"Webhook rifiutato: nessun webhook_secret per user {user_id}. "
                 f"L'utente deve ricollegare CardTrader."
             )
-            return {
-                "status": "rejected",
-                "user_id": user_id,
-                "message": "Webhook secret not configured; re-link CardTrader",
-            }
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Webhook secret not configured",
+            )
         try:
             verify_webhook(body, signature_header, shared_secret)
         except WebhookValidationError as e:
             logger.warning(
                 f"Webhook rifiutato: firma non valida per user {user_id}: {e}"
             )
-            return {
-                "status": "rejected",
-                "user_id": user_id,
-                "webhook_id": webhook_id,
-                "message": "Invalid webhook signature",
-            }
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid webhook signature",
+            ) from e
+
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid webhook JSON",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Webhook payload must be an object",
+            )
+
+        # CardTrader documents this top-level value as the unique identifier
+        # for a single endpoint call. It is the stable idempotency key across
+        # retries; ``object_id``/``data.id`` instead identify the order.
+        webhook_id_raw = payload.get("id")
+        if not isinstance(webhook_id_raw, (str, int)) or not str(webhook_id_raw).strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing webhook id",
+            )
+        webhook_id = str(webhook_id_raw).strip()
+        if len(webhook_id) > 128:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid webhook id",
+            )
 
         # Queue async processing with user_id
-        process_webhook_notification.delay(webhook_id, payload, str(user_uuid))
+        try:
+            process_webhook_notification.delay(webhook_id, payload, str(user_uuid))
+        except Exception as e:
+            logger.error(
+                "Webhook %s validated but could not be enqueued; requesting retry",
+                webhook_id,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Webhook processing temporarily unavailable",
+            ) from e
         
         elapsed = (time.time() - start_time) * 1000  # milliseconds
         logger.info(
@@ -576,17 +593,19 @@ async def receive_webhook(
             "processing_time_ms": round(elapsed, 2),
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(
             f"Error processing webhook for user {user_id}: {e}",
             exc_info=True
         )
-        # Still return 200 to avoid CardTrader retries
-        return {
-            "status": "error",
-            "user_id": user_id,
-            "message": str(e),
-        }
+        # A non-2xx response is intentional: CardTrader must retry transient
+        # parsing, database, Redis or queue failures instead of losing events.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook processing temporarily unavailable",
+        ) from e
 
 
 @router.post("/webhook/{webhook_id}", status_code=status.HTTP_200_OK)
@@ -680,6 +699,7 @@ async def get_webhook_url(
 @router.post("/setup-test-user")
 async def setup_test_user(
     request: SetupTestUserRequest,
+    user_id_from_token: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
@@ -691,6 +711,18 @@ async def setup_test_user(
     Returns:
         User sync settings
     """
+    if not settings.test_endpoints_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    try:
+        owns_requested_user = uuid.UUID(user_id_from_token) == uuid.UUID(request.user_id)
+    except ValueError:
+        owns_requested_user = False
+    if not owns_requested_user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot configure CardTrader sync for another user",
+        )
+
     try:
         user_uuid = uuid.UUID(request.user_id)
     except ValueError as e:

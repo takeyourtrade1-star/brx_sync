@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = Field(default=False, description="Debug mode")
     ENVIRONMENT: str = Field(default="production", description="Environment name")
+    ENABLE_TEST_ENDPOINTS: bool = Field(
+        default=False,
+        description=(
+            "Expose local-only test helpers. Ignored outside development/local/test."
+        ),
+    )
     ALLOWED_ORIGINS: str = Field(
         default="*",
         description="Comma-separated list of allowed CORS origins (use '*' for all in dev only)"
@@ -109,6 +115,12 @@ class Settings(BaseSettings):
         default="https://api.cardtrader.com/api/v2",
         description="CardTrader V2 API base URL",
     )
+    WEBHOOK_MAX_BODY_BYTES: int = Field(
+        default=1024 * 1024,
+        ge=1024,
+        le=4 * 1024 * 1024,
+        description="Maximum accepted CardTrader webhook request body.",
+    )
     TRADE_CARDTRADER_MUTATION_TIMEOUT_SECONDS: float = Field(
         default=15.0,
         ge=1.0,
@@ -188,6 +200,15 @@ class Settings(BaseSettings):
         if not self.FERNET_KEY:
             raise ValueError("FERNET_KEY not configured")
         return self.FERNET_KEY.encode("utf-8")
+
+    @property
+    def test_endpoints_enabled(self) -> bool:
+        """Test helpers are never exposed merely because a flag leaked to production."""
+        return self.ENABLE_TEST_ENDPOINTS and self.ENVIRONMENT.strip().lower() in {
+            "development",
+            "local",
+            "test",
+        }
 
     def _format_pem_public_key(self, key_str: Optional[str]) -> str:
         """

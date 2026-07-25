@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select, update
 
 from app.core.crypto import get_encryption_manager
-from app.core.database import get_db_session_context, get_isolated_db_session
+from app.core.database import get_isolated_db_session
 from app.models.inventory import (
     SyncStatusEnum,
     SyncOperation,
@@ -163,7 +163,7 @@ async def _initial_bulk_sync_async(
     encryption_manager = get_encryption_manager()
     blueprint_mapper = get_blueprint_mapper()
     
-    async with get_db_session_context() as session:
+    async with get_isolated_db_session() as session:
         # Get user sync settings
         stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
         result = await session.execute(stmt)
@@ -508,7 +508,7 @@ async def _update_sync_status(
     error: Optional[str] = None,
 ) -> None:
     """Update sync status for user."""
-    async with get_db_session_context() as session:
+    async with get_isolated_db_session() as session:
         # Use cast to ensure PostgreSQL enum type
         from sqlalchemy import cast
         from sqlalchemy.dialects.postgresql import ENUM as PG_ENUM
@@ -568,7 +568,7 @@ async def _update_product_quantity_async(
     delta: int,
 ) -> Dict[str, Any]:
     """Async implementation of product quantity update."""
-    async with get_db_session_context() as session:
+    async with get_isolated_db_session() as session:
         stmt = select(UserInventoryItem).where(
             UserInventoryItem.user_id == user_uuid,
             UserInventoryItem.external_stock_id == external_stock_id,
@@ -617,6 +617,14 @@ def process_webhook_notification(
         result = run_async(
             _process_webhook_notification_async(webhook_id, payload, user_id)
         )
+        if result.get("status") == "reconcile_required" and user_id:
+            # Arithmetic deltas cannot safely reconstruct destroy/legacy or
+            # partial events. Queue the authoritative CardTrader export; if
+            # enqueueing fails this task retries, and the event ledger returns
+            # reconcile_required again on the duplicate delivery.
+            from app.tasks.periodic_sync import reconcile_user
+
+            reconcile_user.delay(user_id)
         return result
     except Exception as e:
         logger.error(f"Error processing webhook {webhook_id}: {e}", exc_info=True)

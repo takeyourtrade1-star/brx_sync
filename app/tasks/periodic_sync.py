@@ -115,7 +115,10 @@ async def _reconcile_all_users_async() -> Dict[str, Any]:
 def reconcile_user(self, user_id: str) -> Dict[str, Any]:
     """Riconciliazione manuale di un singolo utente (trigger da API)."""
     try:
-        return run_async(_reconcile_single_user_async(user_id))
+        result = run_async(_reconcile_single_user_async(user_id))
+        if result.get("status") == "error":
+            raise RuntimeError(result.get("error") or "reconciliation failed")
+        return result
     except Exception as exc:
         logger.error(
             "Riconciliazione manuale fallita per %s: %s", user_id, exc, exc_info=True
