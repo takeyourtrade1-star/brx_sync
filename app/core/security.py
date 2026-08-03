@@ -143,6 +143,6 @@ def decode_url_safe(value: str) -> str:
     """
     try:
         return unquote(value)
-    except Exception as e:
-        logger.warning(f"Failed to decode URL: {e}")
+    except Exception as exc:
+        logger.warning("Failed to decode URL (%s)", type(exc).__name__)
         return value

@@ -1,206 +1,319 @@
+"""Authoritative, fail-safe CardTrader inventory reconciliation.
+
+The full CardTrader export is the only inbound authority for quantities.
+Webhook workers merely quarantine rows with a durable inbox watermark.  A
+validated snapshot may clear that quarantine only when no reservation/outgoing
+mutation is active and no newer webhook is pending for the row.
 """
-Reconciler v2 — Fase 3/4 del piano CardTrader.
 
-Confronta l'export completo CardTrader (/products/export) con le righe locali
-collegate (external_stock_id NOT NULL) di un utente.
+from __future__ import annotations
 
-Due modalità:
-- reconcile_user_report: SOLO REPORT, nessuna mutazione su DB.
-- reconcile_user_apply: applica il diff al database locale (quantità, prezzi,
-  creazioni, esauriti, archiviazioni). NON scrive MAI su CardTrader.
-
-Regole di sicurezza:
-- Un export non valido (troncato, id duplicati, quantità negative) viene
-  SCARTATO: nessuna mutazione, nessun contatore aggiornato.
-- Un articolo sparito dall'export viene azzerato solo alla SECONDA snapshot
-  valida consecutiva in cui manca (contatori in Redis). Mai hard delete.
-- Gli update usano una condizione ottimistica (WHERE quantity = valore letto):
-  se nel frattempo un acquisto ha cambiato la riga, l'update viene saltato e
-  ripreso al giro successivo.
-- Le righe interne (external_stock_id NULL) non vengono mai toccate.
-"""
+import asyncio
+import hashlib
 import json
 import logging
+import math
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_encryption_manager
-from app.core.redis_client import get_redis_sync
-from app.models.inventory import UserInventoryItem, UserSyncSettings
+from app.models.inventory import (
+    SyncSnapshot,
+    UserInventoryItem,
+    UserSyncSettings,
+    WebhookInbox,
+)
 from app.services.cardtrader_client import CardTraderClient
+from app.services.cardtrader_mutation_lease import (
+    CardTraderMutationBusyError,
+    CardTraderMutationLease,
+    cardtrader_mutation_lease,
+)
 
 logger = logging.getLogger(__name__)
 
-# Redis: contatori di assenza consecutiva e dimensione ultima snapshot valida
-MISSING_KEY = "reconcile_report:missing:{user_id}"
-LAST_SNAPSHOT_SIZE_KEY = "reconcile_report:last_snapshot_size:{user_id}"
-STATE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 giorni
-
-# Limite voci dettagliate per categoria nel report (i conteggi restano completi)
+MAGIC_GAME_ID = 1
+MAGIC_MAPPING_TABLE = "cards_prints"
 DETAIL_LIMIT = 50
+MISSING_CONFIRMATIONS_REQUIRED = 2
+SUSPICIOUS_DROP_RATIO = 0.10
+SUSPICIOUS_DROP_ABSOLUTE = 3
+UNRESOLVED_INBOX_STATUSES = (
+    "received",
+    "processing",
+    "failed",
+    "deferred",
+    "reconcile_pending",
+)
+
+BlueprintMapper = Callable[[int], Optional[tuple[int, str]]]
 
 
-def _extract_price_cents(product: Dict[str, Any]) -> Optional[int]:
-    """Prezzo in centesimi dall'export CT; None se il campo non è riconoscibile."""
+async def _refresh_mutation_lease(
+    lease: CardTraderMutationLease,
+    stopped: asyncio.Event,
+    lost: list[BaseException],
+) -> None:
+    """Keep the shared outbound/inbound lease alive during a long export."""
+
+    while not stopped.is_set():
+        try:
+            await asyncio.wait_for(stopped.wait(), timeout=30)
+        except TimeoutError:
+            try:
+                lease.refresh()
+            except Exception as exc:  # noqa: BLE001 - Redis client errors vary
+                lost.append(exc)
+                return
+
+
+def _assert_mutation_lease(
+    lease: CardTraderMutationLease,
+    lost: list[BaseException],
+) -> None:
+    if lost:
+        raise CardTraderMutationBusyError(
+            "CardTrader mutation lease was lost during reconciliation"
+        ) from lost[0]
+    lease.refresh()
+
+
+def _extract_price_cents(product: dict[str, Any]) -> int | None:
     price_cents = product.get("price_cents")
-    if isinstance(price_cents, int):
+    if isinstance(price_cents, int) and not isinstance(price_cents, bool):
         return price_cents
     price = product.get("price")
-    if isinstance(price, dict) and isinstance(price.get("cents"), int):
-        return price["cents"]
+    if isinstance(price, dict):
+        cents = price.get("cents")
+        if isinstance(cents, int) and not isinstance(cents, bool):
+            return cents
     return None
+
+
+def normalize_magic_snapshot(products: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate the raw export and return its strict Magic-only projection."""
+
+    if not isinstance(products, list):
+        return [], ["export non è una lista"]
+
+    normalized: list[dict[str, Any]] = []
+    problems: list[str] = []
+    seen_ids: set[str] = set()
+
+    for index, product in enumerate(products):
+        if not isinstance(product, dict):
+            problems.append(f"prodotto non valido all'indice {index}")
+            continue
+
+        game_id = product.get("game_id")
+        if not isinstance(game_id, int) or isinstance(game_id, bool):
+            problems.append(f"game_id mancante/non valido all'indice {index}")
+            continue
+        if game_id != MAGIC_GAME_ID:
+            # Full exports may contain several games. They are intentionally
+            # outside the BRX inventory namespace and never count as coverage.
+            continue
+
+        product_id = product.get("id")
+        blueprint_id = product.get("blueprint_id")
+        quantity = product.get("quantity")
+        price_cents = _extract_price_cents(product)
+
+        if product_id is None or not str(product_id).strip():
+            problems.append(f"prodotto Magic senza id all'indice {index}")
+            continue
+        pid = str(product_id).strip()
+        if pid in seen_ids:
+            problems.append(f"product id duplicato nell'export Magic: {pid}")
+            continue
+        seen_ids.add(pid)
+
+        if not isinstance(blueprint_id, int) or isinstance(blueprint_id, bool) or blueprint_id <= 0:
+            problems.append(f"blueprint_id non valido per prodotto {pid}")
+            continue
+        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 0:
+            problems.append(f"quantità non valida per prodotto {pid}: {quantity!r}")
+            continue
+        if price_cents is None or price_cents < 0:
+            problems.append(f"prezzo non valido per prodotto {pid}")
+            continue
+
+        normalized_product = dict(product)
+        normalized_product.update(
+            {
+                "id": pid,
+                "game_id": MAGIC_GAME_ID,
+                "blueprint_id": blueprint_id,
+                "quantity": quantity,
+                "price_cents": price_cents,
+                "properties_hash": (
+                    product.get("properties_hash")
+                    if isinstance(product.get("properties_hash"), dict)
+                    else {}
+                ),
+            }
+        )
+        normalized.append(normalized_product)
+
+    return normalized, problems
+
+
+def _snapshot_checksum(products: Iterable[dict[str, Any]]) -> str:
+    """Stable checksum of the authoritative Magic inventory contents."""
+
+    rows = []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        try:
+            game_id = int(product.get("game_id"))
+        except (TypeError, ValueError):
+            continue
+        if game_id != MAGIC_GAME_ID:
+            continue
+        rows.append(
+            {
+                "id": str(product.get("id")),
+                "blueprint_id": product.get("blueprint_id"),
+                "quantity": product.get("quantity"),
+                "price_cents": _extract_price_cents(product),
+            }
+        )
+    encoded = json.dumps(
+        sorted(rows, key=lambda row: row["id"]),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _snapshot_id_set_checksum(products: Iterable[dict[str, Any]]) -> str:
+    ids = sorted(str(product["id"]) for product in products)
+    return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()
 
 
 def validate_snapshot(
     products: Any,
-    previous_snapshot_size: Optional[int],
-    local_active_rows: Optional[int] = None,
-) -> Tuple[bool, List[str]]:
-    """
-    Valida l'export prima di usarlo. Ritorna (ok, problemi).
-    Se non ok, la snapshot va SCARTATA: nessun diff, nessun contatore aggiornato.
-    """
-    problems: List[str] = []
-    if not isinstance(products, list):
-        return False, ["export non è una lista"]
+    previous_snapshot_size: int | None,
+    local_active_rows: int | None = None,
+    *,
+    allow_confirmed_shrink: bool = False,
+) -> tuple[bool, list[str]]:
+    """Validate shape and set coverage for the strict Magic projection."""
 
-    ids: List[str] = []
+    magic_products, problems = normalize_magic_snapshot(products)
+    if problems:
+        return False, problems
+
+    baselines = [
+        value
+        for value in (previous_snapshot_size, local_active_rows)
+        if value is not None and value > 0
+    ]
+    baseline = max(baselines, default=0)
+    drop = baseline - len(magic_products)
+    suspicious_drop = max(
+        SUSPICIOUS_DROP_ABSOLUTE,
+        math.ceil(baseline * SUSPICIOUS_DROP_RATIO),
+    )
+    if baseline > 0 and drop >= suspicious_drop and not allow_confirmed_shrink:
+        problems.append(
+            "set Magic implausibilmente ridotto: "
+            f"export={len(magic_products)} baseline={baseline} drop={drop}"
+        )
+
+    return not problems, problems
+
+
+def _filter_cards_prints(
+    products: list[dict[str, Any]],
+    map_blueprint: BlueprintMapper | None,
+) -> tuple[list[dict[str, Any]], list[str], int]:
+    """Require both game_id=1 and an explicit cards_prints mapping."""
+
+    if map_blueprint is None:
+        return [], ["blueprint mapper non disponibile"], 0
+
+    accepted: list[dict[str, Any]] = []
+    problems: list[str] = []
+    unsupported = 0
+    mapping_cache: dict[int, tuple[int, str] | None] = {}
+
     for product in products:
-        if not isinstance(product, dict) or product.get("id") is None:
-            problems.append("prodotto senza id nell'export")
-            break
-        ids.append(str(product["id"]))
-        quantity = product.get("quantity", 0)
-        if not isinstance(quantity, int) or quantity < 0:
-            problems.append(
-                f"quantità non valida per prodotto {product['id']}: {quantity!r}"
-            )
-            break
-
-    if len(ids) != len(set(ids)):
-        problems.append("product id duplicati nell'export")
-
-    # Plausibilità vs snapshot precedente: un export molto più piccolo del
-    # precedente è probabilmente troncato (timeout/errore parziale).
-    if (
-        previous_snapshot_size is not None
-        and previous_snapshot_size >= 10
-        and len(ids) < previous_snapshot_size * 0.5
-    ):
-        problems.append(
-            f"conteggio implausibile: export={len(ids)} vs snapshot precedente={previous_snapshot_size}"
-        )
-
-    # Plausibilità vs righe locali attive: a differenza della snapshot
-    # precedente (Redis, azzerato a ogni redeploy) questo confronto
-    # sopravvive ai riavvii e protegge anche il primo run.
-    if (
-        local_active_rows is not None
-        and local_active_rows >= 10
-        and len(ids) < local_active_rows * 0.5
-    ):
-        problems.append(
-            f"conteggio implausibile: export={len(ids)} vs righe locali attive={local_active_rows}"
-        )
-
-    return (len(problems) == 0), problems
+        blueprint_id = int(product["blueprint_id"])
+        if blueprint_id not in mapping_cache:
+            mapping_cache[blueprint_id] = map_blueprint(blueprint_id)
+        mapping = mapping_cache[blueprint_id]
+        if mapping is None or mapping[1] != MAGIC_MAPPING_TABLE:
+            unsupported += 1
+            continue
+        accepted.append(product)
+    return accepted, problems, unsupported
 
 
 def diff_inventory(
-    products: List[Dict[str, Any]],
-    local_items: List[UserInventoryItem],
-    missing_counts: Dict[str, int],
-    map_blueprint: Optional[Callable[[int], Optional[Tuple[int, str]]]] = None,
-) -> Dict[str, Any]:
-    """
-    Diff puro (nessun side effect) tra export CT e righe locali collegate.
+    products: list[dict[str, Any]],
+    local_items: list[UserInventoryItem],
+    missing_counts: dict[str, int],
+    map_blueprint: BlueprintMapper | None = None,
+) -> dict[str, Any]:
+    """Pure report diff over already normalized/mapped Magic products."""
 
-    missing_counts: contatori di assenza consecutiva PRIMA di questa snapshot
-    (serve per marcare i candidati archiviati alla seconda assenza).
-    """
-    ct_by_pid = {str(p["id"]): p for p in products}
-    local_by_pid = {item.external_stock_id: item for item in local_items}
-
+    ct_by_pid = {str(product["id"]): product for product in products}
+    local_by_pid = {
+        str(item.external_stock_id): item for item in local_items if item.external_stock_id
+    }
+    quantity_diffs: list[dict[str, Any]] = []
+    price_diffs: list[dict[str, Any]] = []
+    missing_local: list[dict[str, Any]] = []
+    missing_on_ct: list[dict[str, Any]] = []
     identical = 0
-    quantity_diffs: List[Dict[str, Any]] = []
-    price_diffs: List[Dict[str, Any]] = []
-    sold_out_on_ct: List[Dict[str, Any]] = []
-    missing_local: List[Dict[str, Any]] = []
-    missing_local_unmapped = 0
-    missing_on_ct_active: List[Dict[str, Any]] = []
-    missing_on_ct_zero = 0
-    archive_candidates: List[Dict[str, Any]] = []
 
     for pid, product in ct_by_pid.items():
         local = local_by_pid.get(pid)
-        ct_quantity = product.get("quantity", 0)
-        ct_price = _extract_price_cents(product)
-
         if local is None:
-            # Presente su CT, assente da noi
-            entry = {
-                "product_id": pid,
-                "ct_blueprint_id": product.get("blueprint_id"),
-                "name": product.get("name_en") or product.get("name"),
-                "quantity": ct_quantity,
-            }
-            if map_blueprint is not None and product.get("blueprint_id") is not None:
-                try:
-                    mapped = map_blueprint(product["blueprint_id"])
-                except Exception as exc:  # mapping è solo informativo nel report
-                    mapped = None
-                    entry["mapping_check_error"] = str(exc)
-                entry["mapped"] = mapped is not None
-                if mapped is None:
-                    missing_local_unmapped += 1
-            missing_local.append(entry)
+            missing_local.append(
+                {
+                    "product_id": pid,
+                    "ct_blueprint_id": product["blueprint_id"],
+                    "quantity": product["quantity"],
+                }
+            )
             continue
-
-        qty_equal = local.quantity == ct_quantity
-        price_equal = ct_price is None or local.price_cents == ct_price
-
-        if ct_quantity == 0 and local.quantity > 0:
-            sold_out_on_ct.append({
-                "product_id": pid,
-                "local_quantity": local.quantity,
-            })
-        elif not qty_equal:
-            quantity_diffs.append({
-                "product_id": pid,
-                "local_quantity": local.quantity,
-                "ct_quantity": ct_quantity,
-            })
-
-        if not price_equal:
-            price_diffs.append({
-                "product_id": pid,
-                "local_price_cents": local.price_cents,
-                "ct_price_cents": ct_price,
-            })
-
-        if qty_equal and price_equal:
+        if local.quantity != product["quantity"]:
+            quantity_diffs.append(
+                {
+                    "product_id": pid,
+                    "local_quantity": local.quantity,
+                    "ct_quantity": product["quantity"],
+                }
+            )
+        if local.price_cents != product["price_cents"]:
+            price_diffs.append(
+                {
+                    "product_id": pid,
+                    "local_price_cents": local.price_cents,
+                    "ct_price_cents": product["price_cents"],
+                }
+            )
+        if local.quantity == product["quantity"] and local.price_cents == product["price_cents"]:
             identical += 1
 
     for pid, local in local_by_pid.items():
-        if pid in ct_by_pid:
-            continue
-        # Da noi ma sparito dall'export CT
-        if local.quantity > 0:
-            entry = {
-                "product_id": pid,
-                "local_quantity": local.quantity,
-                "consecutive_missing": missing_counts.get(pid, 0) + 1,
-            }
-            missing_on_ct_active.append(entry)
-            if missing_counts.get(pid, 0) + 1 >= 2:
-                archive_candidates.append(entry)
-        else:
-            missing_on_ct_zero += 1
+        if pid not in ct_by_pid:
+            missing_on_ct.append(
+                {
+                    "product_id": pid,
+                    "local_quantity": local.quantity,
+                    "consecutive_missing": missing_counts.get(pid, 0) + 1,
+                }
+            )
 
     return {
         "identical": identical,
@@ -212,322 +325,621 @@ def diff_inventory(
             "count": len(price_diffs),
             "items": price_diffs[:DETAIL_LIMIT],
         },
-        "sold_out_on_ct": {
-            "count": len(sold_out_on_ct),
-            "items": sold_out_on_ct[:DETAIL_LIMIT],
-        },
         "missing_local": {
             "count": len(missing_local),
-            "unmapped": missing_local_unmapped,
             "items": missing_local[:DETAIL_LIMIT],
         },
         "missing_on_ct_active": {
-            "count": len(missing_on_ct_active),
-            "items": missing_on_ct_active[:DETAIL_LIMIT],
+            "count": len(missing_on_ct),
+            "items": missing_on_ct[:DETAIL_LIMIT],
         },
-        "missing_on_ct_zero_count": missing_on_ct_zero,
         "archive_candidates": {
-            "count": len(archive_candidates),
-            "items": archive_candidates[:DETAIL_LIMIT],
+            "count": sum(
+                1
+                for item in missing_on_ct
+                if item["consecutive_missing"] >= MISSING_CONFIRMATIONS_REQUIRED
+            ),
+            "items": [
+                item
+                for item in missing_on_ct
+                if item["consecutive_missing"] >= MISSING_CONFIRMATIONS_REQUIRED
+            ][:DETAIL_LIMIT],
         },
     }
-
-
-def _load_missing_counts(redis, user_id: uuid.UUID) -> Dict[str, int]:
-    raw = redis.get(MISSING_KEY.format(user_id=user_id))
-    if not raw:
-        return {}
-    try:
-        data = json.loads(raw)
-        return {str(k): int(v) for k, v in data.items()}
-    except (ValueError, TypeError):
-        logger.warning("Contatori assenza corrotti per %s: reset", user_id)
-        return {}
-
-
-def _save_snapshot_state(
-    redis,
-    user_id: uuid.UUID,
-    ct_pids: set,
-    local_pids: set,
-    missing_counts: Dict[str, int],
-) -> Dict[str, int]:
-    """Aggiorna i contatori di assenza SOLO dopo una snapshot valida."""
-    new_counts: Dict[str, int] = {}
-    for pid in local_pids:
-        if pid not in ct_pids:
-            new_counts[pid] = missing_counts.get(pid, 0) + 1
-        # presente di nuovo → contatore azzerato (semplicemente non salvato)
-    redis.set(
-        MISSING_KEY.format(user_id=user_id),
-        json.dumps(new_counts),
-        ex=STATE_TTL_SECONDS,
-    )
-    redis.set(
-        LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id),
-        str(len(ct_pids)),
-        ex=STATE_TTL_SECONDS,
-    )
-    return new_counts
 
 
 async def _load_local_and_export(
     session: AsyncSession,
     sync_settings: UserSyncSettings,
-) -> Tuple[List[UserInventoryItem], int, Any]:
-    """Carica righe locali collegate, conteggio righe interne ed export CT."""
+) -> tuple[list[UserInventoryItem], int, Any, int]:
     user_id = sync_settings.user_id
-
-    result = await session.execute(
-        select(UserInventoryItem).where(
-            UserInventoryItem.user_id == user_id,
-            UserInventoryItem.external_stock_id.isnot(None),
-            UserInventoryItem.external_stock_id != "",
-        )
-    )
-    local_items = list(result.scalars().all())
-
-    internal_rows = (
-        await session.execute(
-            select(UserInventoryItem.id).where(
-                UserInventoryItem.user_id == user_id,
-                UserInventoryItem.external_stock_id.is_(None),
+    environment = str(sync_settings.execution_mode)
+    local_items = list(
+        (
+            await session.execute(
+                select(UserInventoryItem).where(
+                    UserInventoryItem.user_id == user_id,
+                    UserInventoryItem.environment == environment,
+                    UserInventoryItem.source == "cardtrader",
+                    UserInventoryItem.external_stock_id.isnot(None),
+                    UserInventoryItem.external_stock_id != "",
+                )
             )
         )
-    ).scalars().all()
-
+        .scalars()
+        .all()
+    )
+    internal_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(UserInventoryItem)
+                .where(
+                    UserInventoryItem.user_id == user_id,
+                    UserInventoryItem.environment == environment,
+                    UserInventoryItem.external_stock_id.is_(None),
+                )
+            )
+        ).scalar_one()
+    )
+    watermark = int(
+        (
+            await session.execute(
+                select(func.coalesce(func.max(WebhookInbox.id), 0)).where(
+                    WebhookInbox.user_id == user_id
+                )
+            )
+        ).scalar_one()
+    )
     token = get_encryption_manager().decrypt(sync_settings.cardtrader_token_encrypted)
-
-    # Chiudi la transazione di sola lettura PRIMA dell'HTTP verso CardTrader:
-    # l'export può durare 2-3 minuti e la connessione non deve restare
-    # in transazione per tutto quel tempo.
     await session.commit()
-
     async with CardTraderClient(token, str(user_id)) as client:
         products = await client.get_products_export()
+    return local_items, internal_count, products, watermark
 
-    return local_items, len(internal_rows), products
+
+def _unpack_loaded(
+    loaded: tuple,
+) -> tuple[list[UserInventoryItem], int, Any, int]:
+    # Compatibility for focused tests and external report scripts that mocked
+    # the pre-watermark helper.
+    if len(loaded) == 3:
+        local_items, internal_count, products = loaded
+        return local_items, internal_count, products, 0
+    local_items, internal_count, products, watermark = loaded
+    return local_items, internal_count, products, int(watermark)
+
+
+async def _previous_snapshot_size(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    environment: str,
+) -> int | None:
+    return (
+        await session.execute(
+            select(SyncSnapshot.product_count)
+            .where(
+                SyncSnapshot.user_id == user_id,
+                SyncSnapshot.environment == environment,
+                SyncSnapshot.status == "applied",
+            )
+            .order_by(SyncSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+async def _latest_unresolved_inbox_id(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    return int(
+        (
+            await session.execute(
+                select(func.coalesce(func.max(WebhookInbox.id), 0)).where(
+                    WebhookInbox.user_id == user_id,
+                    WebhookInbox.status.in_(UNRESOLVED_INBOX_STATUSES),
+                )
+            )
+        ).scalar_one()
+    )
+
+
+async def _is_confirmed_suspicious_set(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    environment: str,
+    checksum: str,
+) -> bool:
+    prior = (
+        await session.execute(
+            select(SyncSnapshot.problems_json)
+            .where(
+                SyncSnapshot.user_id == user_id,
+                SyncSnapshot.environment == environment,
+                SyncSnapshot.status == "rejected",
+                SyncSnapshot.checksum == checksum,
+            )
+            .order_by(SyncSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return bool(
+        isinstance(prior, list)
+        and any(
+            isinstance(problem, str) and problem.startswith("set Magic implausibilmente ridotto:")
+            for problem in prior
+        )
+    )
+
+
+async def _record_snapshot(
+    session: AsyncSession,
+    *,
+    snapshot_id: uuid.UUID,
+    user_id: uuid.UUID,
+    environment: str,
+    status: str,
+    product_count: int,
+    checksum: str,
+    problems: list[str] | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
+    session.add(
+        SyncSnapshot(
+            id=snapshot_id,
+            user_id=user_id,
+            environment=environment,
+            status=status,
+            product_count=product_count,
+            checksum=checksum,
+            problems_json=problems,
+            result_json=result,
+            completed_at=datetime.now(timezone.utc),
+        )
+    )
 
 
 async def reconcile_user_report(
     session: AsyncSession,
     sync_settings: UserSyncSettings,
-    map_blueprint: Optional[Callable[[int], Optional[Tuple[int, str]]]] = None,
-) -> Dict[str, Any]:
-    """
-    Report di riconciliazione per un utente. Nessuna scrittura su DB né su
-    CardTrader; aggiorna solo lo stato snapshot in Redis se l'export è valido.
-    """
+    map_blueprint: BlueprintMapper | None = None,
+) -> dict[str, Any]:
     user_id = sync_settings.user_id
-    redis = get_redis_sync()
-
-    local_items, internal_count, products = await _load_local_and_export(
-        session, sync_settings
+    environment = str(sync_settings.execution_mode)
+    local_items, internal_count, raw_products, _watermark = _unpack_loaded(
+        await _load_local_and_export(session, sync_settings)
     )
-
-    raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
-    previous_size = int(raw_prev) if raw_prev else None
-    local_active_rows = sum(1 for item in local_items if item.quantity > 0)
-
-    ok, problems = validate_snapshot(products, previous_size, local_active_rows)
-    if not ok:
-        logger.warning("Snapshot RIFIUTATA per %s: %s", user_id, problems)
+    normalized, shape_problems = normalize_magic_snapshot(raw_products)
+    mapped, mapping_problems, unsupported = _filter_cards_prints(normalized, map_blueprint)
+    previous_size = await _previous_snapshot_size(session, user_id, environment)
+    local_active = sum(
+        1
+        for item in local_items
+        if item.quantity > 0 and getattr(item, "game_id", None) == MAGIC_GAME_ID
+    )
+    ok, coverage_problems = validate_snapshot(
+        mapped,
+        previous_size,
+        local_active,
+    )
+    problems = shape_problems + mapping_problems + coverage_problems
+    if not ok or problems:
         return {
             "user_id": str(user_id),
             "status": "rejected",
             "problems": problems,
-            "export_size": len(products) if isinstance(products, list) else None,
-            "local_linked_rows": len(local_items),
-            "local_internal_rows": internal_count,
+            "magic_export_size": len(mapped),
+            "unsupported_rows": unsupported,
         }
-
-    missing_counts = _load_missing_counts(redis, user_id)
-    diff = diff_inventory(products, local_items, missing_counts, map_blueprint)
-
-    ct_pids = {str(p["id"]) for p in products}
-    local_pids = {item.external_stock_id for item in local_items}
-    _save_snapshot_state(redis, user_id, ct_pids, local_pids, missing_counts)
-
+    missing_counts = {
+        str(item.external_stock_id): int(item.missing_snapshot_count)
+        for item in local_items
+        if item.external_stock_id
+    }
     return {
         "user_id": str(user_id),
         "status": "ok",
-        "export_size": len(products),
-        "previous_snapshot_size": previous_size,
+        "magic_export_size": len(mapped),
+        "unsupported_rows": unsupported,
         "local_linked_rows": len(local_items),
         "local_internal_rows": internal_count,
-        "diff": diff,
+        "diff": diff_inventory(mapped, local_items, missing_counts),
     }
+
+
+def _eligible_inbound_state(snapshot_watermark: int):
+    return or_(
+        and_(
+            UserInventoryItem.sync_state == "synced",
+            UserInventoryItem.sync_uncertain_event_id.is_(None),
+        ),
+        and_(
+            UserInventoryItem.sync_state.in_(("synced", "failed", "uncertain")),
+            UserInventoryItem.sync_uncertain_event_id.isnot(None),
+            UserInventoryItem.sync_uncertain_event_id <= snapshot_watermark,
+        ),
+    )
+
+
+async def _quarantine_non_magic_legacy(
+    session: AsyncSession,
+    *,
+    local_items: list[UserInventoryItem],
+    user_id: uuid.UUID,
+    environment: str,
+    map_blueprint: BlueprintMapper,
+    watermark: int,
+    present_ids: set[str],
+) -> int:
+    quarantined = 0
+    for local in local_items:
+        if local.external_stock_id and str(local.external_stock_id) in present_ids:
+            # A present row is verified/backfilled by the snapshot update below
+            # under its original row-version CAS.
+            continue
+        mapping = map_blueprint(local.blueprint_id)
+        verified_magic = (
+            getattr(local, "game_id", None) == MAGIC_GAME_ID
+            and mapping is not None
+            and mapping[1] == MAGIC_MAPPING_TABLE
+        )
+        if verified_magic:
+            continue
+        result = await session.execute(
+            update(UserInventoryItem)
+            .where(
+                UserInventoryItem.id == local.id,
+                UserInventoryItem.user_id == user_id,
+                UserInventoryItem.environment == environment,
+                UserInventoryItem.source == "cardtrader",
+                UserInventoryItem.row_version == local.row_version,
+                UserInventoryItem.reserved_quantity == 0,
+                _eligible_inbound_state(watermark),
+            )
+            .values(
+                sync_state="uncertain",
+                sync_uncertain_event_id=max(watermark, 0),
+                mapping_status="unsupported",
+                lifecycle_status="stale",
+                row_version=UserInventoryItem.row_version + 1,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        quarantined += int(result.rowcount or 0)
+    return quarantined
 
 
 async def reconcile_user_apply(
     session: AsyncSession,
     sync_settings: UserSyncSettings,
-    map_blueprint: Optional[Callable[[int], Optional[Tuple[int, str]]]] = None,
-) -> Dict[str, Any]:
-    """
-    Applica la riconciliazione al database locale. NON scrive mai su CardTrader.
+    map_blueprint: BlueprintMapper | None = None,
+) -> dict[str, Any]:
+    """Apply one snapshot while excluding every outbound CT mutation."""
 
-    Ordine: export → validazione → mutazioni locali in una transazione breve
-    (l'HTTP verso CardTrader è già concluso quando si inizia a scrivere).
-    """
+    async with cardtrader_mutation_lease(sync_settings.user_id) as lease:
+        stopped = asyncio.Event()
+        lost: list[BaseException] = []
+        heartbeat = asyncio.create_task(_refresh_mutation_lease(lease, stopped, lost))
+        try:
+            return await _reconcile_user_apply_locked(
+                session,
+                sync_settings,
+                map_blueprint,
+                mutation_lease=lease,
+                lost_lease=lost,
+            )
+        finally:
+            stopped.set()
+            await heartbeat
+
+
+async def _reconcile_user_apply_locked(
+    session: AsyncSession,
+    sync_settings: UserSyncSettings,
+    map_blueprint: BlueprintMapper | None = None,
+    *,
+    mutation_lease: CardTraderMutationLease,
+    lost_lease: list[BaseException],
+) -> dict[str, Any]:
     user_id = sync_settings.user_id
-    redis = get_redis_sync()
-
-    local_items, internal_count, products = await _load_local_and_export(
-        session, sync_settings
+    environment = str(sync_settings.execution_mode)
+    snapshot_id = uuid.uuid4()
+    local_items, internal_count, raw_products, watermark = _unpack_loaded(
+        await _load_local_and_export(session, sync_settings)
     )
+    _assert_mutation_lease(mutation_lease, lost_lease)
 
-    raw_prev = redis.get(LAST_SNAPSHOT_SIZE_KEY.format(user_id=user_id))
-    previous_size = int(raw_prev) if raw_prev else None
-    local_active_rows = sum(1 for item in local_items if item.quantity > 0)
-
-    ok, problems = validate_snapshot(products, previous_size, local_active_rows)
-    if not ok:
-        logger.warning(
-            "Reconcile apply: snapshot RIFIUTATA per %s, nessuna mutazione: %s",
-            user_id,
-            problems,
+    normalized, shape_problems = normalize_magic_snapshot(raw_products)
+    mapped, mapping_problems, unsupported = _filter_cards_prints(normalized, map_blueprint)
+    checksum = _snapshot_id_set_checksum(mapped)
+    previous_size = await _previous_snapshot_size(session, user_id, environment)
+    confirmed_shrink = await _is_confirmed_suspicious_set(session, user_id, environment, checksum)
+    local_active = sum(
+        1
+        for item in local_items
+        if item.quantity > 0 and getattr(item, "game_id", None) == MAGIC_GAME_ID
+    )
+    ok, coverage_problems = validate_snapshot(
+        mapped,
+        previous_size,
+        local_active,
+        allow_confirmed_shrink=confirmed_shrink,
+    )
+    problems = shape_problems + mapping_problems + coverage_problems
+    if not ok or problems:
+        await _record_snapshot(
+            session,
+            snapshot_id=snapshot_id,
+            user_id=user_id,
+            environment=environment,
+            status="rejected",
+            product_count=len(mapped),
+            checksum=checksum,
+            problems=problems,
         )
+        await session.commit()
         return {
             "user_id": str(user_id),
             "status": "rejected",
             "problems": problems,
-            "export_size": len(products) if isinstance(products, list) else None,
+            "magic_export_size": len(mapped),
+            "unsupported_rows": unsupported,
         }
 
-    missing_counts = _load_missing_counts(redis, user_id)
-    ct_by_pid = {str(p["id"]): p for p in products}
-    local_by_pid = {item.external_stock_id: item for item in local_items}
+    if map_blueprint is None:  # guarded by _filter_cards_prints, narrows typing
+        raise RuntimeError("Strict Magic mapping unavailable")
 
+    settings_now = (
+        await session.execute(
+            select(UserSyncSettings).where(UserSyncSettings.user_id == user_id).with_for_update()
+        )
+    ).scalar_one()
+    if str(settings_now.sync_status) != "active" or str(settings_now.execution_mode) != environment:
+        await session.rollback()
+        return {
+            "user_id": str(user_id),
+            "status": "deferred",
+            "reason": (
+                f"sync_status={settings_now.sync_status},"
+                f"execution_mode={settings_now.execution_mode}"
+            ),
+        }
+    latest_unresolved = await _latest_unresolved_inbox_id(session, user_id)
+    if latest_unresolved > watermark:
+        await session.rollback()
+        return {
+            "user_id": str(user_id),
+            "status": "superseded",
+            "snapshot_watermark": watermark,
+            "newer_inbox_id": latest_unresolved,
+            "reason": "webhook_observed_after_export_started",
+        }
+
+    ct_by_pid = {str(product["id"]): product for product in mapped}
+    local_by_pid = {
+        str(item.external_stock_id): item for item in local_items if item.external_stock_id
+    }
     applied = {
         "updated": 0,
-        "sold_out": 0,
         "created": 0,
+        "sold_out": 0,
+        "missing_quarantined": 0,
         "archived": 0,
-        "skipped_concurrent": 0,  # riga cambiata da un acquisto durante il run
-        "skipped_unmapped": 0,    # blueprint senza mapping catalogo (o One Piece)
-        "skipped_zero_qty": 0,    # nuovo su CT ma già esaurito: non creato
+        "skipped_unsafe": 0,
+        "skipped_zero_qty": 0,
+        "unsupported_export_rows": unsupported,
+        "legacy_non_magic_quarantined": 0,
     }
 
     try:
-        # 1) Aggiorna/crea gli articoli presenti nell'export
-        for pid, product in ct_by_pid.items():
-            local = local_by_pid.get(pid)
-            ct_quantity = product.get("quantity", 0)
-            ct_price = _extract_price_cents(product)
+        applied["legacy_non_magic_quarantined"] = await _quarantine_non_magic_legacy(
+            session,
+            local_items=local_items,
+            user_id=user_id,
+            environment=environment,
+            map_blueprint=map_blueprint,
+            watermark=watermark,
+            present_ids=set(ct_by_pid),
+        )
 
+        for index, (pid, product) in enumerate(ct_by_pid.items(), start=1):
+            if index % 500 == 0:
+                _assert_mutation_lease(mutation_lease, lost_lease)
+            local = local_by_pid.get(pid)
             if local is None:
-                # Già esaurito su CT: creare una riga a quantità 0 è solo rumore
-                if ct_quantity <= 0:
+                if product["quantity"] <= 0:
                     applied["skipped_zero_qty"] += 1
                     continue
-                # Nuovo su CT: crea solo se il blueprint è mappato nel catalogo
-                # (stessa regola del bulk sync iniziale; One Piece escluso).
-                ct_blueprint_id = product.get("blueprint_id")
-                mapping = None
-                if map_blueprint is not None and ct_blueprint_id is not None:
-                    try:
-                        mapping = map_blueprint(ct_blueprint_id)
-                    except Exception as exc:
-                        logger.warning(
-                            "Reconcile: mapping non verificabile per blueprint %s: %s",
-                            ct_blueprint_id,
-                            exc,
-                        )
-                if mapping is None or mapping[1] == "op_prints":
-                    applied["skipped_unmapped"] += 1
-                    continue
-                # Insert idempotente: se un webhook ha creato la stessa riga
-                # nel frattempo, il conflitto viene ignorato invece di far
-                # fallire (e annullare) l'intero giro di riconciliazione.
                 result = await session.execute(
                     pg_insert(UserInventoryItem)
                     .values(
                         user_id=user_id,
-                        blueprint_id=ct_blueprint_id,
-                        quantity=ct_quantity,
-                        price_cents=ct_price or 0,
-                        properties=product.get("properties_hash", {}),
+                        blueprint_id=product["blueprint_id"],
+                        game_id=MAGIC_GAME_ID,
+                        quantity=product["quantity"],
+                        reserved_quantity=0,
+                        price_cents=product["price_cents"],
+                        properties=product["properties_hash"],
                         external_stock_id=pid,
                         source="cardtrader",
+                        environment=environment,
+                        lifecycle_status="active",
+                        sync_state="synced",
+                        sync_uncertain_event_id=None,
+                        mapping_status="mapped",
+                        missing_snapshot_count=0,
+                        last_seen_snapshot_id=snapshot_id,
+                        last_external_update_at=datetime.now(timezone.utc),
+                        description=product.get("description"),
+                        user_data_field=product.get("user_data_field"),
+                        graded=product.get("graded"),
                     )
                     .on_conflict_do_nothing()
                 )
                 if result.rowcount == 1:
                     applied["created"] += 1
                 else:
-                    applied["skipped_concurrent"] += 1
+                    applied["skipped_unsafe"] += 1
                 continue
 
-            # NB: l'UPDATE ORM sincronizza anche l'oggetto in memoria, quindi
-            # il valore letto va salvato PRIMA di eseguire l'update.
-            quantity_seen = local.quantity
-            values: Dict[str, Any] = {}
-            if quantity_seen != ct_quantity:
-                values["quantity"] = ct_quantity
-            if ct_price is not None and local.price_cents != ct_price:
-                values["price_cents"] = ct_price
-            if not values:
-                continue
-
-            # Update ottimistico: applica solo se la quantità è ancora quella
-            # letta a inizio run (un acquisto concorrente la può aver cambiata).
             result = await session.execute(
                 update(UserInventoryItem)
                 .where(
                     UserInventoryItem.id == local.id,
-                    UserInventoryItem.quantity == quantity_seen,
+                    UserInventoryItem.user_id == user_id,
+                    UserInventoryItem.environment == environment,
+                    UserInventoryItem.source == "cardtrader",
+                    UserInventoryItem.row_version == local.row_version,
+                    UserInventoryItem.reserved_quantity == 0,
+                    _eligible_inbound_state(watermark),
                 )
-                .values(**values)
+                .values(
+                    game_id=MAGIC_GAME_ID,
+                    quantity=product["quantity"],
+                    price_cents=product["price_cents"],
+                    properties=product["properties_hash"],
+                    description=product.get("description"),
+                    user_data_field=product.get("user_data_field"),
+                    graded=product.get("graded"),
+                    lifecycle_status=("active" if product["quantity"] > 0 else "sold_out"),
+                    sync_state="synced",
+                    sync_uncertain_event_id=None,
+                    mapping_status="mapped",
+                    missing_snapshot_count=0,
+                    last_seen_snapshot_id=snapshot_id,
+                    last_external_update_at=datetime.now(timezone.utc),
+                    row_version=UserInventoryItem.row_version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
             )
             if result.rowcount == 0:
-                applied["skipped_concurrent"] += 1
-            elif ct_quantity == 0 and quantity_seen > 0:
+                applied["skipped_unsafe"] += 1
+            elif product["quantity"] == 0 and local.quantity > 0:
                 applied["sold_out"] += 1
             else:
                 applied["updated"] += 1
 
-        # 2) Articoli spariti dall'export: azzera solo alla 2ª assenza consecutiva
-        for pid, local in local_by_pid.items():
-            if pid in ct_by_pid or local.quantity == 0:
+        for index, (pid, local) in enumerate(local_by_pid.items(), start=1):
+            if index % 500 == 0:
+                _assert_mutation_lease(mutation_lease, lost_lease)
+            if pid in ct_by_pid:
                 continue
-            if missing_counts.get(pid, 0) + 1 >= 2:
-                quantity_seen = local.quantity
-                result = await session.execute(
-                    update(UserInventoryItem)
-                    .where(
-                        UserInventoryItem.id == local.id,
-                        UserInventoryItem.quantity == quantity_seen,
-                    )
-                    .values(quantity=0)
-                )
-                if result.rowcount == 0:
-                    applied["skipped_concurrent"] += 1
-                else:
-                    applied["archived"] += 1
+            mapping = map_blueprint(local.blueprint_id)
+            if (
+                getattr(local, "game_id", None) != MAGIC_GAME_ID
+                or mapping is None
+                or mapping[1] != MAGIC_MAPPING_TABLE
+            ):
+                continue
 
-        # 3) last_sync_at nella stessa transazione
-        await session.execute(
-            update(UserSyncSettings)
-            .where(UserSyncSettings.user_id == user_id)
-            .values(last_sync_at=datetime.now(timezone.utc), last_error=None)
+            next_missing = int(local.missing_snapshot_count) + 1
+            if next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
+                values = {
+                    "quantity": 0,
+                    "lifecycle_status": "sold_out",
+                    "sync_state": "synced",
+                    "sync_uncertain_event_id": None,
+                    "missing_snapshot_count": next_missing,
+                    "row_version": UserInventoryItem.row_version + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            else:
+                values = {
+                    "lifecycle_status": "stale",
+                    "sync_state": "uncertain",
+                    "sync_uncertain_event_id": max(watermark, 0),
+                    "missing_snapshot_count": next_missing,
+                    "row_version": UserInventoryItem.row_version + 1,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            result = await session.execute(
+                update(UserInventoryItem)
+                .where(
+                    UserInventoryItem.id == local.id,
+                    UserInventoryItem.user_id == user_id,
+                    UserInventoryItem.environment == environment,
+                    UserInventoryItem.source == "cardtrader",
+                    UserInventoryItem.row_version == local.row_version,
+                    UserInventoryItem.reserved_quantity == 0,
+                    _eligible_inbound_state(watermark),
+                )
+                .values(**values)
+            )
+            if result.rowcount == 0:
+                applied["skipped_unsafe"] += 1
+            elif next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
+                applied["archived"] += 1
+            else:
+                applied["missing_quarantined"] += 1
+
+        settings_now.last_sync_at = datetime.now(timezone.utc)
+        settings_now.last_error = None
+        unresolved_marker = exists(
+            select(1).where(
+                UserInventoryItem.user_id == user_id,
+                UserInventoryItem.environment == environment,
+                UserInventoryItem.source == "cardtrader",
+                UserInventoryItem.sync_uncertain_event_id == WebhookInbox.id,
+            )
         )
+        await session.execute(
+            update(WebhookInbox)
+            .where(
+                WebhookInbox.user_id == user_id,
+                WebhookInbox.id <= watermark,
+                WebhookInbox.status == "reconcile_pending",
+                ~unresolved_marker,
+            )
+            .values(
+                status="completed",
+                processed_at=datetime.now(timezone.utc),
+                last_error=None,
+            )
+        )
+        await _record_snapshot(
+            session,
+            snapshot_id=snapshot_id,
+            user_id=user_id,
+            environment=environment,
+            status="applied",
+            product_count=len(mapped),
+            checksum=checksum,
+            result={
+                "watermark": watermark,
+                "applied": applied,
+                "strict_game_id": MAGIC_GAME_ID,
+                "mapping_table": MAGIC_MAPPING_TABLE,
+            },
+        )
+
+        from app.services.marketplace_projection import (
+            project_inventory_to_marketplace,
+        )
+
+        await project_inventory_to_marketplace(session, user_id, environment)
+        latest_unresolved = await _latest_unresolved_inbox_id(session, user_id)
+        if latest_unresolved > watermark:
+            await session.rollback()
+            return {
+                "user_id": str(user_id),
+                "status": "superseded",
+                "snapshot_watermark": watermark,
+                "newer_inbox_id": latest_unresolved,
+                "reason": "webhook_observed_before_snapshot_commit",
+            }
+        _assert_mutation_lease(mutation_lease, lost_lease)
         await session.commit()
     except Exception:
         await session.rollback()
         raise
 
-    # Contatori assenza: solo dopo il commit di una snapshot valida applicata
-    ct_pids = set(ct_by_pid.keys())
-    local_pids = set(local_by_pid.keys())
-    _save_snapshot_state(redis, user_id, ct_pids, local_pids, missing_counts)
-
-    logger.info("Reconcile apply per %s: %s", user_id, applied)
     return {
         "user_id": str(user_id),
         "status": "ok",
-        "export_size": len(products),
-        "previous_snapshot_size": previous_size,
+        "snapshot_id": str(snapshot_id),
+        "snapshot_watermark": watermark,
+        "magic_export_size": len(mapped),
         "local_linked_rows": len(local_items),
         "local_internal_rows": internal_count,
         "applied": applied,

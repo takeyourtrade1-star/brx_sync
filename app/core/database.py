@@ -26,6 +26,8 @@ pg_engine = create_async_engine(
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_pre_ping=True,
     pool_recycle=3600,
+    pool_timeout=10,
+    connect_args=settings.postgres_connect_args,
     echo=settings.DEBUG,
 )
 
@@ -84,41 +86,16 @@ async def transaction_with_timeout(
         asyncio.TimeoutError: If transaction exceeds timeout
     """
     timeout = timeout_seconds or settings.DB_TRANSACTION_TIMEOUT
-    transaction_started = False
-    
-    async def _begin_with_timeout():
-        nonlocal transaction_started
-        try:
-            # Start transaction with timeout
-            await asyncio.wait_for(
-                session.begin().__aenter__(),
-                timeout=timeout
-            )
-            transaction_started = True
-        except asyncio.TimeoutError:
-            await session.rollback()
-            logger.error(
-                f"Transaction start timeout after {timeout} seconds."
-            )
-            raise
-    
     try:
-        await _begin_with_timeout()
-        try:
-            yield
-            # Commit happens automatically when exiting session.begin() context
-        except Exception:
-            await session.rollback()
-            raise
-    except asyncio.TimeoutError:
-        if transaction_started:
-            await session.rollback()
-        logger.error(
-            f"Transaction timeout after {timeout} seconds. Transaction rolled back."
-        )
+        async with asyncio.timeout(timeout):
+            async with session.begin():
+                yield
+    except TimeoutError as exc:
+        await session.rollback()
+        logger.error("Database transaction exceeded its configured timeout")
         raise asyncio.TimeoutError(
             f"Database transaction exceeded timeout of {timeout} seconds"
-        )
+        ) from exc
 
 
 async def execute_with_deadlock_retry(
@@ -178,11 +155,12 @@ async def execute_with_deadlock_retry(
 # MySQL connection pool (sync, read-only for blueprint mapping)
 # Using pymysql connection pool for thread-safe connection management
 from pymysql import cursors
-from queue import Queue
+from queue import Empty, Full, Queue
 import threading
 
 _mysql_pool: Optional[Queue] = None
 _mysql_pool_lock = threading.Lock()
+_mysql_open_connections = 0
 def _get_mysql_pool_size() -> int:
     """Get MySQL pool size from settings."""
     return getattr(settings, 'MYSQL_POOL_SIZE', 5)
@@ -194,23 +172,28 @@ def _get_mysql_pool_max_overflow() -> int:
 
 def _create_mysql_connection() -> pymysql.Connection:
     """Create a new MySQL connection."""
-    return pymysql.connect(
-        host=settings.MYSQL_HOST,
-        port=settings.MYSQL_PORT,
-        user=settings.MYSQL_USER,
-        password=settings.MYSQL_PASSWORD.get_secret_value(),
-        database=settings.MYSQL_DATABASE,
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-        read_timeout=10,
-        write_timeout=10,
-        autocommit=True,  # Read-only operations
-    )
+    options = {
+        "host": settings.MYSQL_HOST,
+        "port": settings.MYSQL_PORT,
+        "user": settings.MYSQL_USER,
+        "password": settings.MYSQL_PASSWORD.get_secret_value(),
+        "database": settings.MYSQL_DATABASE,
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.DictCursor,
+        "connect_timeout": 5,
+        "read_timeout": 10,
+        "write_timeout": 10,
+        "local_infile": False,
+        "autocommit": True,  # Read-only operations
+    }
+    if settings.mysql_ssl_context is not None:
+        options["ssl"] = settings.mysql_ssl_context
+    return pymysql.connect(**options)
 
 
 def _init_mysql_pool() -> None:
     """Initialize MySQL connection pool."""
-    global _mysql_pool
+    global _mysql_pool, _mysql_open_connections
     if _mysql_pool is None:
         pool_size = _get_mysql_pool_size()
         max_overflow = _get_mysql_pool_max_overflow()
@@ -221,8 +204,12 @@ def _init_mysql_pool() -> None:
             try:
                 conn = _create_mysql_connection()
                 _mysql_pool.put(conn)
-            except Exception as e:
-                logger.error(f"Failed to create MySQL connection for pool: {e}")
+                _mysql_open_connections += 1
+            except Exception as exc:
+                logger.error(
+                    "Failed to create MySQL connection for pool (%s)",
+                    type(exc).__name__,
+                )
                 # Continue with fewer connections if some fail
         
         logger.info(f"MySQL connection pool initialized with {_mysql_pool.qsize()} connections")
@@ -238,33 +225,54 @@ def get_mysql_connection() -> pymysql.Connection:
     Raises:
         Exception: If connection cannot be obtained
     """
-    global _mysql_pool
+    global _mysql_pool, _mysql_open_connections
     
     with _mysql_pool_lock:
         if _mysql_pool is None:
             _init_mysql_pool()
     
-    # Try to get connection from pool (with timeout)
+    assert _mysql_pool is not None
+
+    # Prefer an idle connection. If none is available, reserve a bounded
+    # overflow slot before opening a new socket. Once capacity is reached,
+    # wait for a borrower to return a connection instead of bypassing the pool.
     try:
-        conn = _mysql_pool.get(timeout=5)
-        
-        # Check if connection is still alive
-        try:
-            conn.ping(reconnect=False)
-        except Exception:
-            # Connection is dead, create a new one
-            logger.warning("MySQL connection from pool is dead, creating new one")
+        conn = _mysql_pool.get_nowait()
+    except Empty:
+        create_new = False
+        with _mysql_pool_lock:
+            capacity = _get_mysql_pool_size() + _get_mysql_pool_max_overflow()
+            if _mysql_open_connections < capacity:
+                _mysql_open_connections += 1
+                create_new = True
+        if create_new:
             try:
-                conn.close()
+                conn = _create_mysql_connection()
             except Exception:
-                pass
+                with _mysql_pool_lock:
+                    _mysql_open_connections -= 1
+                raise
+        else:
+            try:
+                conn = _mysql_pool.get(timeout=5)
+            except Empty as exc:
+                raise TimeoutError("MySQL connection pool exhausted") from exc
+
+    try:
+        conn.ping(reconnect=False)
+    except Exception:
+        logger.warning("MySQL pooled connection was stale; replacing its bounded slot")
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
             conn = _create_mysql_connection()
-        
-        return conn
-    except Exception as e:
-        logger.error(f"Failed to get MySQL connection from pool: {e}")
-        # Fallback: create a new connection
-        return _create_mysql_connection()
+        except Exception:
+            with _mysql_pool_lock:
+                _mysql_open_connections -= 1
+            raise
+    return conn
 
 
 def return_mysql_connection(conn: pymysql.Connection) -> None:
@@ -274,7 +282,7 @@ def return_mysql_connection(conn: pymysql.Connection) -> None:
     Args:
         conn: MySQL connection to return
     """
-    global _mysql_pool
+    global _mysql_pool, _mysql_open_connections
     
     if _mysql_pool is None:
         # Pool not initialized, just close the connection
@@ -291,23 +299,27 @@ def return_mysql_connection(conn: pymysql.Connection) -> None:
         # Try to put connection back in pool
         try:
             _mysql_pool.put_nowait(conn)
-        except Exception:
+        except Full:
             # Pool is full, close the connection
             try:
                 conn.close()
             except Exception:
                 pass
+            with _mysql_pool_lock:
+                _mysql_open_connections -= 1
     except Exception:
         # Connection is dead, close it
         try:
             conn.close()
         except Exception:
             pass
+        with _mysql_pool_lock:
+            _mysql_open_connections -= 1
 
 
 def close_mysql_connection() -> None:
     """Close all MySQL connections in pool."""
-    global _mysql_pool
+    global _mysql_pool, _mysql_open_connections
     
     if _mysql_pool is None:
         return
@@ -321,6 +333,7 @@ def close_mysql_connection() -> None:
                 pass
         
         _mysql_pool = None
+        _mysql_open_connections = 0
         logger.info("MySQL connection pool closed")
 
 
@@ -361,10 +374,12 @@ def get_sync_db_engine():
         sync_url = settings.DATABASE_URL.replace("postgresql+asyncpg://", "postgresql+psycopg2://")
         _sync_pg_engine = create_engine(
             sync_url,
-            pool_size=5,
-            max_overflow=10,
+            pool_size=settings.DB_SYNC_POOL_SIZE,
+            max_overflow=settings.DB_SYNC_MAX_OVERFLOW,
             pool_pre_ping=True,
             pool_recycle=3600,
+            pool_timeout=10,
+            connect_args=settings.postgres_sync_connect_args,
             echo=settings.DEBUG,
         )
         logger.info("Synchronous PostgreSQL engine created (psycopg2)")
@@ -381,10 +396,12 @@ def create_isolated_async_engine():
     # Create a new engine bound to the current event loop
     isolated_engine = create_async_engine(
         settings.DATABASE_URL,
-        pool_size=2,  # Smaller pool for isolated tasks
-        max_overflow=2,
+        pool_size=settings.DB_ISOLATED_POOL_SIZE,
+        max_overflow=settings.DB_ISOLATED_MAX_OVERFLOW,
         pool_pre_ping=True,
         pool_recycle=3600,
+        pool_timeout=10,
+        connect_args=settings.postgres_connect_args,
         echo=settings.DEBUG,
     )
     
@@ -440,8 +457,8 @@ async def get_isolated_db_session() -> AsyncGenerator[AsyncSession, None]:
                 # Small delay to ensure connections are fully closed
                 import asyncio
                 await asyncio.sleep(0.05)
-            except Exception as e:
-                logger.warning(f"Error closing session: {e}")
+            except Exception as exc:
+                logger.warning("Error closing isolated session (%s)", type(exc).__name__)
         
         # Dispose the engine after use to free resources
         # CRITICAL: This must be done before the event loop is closed
@@ -452,5 +469,5 @@ async def get_isolated_db_session() -> AsyncGenerator[AsyncSession, None]:
             import asyncio
             await asyncio.sleep(0.05)
             logger.debug(f"Disposed isolated engine for event loop: {id(current_loop)}")
-        except Exception as e:
-            logger.warning(f"Error disposing isolated engine: {e}")
+        except Exception as exc:
+            logger.warning("Error disposing isolated engine (%s)", type(exc).__name__)

@@ -11,6 +11,26 @@ from app.core.redis_client import get_redis_sync
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+_TOKEN_BUCKET_SCRIPT = """
+local key = KEYS[1]
+local max_tokens = tonumber(ARGV[1])
+local window_seconds = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local bucket = redis.call('HMGET', key, 'tokens', 'refill_time')
+local tokens = tonumber(bucket[1])
+local refill_time = tonumber(bucket[2])
+if not tokens or not refill_time or now >= refill_time then
+  tokens = max_tokens
+  refill_time = now + window_seconds
+end
+if tokens > 0 then
+  tokens = tokens - 1
+  redis.call('HSET', key, 'tokens', tokens, 'refill_time', refill_time)
+  redis.call('EXPIRE', key, math.ceil(window_seconds * 2))
+  return {1, 0}
+end
+return {0, math.max(0, refill_time - now)}
+"""
 
 
 class RateLimiter:
@@ -42,64 +62,19 @@ class RateLimiter:
         now = time.time()
         
         try:
-            # Use Redis pipeline for atomic operations
-            pipe = self.redis.pipeline()
-            
-            # Get current bucket state
-            pipe.hgetall(key)
-            pipe.execute()
-            
-            # Get or initialize bucket
-            bucket_data = self.redis.hgetall(key)
-            
-            if not bucket_data:
-                # Initialize new bucket
-                tokens = self.requests - 1
-                refill_time = now + self.window_seconds
-                self.redis.hset(
-                    key,
-                    mapping={
-                        "tokens": tokens,
-                        "refill_time": refill_time,
-                    }
-                )
-                self.redis.expire(key, int(self.window_seconds * 2))
-                return True, None
-            
-            # Parse bucket data
-            tokens = int(bucket_data.get("tokens", 0))
-            refill_time = float(bucket_data.get("refill_time", now))
-            
-            # Check if bucket needs refill
-            if now >= refill_time:
-                # Refill bucket
-                tokens = self.requests - 1
-                refill_time = now + self.window_seconds
-                self.redis.hset(
-                    key,
-                    mapping={
-                        "tokens": tokens,
-                        "refill_time": refill_time,
-                    }
-                )
-                self.redis.expire(key, int(self.window_seconds * 2))
-                return True, None
-            
-            # Check if tokens available
-            if tokens > 0:
-                # Consume token
-                tokens -= 1
-                self.redis.hset(key, "tokens", tokens)
-                return True, None
-            else:
-                # Rate limited - calculate wait time
-                wait_seconds = refill_time - now
-                return False, wait_seconds
+            allowed, wait_seconds = self.redis.eval(
+                _TOKEN_BUCKET_SCRIPT,
+                1,
+                key,
+                self.requests,
+                self.window_seconds,
+                now,
+            )
+            return bool(allowed), float(wait_seconds) if wait_seconds else None
                 
         except Exception as e:
-            logger.error(f"Rate limiter error for user {user_id}: {e}")
-            # Fail open - allow request if Redis fails
-            return True, None
+            logger.error("CardTrader rate limiter unavailable")
+            return False, float(self.window_seconds)
 
     def get_wait_time(self, user_id: str) -> float:
         """Get seconds to wait before next request is allowed."""

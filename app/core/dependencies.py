@@ -6,37 +6,34 @@ Provides reusable dependency functions for common use cases.
 import uuid
 from typing import Optional
 
-from fastapi import Depends, Header
+from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
 from app.core.exceptions import ValidationError
 from app.core.logging import LogContext, get_logger
+from app.core.trace_ids import safe_trace_id
 from app.core.validators import validate_uuid
 
 logger = get_logger(__name__)
 
 
 def get_trace_id(
-    x_trace_id: Optional[str] = Header(None, alias="X-Trace-Id"),
-    x_request_id: Optional[str] = Header(None, alias="X-Request-Id"),
+    request: Request,
 ) -> str:
     """
     Extract or generate trace ID from request headers.
     
     Args:
-        x_trace_id: X-Trace-Id header
-        x_request_id: X-Request-Id header (fallback)
+        request: Raw ASGI request (needed to reject duplicate headers)
         
     Returns:
         Trace ID string
     """
-    trace_id = x_trace_id or x_request_id
-    
-    if not trace_id:
-        trace_id = str(uuid.uuid4())
-    
-    return trace_id
+    return safe_trace_id(
+        request,
+        accepted_headers=("x-trace-id", "x-request-id"),
+    )
 
 
 def get_user_id_from_path(user_id: str) -> uuid.UUID:

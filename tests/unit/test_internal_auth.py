@@ -40,10 +40,21 @@ class _FakeRedis:
     async def expire(self, key: str, ttl: int) -> None:
         self.expirations.append((key, ttl))
 
+    async def eval(self, _script: str, _keys: int, _key: str, _ttl: int) -> int:
+        if self.fail:
+            raise ConnectionError("redis unavailable")
+        self.count += 1
+        return self.count
+
 
 def _settings(token: str | None = "correct-token", limit: int = 300) -> SimpleNamespace:
     return SimpleNamespace(
         INTERNAL_API_TOKEN=SecretStr(token) if token is not None else None,
+        INTERNAL_CALLER_TOKENS=None,
+        INTERNAL_API_TOKEN_SCOPES="inventory:write,metrics:read",
+        INTERNAL_API_ALLOWED_CIDRS=(
+            "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+        ),
         INTERNAL_API_RATE_LIMIT_PER_MINUTE=limit,
     )
 
@@ -97,8 +108,7 @@ async def test_internal_token_accepts_exact_value(monkeypatch):
     assert (
         await internal_dependencies.verify_internal_token(_request(), "correct-token") is None
     )
-    assert len(redis.expirations) == 1
-    assert redis.expirations[0][1] == 65
+    assert redis.count == 1
 
 
 @pytest.mark.asyncio

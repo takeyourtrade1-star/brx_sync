@@ -6,6 +6,7 @@ and integration with CloudWatch/ELK.
 """
 import json
 import logging
+import re
 import sys
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
@@ -18,6 +19,30 @@ settings = get_settings()
 trace_id_var: ContextVar[Optional[str]] = ContextVar("trace_id", default=None)
 user_id_var: ContextVar[Optional[str]] = ContextVar("user_id", default=None)
 request_id_var: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+
+_SENSITIVE_KEY = re.compile(
+    r"(?i)(password|passwd|secret|token|authorization|api[_-]?key|fernet|private[_-]?key)"
+)
+_REDACTIONS = (
+    (re.compile(r"(?i)(\b(?:postgres(?:ql)?|mysql|redis)\+?[^:]*://[^:/@\s]+:)[^@\s]+@"), r"\1[REDACTED]@"),
+    (re.compile(r"(?i)\bBearer\s+[^\s,;]+"), "Bearer [REDACTED]"),
+    (re.compile(r"(?i)((?:password|secret|token|api[_-]?key|fernet[_-]?key)\s*[=:]\s*)[^\s,;]+"), r"\1[REDACTED]"),
+    (re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", re.DOTALL), "[REDACTED PRIVATE KEY]"),
+)
+
+
+def redact_log_value(value: Any, *, key: str = "") -> Any:
+    """Best-effort last line of defence for structured log values."""
+    if _SENSITIVE_KEY.search(key):
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {str(k): redact_log_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_log_value(item) for item in value]
+    rendered = str(value)
+    for pattern, replacement in _REDACTIONS:
+        rendered = pattern.sub(replacement, rendered)
+    return rendered
 
 
 class StructuredFormatter(logging.Formatter):
@@ -43,7 +68,7 @@ class StructuredFormatter(logging.Formatter):
             "timestamp": self.formatTime(record, self.datefmt),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": redact_log_value(record.getMessage()),
         }
         
         # Add context from context variables
@@ -61,15 +86,27 @@ class StructuredFormatter(logging.Formatter):
         
         # Add extra fields from record
         if hasattr(record, "extra"):
-            log_data.update(record.extra)
+            log_data.update(
+                {
+                    str(key): redact_log_value(value, key=str(key))
+                    for key, value in record.extra.items()
+                }
+            )
         
         # Add exception info if present
         if record.exc_info:
             log_data["exception"] = {
                 "type": record.exc_info[0].__name__ if record.exc_info[0] else None,
-                "message": str(record.exc_info[1]) if record.exc_info[1] else None,
-                "traceback": self.formatException(record.exc_info) if record.exc_info else None,
             }
+            if settings.ENVIRONMENT in {"development", "test"}:
+                log_data["exception"]["message"] = (
+                    redact_log_value(record.exc_info[1])
+                    if record.exc_info[1]
+                    else None
+                )
+                log_data["exception"]["traceback"] = redact_log_value(
+                    self.formatException(record.exc_info)
+                )
         
         # Add any additional fields from record
         for key, value in record.__dict__.items():
@@ -80,9 +117,14 @@ class StructuredFormatter(logging.Formatter):
                 "thread", "threadName", "exc_info", "exc_text", "stack_info",
             ):
                 if not key.startswith("_"):
-                    log_data[key] = value
+                    log_data[key] = redact_log_value(value, key=key)
         
         return json.dumps(log_data, default=str, ensure_ascii=False)
+
+
+class RedactingTextFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return str(redact_log_value(super().format(record)))
 
 
 def setup_logging() -> None:
@@ -104,7 +146,7 @@ def setup_logging() -> None:
     
     if settings.DEBUG:
         # Human-readable format for development
-        formatter = logging.Formatter(
+        formatter = RedactingTextFormatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )

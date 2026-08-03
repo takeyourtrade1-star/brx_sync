@@ -17,6 +17,7 @@ def mock_redis():
     redis_mock.hset.return_value = True
     redis_mock.expire.return_value = True
     redis_mock.delete.return_value = True
+    redis_mock.eval.return_value = [1, 0]
     return redis_mock
 
 
@@ -30,7 +31,7 @@ def test_rate_limiter_initial_consume(mock_get_redis, mock_redis):
     
     assert allowed is True
     assert wait_seconds is None
-    assert mock_redis.hset.called
+    assert mock_redis.eval.called
 
 
 @patch("app.services.rate_limiter.get_redis_sync")
@@ -38,11 +39,7 @@ def test_rate_limiter_rate_limited(mock_get_redis, mock_redis):
     """Test rate limiting when tokens exhausted."""
     mock_get_redis.return_value = mock_redis
     
-    # Simulate bucket with no tokens
-    mock_redis.hgetall.return_value = {
-        "tokens": "0",
-        "refill_time": str(time.time() + 5.0),
-    }
+    mock_redis.eval.return_value = [0, 5]
     
     limiter = RateLimiter(requests=200, window_seconds=10)
     allowed, wait_seconds = limiter.check_and_consume("user123")
@@ -61,3 +58,16 @@ def test_rate_limiter_reset(mock_get_redis, mock_redis):
     limiter.reset("user123")
     
     assert mock_redis.delete.called
+
+
+@patch("app.services.rate_limiter.get_redis_sync")
+def test_rate_limiter_fails_closed_when_redis_is_unavailable(mock_get_redis, mock_redis):
+    mock_redis.eval.side_effect = ConnectionError("redis unavailable")
+    mock_get_redis.return_value = mock_redis
+
+    allowed, wait_seconds = RateLimiter(requests=200, window_seconds=10).check_and_consume(
+        "user123"
+    )
+
+    assert allowed is False
+    assert wait_seconds == 10

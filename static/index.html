@@ -382,6 +382,75 @@
         </div>
     </div>
     
+    <template id="edit-modal-form-template">
+        <div class="form-group">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Quantità *</label>
+            <input type="number" id="edit-quantity" min="0" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Prezzo (€) *</label>
+            <input type="number" id="edit-price" min="0" step="0.01" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Descrizione</label>
+            <textarea id="edit-description" rows="3" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: inherit; resize: vertical;" placeholder="Descrizione del prodotto (visibile a tutti)"></textarea>
+            <small style="color: #86868b; font-size: 11px;">Descrizione visibile a tutti gli utenti</small>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Campo Dati Utente</label>
+            <input type="text" id="edit-user_data_field" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;" placeholder="es: warehouse B, shelf 10C">
+            <small style="color: #86868b; font-size: 11px;">Campo personalizzato per metadata (posizione magazzino, riferimento interno, ecc.)</small>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Gradata</label>
+            <select id="edit-graded" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                <option value="">-- Seleziona --</option>
+                <option value="false">No</option>
+                <option value="true">Sì</option>
+            </select>
+            <small style="color: #86868b; font-size: 11px;">Campo top-level (non dentro properties)</small>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Condizione</label>
+            <select id="edit-condition" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                <option value="">-- Seleziona --</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="edit-signed" style="width: 18px; height: 18px;">
+                <span style="font-weight: 600;">Firmata</span>
+            </label>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="edit-altered" style="width: 18px; height: 18px;">
+                <span style="font-weight: 600;">Alterata</span>
+            </label>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                <input type="checkbox" id="edit-mtg_foil" style="width: 18px; height: 18px;">
+                <span style="font-weight: 600;">Foil</span>
+            </label>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Lingua</label>
+            <select id="edit-mtg_language" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
+                <option value="">-- Seleziona --</option>
+            </select>
+        </div>
+        <div class="form-group" style="margin-top: 15px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">Altre Proprietà (JSON)</label>
+            <textarea id="edit-other-props" rows="4" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: monospace; font-size: 11px;" placeholder='{"custom_field": "value", ...}'></textarea>
+            <small style="color: #86868b; font-size: 11px;">
+                Proprietà aggiuntive in formato JSON (opzionale).<br>
+                <strong>⚠️ NOTA:</strong> Le seguenti proprietà sono <strong>read-only</strong> e verranno ignorate da CardTrader:<br>
+                <code style="font-size: 10px;">mtg_card_colors, collector_number, tournament_legal, cmc, mtg_rarity</code>
+            </small>
+        </div>
+    </template>
+
     <!-- Modal per modificare item -->
     <div id="edit-modal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; align-items: center; justify-content: center;">
         <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; width: 90%; max-height: 90vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.3);">
@@ -400,100 +469,155 @@
         const API_BASE = 'http://localhost:8000/api/v1';
         
         let currentEditItem = null;
+
+        function text(value) {
+            if (value === null || value === undefined) return '';
+            return String(value);
+        }
+
+        function createTextElement(tagName, value, className = '') {
+            const element = document.createElement(tagName);
+            if (className) element.className = className;
+            element.textContent = text(value);
+            return element;
+        }
+
+        function replaceWithTextMessage(element, message, color) {
+            const box = createTextElement('div', message);
+            if (color) box.style.color = color;
+            element.replaceChildren(box);
+        }
+
+        function renderStatusDetails(elementId, heading, details, type = 'info', extraData = null) {
+            const element = document.getElementById(elementId);
+            const allowedTypes = new Set(['info', 'success', 'error', 'warning', 'loading']);
+            const box = document.createElement('div');
+            box.className = `status ${allowedTypes.has(type) ? type : 'info'}`;
+            box.append(createTextElement('strong', heading));
+            for (const detail of details) {
+                box.append(document.createElement('br'));
+                box.append(document.createTextNode(text(detail)));
+            }
+            if (extraData !== null && extraData !== undefined) {
+                const pre = createTextElement('pre', JSON.stringify(extraData, null, 2));
+                pre.style.marginTop = '10px';
+                pre.style.fontSize = '11px';
+                pre.style.whiteSpace = 'pre-wrap';
+                box.append(pre);
+            }
+            element.replaceChildren(box);
+        }
+
+        function renderHealthDetails(elementId, data) {
+            const box = document.createElement('div');
+            box.className = 'result-box';
+            const heading = createTextElement('h3', '📊 Health Check Completo');
+            heading.style.marginBottom = '10px';
+            box.append(heading, createTextElement('p', `Status: ${text(data.status || 'unknown')}`));
+            if (data.services && typeof data.services === 'object') {
+                const servicesHeading = createTextElement('h4', 'Servizi:');
+                servicesHeading.style.marginTop = '15px';
+                servicesHeading.style.marginBottom = '8px';
+                const list = document.createElement('ul');
+                list.style.listStyle = 'none';
+                list.style.padding = '0';
+                for (const [service, serviceStatus] of Object.entries(data.services)) {
+                    const state = serviceStatus && typeof serviceStatus === 'object'
+                        ? serviceStatus.status
+                        : serviceStatus;
+                    const message = serviceStatus && typeof serviceStatus === 'object'
+                        ? serviceStatus.message
+                        : '';
+                    const icon = state === 'healthy' ? '✅' : '❌';
+                    const suffix = message ? ` - ${text(message)}` : '';
+                    list.append(createTextElement('li', `${icon} ${text(service)}: ${text(state)}${suffix}`));
+                }
+                box.append(servicesHeading, list);
+            }
+            document.getElementById(elementId).replaceChildren(box);
+        }
+
+        function renderLogEntries(element, logs, capHeight = false) {
+            const fragment = document.createDocumentFragment();
+            for (const log of logs) {
+                const timestamp = new Date(log.timestamp).toLocaleTimeString('it-IT');
+                const runId = text(log.runId || 'unknown');
+                const location = text(log.location || 'unknown');
+                const message = text(log.message || '');
+                const dataText = log.data ? JSON.stringify(log.data, null, 2) : '';
+                let color = '#86868b';
+                if (runId === 'update' || message.includes('accepted') || message.includes('processed')) color = '#34a853';
+                else if (runId === 'celery_task') color = '#4285f4';
+                else if (runId === 'sync_update' || message.includes('ignored')) color = '#fbbc04';
+                else if (runId === 'sync' || message.includes('error') || message.includes('failed')) color = '#ea4335';
+                else if (runId === 'get_inventory') color = '#9aa0a6';
+                else if (runId === 'webhook') color = '#4285f4';
+
+                const entry = document.createElement('div');
+                entry.style.cssText = `margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid ${color};`;
+                const header = createTextElement('div', `[${timestamp}] ${runId.toUpperCase()} - ${location}`);
+                header.style.cssText = `color: ${color}; font-weight: bold; margin-bottom: 4px;`;
+                const body = createTextElement('div', message);
+                body.style.cssText = 'color: #f5f5f7; margin-bottom: 4px;';
+                entry.append(header, body);
+                if (dataText) {
+                    const details = createTextElement('div', dataText);
+                    details.style.cssText = `color: #9aa0a6; font-size: 10px; margin-top: 4px; white-space: pre-wrap;${capHeight ? ' max-height: 200px; overflow-y: auto;' : ''}`;
+                    entry.append(details);
+                }
+                fragment.append(entry);
+            }
+            element.replaceChildren(fragment);
+        }
         
         function openEditModal(itemId, itemJson) {
             try {
                 const item = typeof itemJson === 'string' ? JSON.parse(itemJson.replace(/&quot;/g, '"')) : itemJson;
                 currentEditItem = item;
                 
-                const props = item.properties || {};
+                const props = item.properties && typeof item.properties === 'object'
+                    ? item.properties
+                    : {};
                 // CardTrader valid condition values (from API documentation)
                 // Must match exactly: "Mint", "Near Mint", "Slightly Played", "Moderately Played", "Played", "Heavily Played", "Poor"
                 const conditionOptions = ['Mint', 'Near Mint', 'Slightly Played', 'Moderately Played', 'Played', 'Heavily Played', 'Poor'];
                 const languageOptions = ['en', 'it', 'de', 'fr', 'es', 'pt', 'ja', 'ko', 'zh'];
                 
-                let html = `
-                    <div class="form-group">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Quantità *</label>
-                        <input type="number" id="edit-quantity" value="${item.quantity}" min="0" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Prezzo (€) *</label>
-                        <input type="number" id="edit-price" value="${(item.price_cents / 100).toFixed(2)}" min="0" step="0.01" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Descrizione</label>
-                        <textarea id="edit-description" rows="3" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: inherit; resize: vertical;" placeholder="Descrizione del prodotto (visibile a tutti)">${item.description || ''}</textarea>
-                        <small style="color: #86868b; font-size: 11px;">Descrizione visibile a tutti gli utenti</small>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Campo Dati Utente</label>
-                        <input type="text" id="edit-user_data_field" value="${item.user_data_field || ''}" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;" placeholder="es: warehouse B, shelf 10C">
-                        <small style="color: #86868b; font-size: 11px;">Campo personalizzato per metadata (posizione magazzino, riferimento interno, ecc.)</small>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Gradata</label>
-                        <select id="edit-graded" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
-                            <option value="">-- Seleziona --</option>
-                            <option value="false" ${item.graded === false ? 'selected' : ''}>No</option>
-                            <option value="true" ${item.graded === true ? 'selected' : ''}>Sì</option>
-                        </select>
-                        <small style="color: #86868b; font-size: 11px;">Campo top-level (non dentro properties)</small>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Condizione</label>
-                        <select id="edit-condition" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
-                            <option value="">-- Seleziona --</option>
-                            ${conditionOptions.map(opt => `<option value="${opt}" ${props.condition === opt ? 'selected' : ''}>${opt}</option>`).join('')}
-                        </select>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                            <input type="checkbox" id="edit-signed" ${props.signed === true || props.signed === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
-                            <span style="font-weight: 600;">Firmata</span>
-                        </label>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                            <input type="checkbox" id="edit-altered" ${props.altered === true || props.altered === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
-                            <span style="font-weight: 600;">Alterata</span>
-                        </label>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                            <input type="checkbox" id="edit-mtg_foil" ${props.mtg_foil === true || props.mtg_foil === 'true' ? 'checked' : ''} style="width: 18px; height: 18px;">
-                            <span style="font-weight: 600;">Foil</span>
-                        </label>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Lingua</label>
-                        <select id="edit-mtg_language" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px;">
-                            <option value="">-- Seleziona --</option>
-                            ${languageOptions.map(opt => `<option value="${opt}" ${props.mtg_language === opt ? 'selected' : ''}>${opt.toUpperCase()}</option>`).join('')}
-                        </select>
-                    </div>
-                    
-                    <div class="form-group" style="margin-top: 15px;">
-                        <label style="display: block; margin-bottom: 8px; font-weight: 600;">Altre Proprietà (JSON)</label>
-                        <textarea id="edit-other-props" rows="4" style="width: 100%; padding: 8px; border: 1px solid #d2d2d7; border-radius: 6px; font-family: monospace; font-size: 11px;" placeholder='{"custom_field": "value", ...}'>${JSON.stringify(Object.fromEntries(Object.entries(props).filter(([k]) => !['condition', 'graded', 'signed', 'altered', 'mtg_foil', 'mtg_language'].includes(k))), null, 2)}</textarea>
-                        <small style="color: #86868b; font-size: 11px;">
-                            Proprietà aggiuntive in formato JSON (opzionale).<br>
-                            <strong>⚠️ NOTA:</strong> Le seguenti proprietà sono <strong>read-only</strong> e verranno ignorate da CardTrader:<br>
-                            <code style="font-size: 10px;">mtg_card_colors, collector_number, tournament_legal, cmc, mtg_rarity</code>
-                        </small>
-                    </div>
-                `;
-                
-                document.getElementById('edit-modal-content').innerHTML = html;
+                const template = document.getElementById('edit-modal-form-template');
+                const content = document.getElementById('edit-modal-content');
+                content.replaceChildren(template.content.cloneNode(true));
+                document.getElementById('edit-quantity').value = text(item.quantity);
+                const priceCents = Number(item.price_cents);
+                document.getElementById('edit-price').value = Number.isFinite(priceCents)
+                    ? (priceCents / 100).toFixed(2)
+                    : '';
+                document.getElementById('edit-description').value = text(item.description);
+                document.getElementById('edit-user_data_field').value = text(item.user_data_field);
+                document.getElementById('edit-graded').value = typeof item.graded === 'boolean'
+                    ? String(item.graded)
+                    : '';
+                document.getElementById('edit-signed').checked = props.signed === true || props.signed === 'true';
+                document.getElementById('edit-altered').checked = props.altered === true || props.altered === 'true';
+                document.getElementById('edit-mtg_foil').checked = props.mtg_foil === true || props.mtg_foil === 'true';
+
+                const conditionSelect = document.getElementById('edit-condition');
+                for (const optionValue of conditionOptions) {
+                    const option = new Option(optionValue, optionValue);
+                    option.selected = props.condition === optionValue;
+                    conditionSelect.add(option);
+                }
+                const languageSelect = document.getElementById('edit-mtg_language');
+                for (const optionValue of languageOptions) {
+                    const option = new Option(optionValue.toUpperCase(), optionValue);
+                    option.selected = props.mtg_language === optionValue;
+                    languageSelect.add(option);
+                }
+                const editableProps = Object.fromEntries(
+                    Object.entries(props).filter(([key]) => ![
+                        'condition', 'graded', 'signed', 'altered', 'mtg_foil', 'mtg_language'
+                    ].includes(key))
+                );
+                document.getElementById('edit-other-props').value = JSON.stringify(editableProps, null, 2);
                 document.getElementById('edit-modal').style.display = 'flex';
             } catch (error) {
                 alert(`❌ Errore apertura modal: ${error.message}`);
@@ -863,12 +987,26 @@
         
         function showStatus(elementId, message, type = 'info') {
             const element = document.getElementById(elementId);
-            element.innerHTML = `<div class="status ${type}">${message}</div>`;
+            const allowedTypes = new Set(['info', 'success', 'error', 'warning', 'loading']);
+            const status = document.createElement('div');
+            status.className = `status ${allowedTypes.has(type) ? type : 'info'}`;
+            const spinnerMarkup = '<span class="loading-spinner"></span>';
+            const messageText = text(message);
+            if (type === 'loading' && messageText.startsWith(spinnerMarkup)) {
+                const spinner = document.createElement('span');
+                spinner.className = 'loading-spinner';
+                status.append(spinner, document.createTextNode(messageText.slice(spinnerMarkup.length)));
+            } else {
+                status.textContent = messageText;
+            }
+            element.replaceChildren(status);
         }
         
         function showResult(elementId, data) {
             const element = document.getElementById(elementId);
-            element.innerHTML = `<div class="result-box">${JSON.stringify(data, null, 2)}</div>`;
+            const result = createTextElement('pre', JSON.stringify(data, null, 2), 'result-box');
+            result.style.whiteSpace = 'pre-wrap';
+            element.replaceChildren(result);
         }
         
         async function apiCall(endpoint, options = {}) {
@@ -936,8 +1074,7 @@
         }
         
         async function applyCompositeIndexMigration() {
-    const statusDiv = document.getElementById('connections-status');
-    statusDiv.innerHTML = '<div class="status loading">⏳ Applicazione migrazione indice composito...</div>';
+    showStatus('connections-status', '⏳ Applicazione migrazione indice composito...', 'loading');
     
     try {
         const response = await fetch(`${API_BASE}/sync/migrate/composite-index`, {
@@ -950,29 +1087,32 @@
         const result = await response.json();
         
         if (response.ok) {
-            statusDiv.innerHTML = `
-                <div class="status success">
-                    ✅ <strong>Migrazione applicata con successo!</strong><br>
-                    <strong>Indice:</strong> ${result.index_name}<br>
-                    <strong>Colonne:</strong> ${result.columns.join(', ')}<br>
-                    <small>L'indice ottimizzerà le query di lookup durante la sincronizzazione bulk.</small>
-                </div>
-            `;
+            const columns = Array.isArray(result.columns) ? result.columns.join(', ') : '';
+            renderStatusDetails(
+                'connections-status',
+                '✅ Migrazione applicata con successo!',
+                [
+                    `Indice: ${text(result.index_name)}`,
+                    `Colonne: ${columns}`,
+                    "L'indice ottimizzerà le query di lookup durante la sincronizzazione bulk."
+                ],
+                'success'
+            );
         } else {
-            statusDiv.innerHTML = `
-                <div class="status error">
-                    ❌ <strong>Errore durante la migrazione:</strong><br>
-                    ${result.detail || result.message || 'Errore sconosciuto'}
-                </div>
-            `;
+            renderStatusDetails(
+                'connections-status',
+                '❌ Errore durante la migrazione:',
+                [result.detail || result.message || 'Errore sconosciuto'],
+                'error'
+            );
         }
     } catch (error) {
-        statusDiv.innerHTML = `
-            <div class="status error">
-                ❌ <strong>Errore di connessione:</strong><br>
-                ${error.message}
-            </div>
-        `;
+        renderStatusDetails(
+            'connections-status',
+            '❌ Errore di connessione:',
+            [error.message],
+            'error'
+        );
     }
 }
 
@@ -1020,7 +1160,7 @@ async function testConnections() {
                     }
                     
                     html += '</div>';
-                    document.getElementById('connections-status').innerHTML = html;
+                    renderHealthDetails('connections-status', data);
                 } else {
                     showStatus('connections-status', `⚠️ Health check fallito: ${data.reason || 'Unknown error'}`, 'error');
                 }
@@ -1077,7 +1217,7 @@ async function testConnections() {
                     }
                     
                     html += '</div>';
-                    document.getElementById('enterprise-tests-status').innerHTML = html;
+                    showResult('enterprise-tests-status', { report: html });
                 }
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
@@ -1122,7 +1262,7 @@ async function testConnections() {
                 }
                 
                 html += '</div>';
-                document.getElementById('enterprise-tests-status').innerHTML = html;
+                showResult('enterprise-tests-status', { report: html });
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
             }
@@ -1152,7 +1292,7 @@ async function testConnections() {
                 }
                 
                 html += '</div>';
-                document.getElementById('enterprise-tests-status').innerHTML = html;
+                showResult('enterprise-tests-status', { report: html });
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
             }
@@ -1167,29 +1307,29 @@ async function testConnections() {
                 return;
             }
             
-            // Salva in localStorage
+            // Persist only the non-secret local user id. The CardTrader token
+            // remains in memory/DOM for this tab and is never written to Web Storage.
             localStorage.setItem('brx_user_id', userId);
-            localStorage.setItem('brx_token', token);
             
-            showStatus('config-status', '✅ Configurazione salvata (locale)', 'success');
+            showStatus('config-status', '✅ User ID salvato; token mantenuto solo in questa pagina', 'success');
         }
         
         function generateUserId() {
-            // Genera UUID v4
-            const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                const r = Math.random() * 16 | 0;
-                const v = c == 'x' ? r : (r & 0x3 | 0x8);
-                return v.toString(16);
-            });
-            document.getElementById('user-id').value = uuid;
+            if (!globalThis.crypto || typeof globalThis.crypto.randomUUID !== 'function') {
+                showStatus(
+                    'config-status',
+                    '⚠️ Generazione UUID sicura non disponibile in questo browser',
+                    'error'
+                );
+                return;
+            }
+            document.getElementById('user-id').value = globalThis.crypto.randomUUID();
         }
         
         function loadConfig() {
             const userId = localStorage.getItem('brx_user_id');
-            const token = localStorage.getItem('brx_token');
             
             if (userId) document.getElementById('user-id').value = userId;
-            if (token) document.getElementById('cardtrader-token').value = token;
         }
         
         async function setupUser() {
@@ -1232,9 +1372,8 @@ async function testConnections() {
                 showStatus('config-status', '✅ Utente configurato nel database!', 'success');
                 showResult('config-status', data);
                 
-                // Salva anche in localStorage
+                // Persist only the non-secret identifier.
                 localStorage.setItem('brx_user_id', userId);
-                localStorage.setItem('brx_token', token);
             } catch (error) {
                 showStatus('config-status', formatError(error), 'error');
             }
@@ -1304,59 +1443,57 @@ async function testConnections() {
         async function checkTaskStatus(taskId) {
             try {
                 const result = await apiCall(`/sync/task/${taskId}`);
-                
-                const statusElement = document.getElementById('sync-status');
-                let statusHtml = '';
-                
+
                 if (result.status === 'SUCCESS') {
-                    statusHtml = `
-                        <div class="status success">
-                            ✅ <strong>Sincronizzazione completata!</strong><br>
-                            <small>Task ID: ${taskId}</small>
-                    `;
-                    if (result.result) {
-                        statusHtml += `<br><pre style="margin-top: 10px; font-size: 11px;">${JSON.stringify(result.result, null, 2)}</pre>`;
-                    }
-                    statusHtml += `</div>`;
+                    renderStatusDetails(
+                        'sync-status',
+                        '✅ Sincronizzazione completata!',
+                        [`Task ID: ${text(taskId)}`],
+                        'success',
+                        result.result || null
+                    );
                     stopTaskMonitoring();
                     // Ricarica inventario automaticamente
                     setTimeout(() => getInventory(), 1000);
                 } else if (result.status === 'FAILURE' || result.status === 'REVOKED') {
-                    statusHtml = `
-                        <div class="status error">
-                            ❌ <strong>Sincronizzazione fallita!</strong><br>
-                            <small>Task ID: ${taskId}</small><br>
-                            <small>Errore: ${result.error || 'Unknown error'}</small>
-                        </div>
-                    `;
+                    renderStatusDetails(
+                        'sync-status',
+                        '❌ Sincronizzazione fallita!',
+                        [
+                            `Task ID: ${text(taskId)}`,
+                            `Errore: ${text(result.error || 'Unknown error')}`
+                        ],
+                        'error'
+                    );
                     stopTaskMonitoring();
                 } else if (result.status === 'PENDING') {
-                    statusHtml = `
-                        <div class="status loading">
-                            ⏳ <strong>In attesa di elaborazione...</strong><br>
-                            <small>Task ID: ${taskId}</small><br>
-                            <small>Il worker Celery potrebbe non essere avviato. Controlla i log.</small>
-                        </div>
-                    `;
+                    renderStatusDetails(
+                        'sync-status',
+                        '⏳ In attesa di elaborazione...',
+                        [
+                            `Task ID: ${text(taskId)}`,
+                            'Il worker Celery potrebbe non essere avviato. Controlla i log.'
+                        ],
+                        'loading'
+                    );
                 } else if (result.status === 'STARTED' || result.status === 'RETRY') {
-                    statusHtml = `
-                        <div class="status loading">
-                            <span class="loading-spinner"></span> <strong>Sincronizzazione in corso...</strong><br>
-                            <small>Task ID: ${taskId}</small><br>
-                            <small>Stato: ${result.message || result.status}</small>
-                        </div>
-                    `;
+                    renderStatusDetails(
+                        'sync-status',
+                        '⏳ Sincronizzazione in corso...',
+                        [
+                            `Task ID: ${text(taskId)}`,
+                            `Stato: ${text(result.message || result.status)}`
+                        ],
+                        'loading'
+                    );
                 } else {
-                    statusHtml = `
-                        <div class="status info">
-                            ℹ️ <strong>Stato: ${result.status}</strong><br>
-                            <small>Task ID: ${taskId}</small><br>
-                            <small>${result.message || ''}</small>
-                        </div>
-                    `;
+                    renderStatusDetails(
+                        'sync-status',
+                        `ℹ️ Stato: ${text(result.status)}`,
+                        [`Task ID: ${text(taskId)}`, text(result.message || '')],
+                        'info'
+                    );
                 }
-                
-                statusElement.innerHTML = statusHtml;
             } catch (error) {
                 console.error('Error checking task status:', error);
                 // Non fermiamo il monitoraggio, potrebbe essere un errore temporaneo
@@ -1412,68 +1549,112 @@ async function testConnections() {
         
         function displayInventoryTable(data) {
             const element = document.getElementById('inventory-result');
-            
-            if (!data.items || data.items.length === 0) {
-                element.innerHTML = '<div class="status info">📭 Nessun item nell\'inventario. Avvia una sincronizzazione per popolare l\'inventario.</div>';
+
+            if (!Array.isArray(data.items) || data.items.length === 0) {
+                showStatus(
+                    'inventory-result',
+                    "📭 Nessun item nell'inventario. Avvia una sincronizzazione per popolare l'inventario.",
+                    'info'
+                );
                 return;
             }
-            
-            let html = `
-                <div class="status success" style="margin-bottom: 15px;">
-                    ✅ Trovati <strong>${data.total}</strong> items totali (mostrati ${data.items.length})
-                </div>
-                <div style="overflow-x: auto;">
-                    <table style="width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden;">
-                        <thead>
-                            <tr style="background: #f5f5f7; border-bottom: 2px solid #e5e5e7;">
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">ID</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Blueprint ID</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">CT Product ID</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Quantità</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Prezzo (€)</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Properties</th>
-                                <th style="padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;">Azioni</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-            `;
-            
-            data.items.forEach(item => {
-                const price = (item.price_cents / 100).toFixed(2);
+
+            const summary = createTextElement(
+                'div',
+                `✅ Trovati ${text(data.total)} items totali (mostrati ${data.items.length})`,
+                'status success'
+            );
+            summary.style.marginBottom = '15px';
+            const wrapper = document.createElement('div');
+            wrapper.style.overflowX = 'auto';
+            const table = document.createElement('table');
+            table.style.cssText = 'width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden;';
+            const head = document.createElement('thead');
+            const headRow = document.createElement('tr');
+            headRow.style.cssText = 'background: #f5f5f7; border-bottom: 2px solid #e5e5e7;';
+            for (const label of ['ID', 'Blueprint ID', 'CT Product ID', 'Quantità', 'Prezzo (€)', 'Properties', 'Azioni']) {
+                const cell = createTextElement('th', label);
+                cell.style.cssText = 'padding: 12px; text-align: left; font-size: 12px; font-weight: 600; color: #1d1d1f;';
+                headRow.append(cell);
+            }
+            head.append(headRow);
+            const body = document.createElement('tbody');
+
+            for (const item of data.items) {
+                const itemId = Number(item.id);
+                if (!Number.isSafeInteger(itemId) || itemId < 1) continue;
+                const priceCents = Number(item.price_cents);
+                const price = Number.isFinite(priceCents) ? (priceCents / 100).toFixed(2) : '';
                 const properties = item.properties ? JSON.stringify(item.properties) : 'N/A';
-                const propsShort = properties.length > 50 ? properties.substring(0, 50) + '...' : properties;
-                
-                const externalStockId = item.external_stock_id || '<span style="color: #ea4335; font-weight: bold;">⚠️ MANCANTE</span>';
-                const hasExternalId = item.external_stock_id ? true : false;
-                
-                html += `
-                    <tr style="border-bottom: 1px solid #e5e5e7; ${!hasExternalId ? 'background: #fff3cd;' : ''}" id="item-row-${item.id}">
-                        <td style="padding: 12px; font-size: 12px;">${item.id}</td>
-                        <td style="padding: 12px; font-size: 12px; font-family: monospace;">${item.blueprint_id}</td>
-                        <td style="padding: 12px; font-size: 11px; font-family: monospace; ${!hasExternalId ? 'color: #ea4335; font-weight: bold;' : 'color: #34a853;'}">${externalStockId}</td>
-                        <td style="padding: 12px; font-size: 12px;">
-                            <input type="number" id="qty-${item.id}" value="${item.quantity}" min="0" style="width: 60px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;">
-                        </td>
-                        <td style="padding: 12px; font-size: 12px;">
-                            <input type="number" id="price-${item.id}" value="${price}" min="0" step="0.01" style="width: 80px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;">
-                        </td>
-                        <td style="padding: 12px; font-size: 11px; color: #86868b; max-width: 200px; overflow: hidden; text-overflow: ellipsis;" title="${properties}">${propsShort}</td>
-                        <td style="padding: 12px;">
-                            <button onclick="openEditModal(${item.id}, ${JSON.stringify(item).replace(/"/g, '&quot;')})" style="padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #4285f4; color: white;" ${!hasExternalId ? 'title="⚠️ Questo item non può essere sincronizzato con CardTrader senza external_stock_id"' : ''}>✏️ Modifica</button>
-                            <button onclick="purchaseItem(${item.id}, event)" style="padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #34a853; color: white;" ${!hasExternalId || item.quantity <= 0 ? 'title="⚠️ Questo item non può essere acquistato (non disponibile o senza external_stock_id)" disabled' : ''}>🛒 Acquista</button>
-                            <button onclick="deleteItem(${item.id})" style="padding: 6px 12px; font-size: 11px; background: #ea4335; color: white;" ${!hasExternalId ? 'title="⚠️ Questo item non può essere eliminato da CardTrader senza external_stock_id"' : ''}>🗑️ Elimina</button>
-                        </td>
-                    </tr>
-                `;
-            });
-            
-            html += `
-                        </tbody>
-                    </table>
-                </div>
-            `;
-            
-            element.innerHTML = html;
+                const propsShort = properties.length > 50 ? `${properties.substring(0, 50)}...` : properties;
+                const hasExternalId = Boolean(item.external_stock_id);
+                const row = document.createElement('tr');
+                row.id = `item-row-${itemId}`;
+                row.style.cssText = `border-bottom: 1px solid #e5e5e7;${hasExternalId ? '' : ' background: #fff3cd;'}`;
+
+                const idCell = createTextElement('td', itemId);
+                idCell.style.cssText = 'padding: 12px; font-size: 12px;';
+                const blueprintCell = createTextElement('td', item.blueprint_id);
+                blueprintCell.style.cssText = 'padding: 12px; font-size: 12px; font-family: monospace;';
+                const externalCell = createTextElement('td', hasExternalId ? item.external_stock_id : '⚠️ MANCANTE');
+                externalCell.style.cssText = `padding: 12px; font-size: 11px; font-family: monospace; color: ${hasExternalId ? '#34a853' : '#ea4335'};${hasExternalId ? '' : ' font-weight: bold;'}`;
+
+                const quantityCell = document.createElement('td');
+                quantityCell.style.cssText = 'padding: 12px; font-size: 12px;';
+                const quantityInput = document.createElement('input');
+                quantityInput.type = 'number';
+                quantityInput.id = `qty-${itemId}`;
+                quantityInput.value = text(item.quantity);
+                quantityInput.min = '0';
+                quantityInput.style.cssText = 'width: 60px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;';
+                quantityCell.append(quantityInput);
+
+                const priceCell = document.createElement('td');
+                priceCell.style.cssText = 'padding: 12px; font-size: 12px;';
+                const priceInput = document.createElement('input');
+                priceInput.type = 'number';
+                priceInput.id = `price-${itemId}`;
+                priceInput.value = price;
+                priceInput.min = '0';
+                priceInput.step = '0.01';
+                priceInput.style.cssText = 'width: 80px; padding: 4px; border: 1px solid #d2d2d7; border-radius: 4px;';
+                priceCell.append(priceInput);
+
+                const propertiesCell = createTextElement('td', propsShort);
+                propertiesCell.title = properties;
+                propertiesCell.style.cssText = 'padding: 12px; font-size: 11px; color: #86868b; max-width: 200px; overflow: hidden; text-overflow: ellipsis;';
+
+                const actionsCell = document.createElement('td');
+                actionsCell.style.padding = '12px';
+                const editButton = createTextElement('button', '✏️ Modifica');
+                editButton.style.cssText = 'padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #4285f4; color: white;';
+                editButton.addEventListener('click', () => openEditModal(itemId, item));
+                if (!hasExternalId) editButton.title = '⚠️ Questo item non può essere sincronizzato con CardTrader senza external_stock_id';
+                const buyButton = createTextElement('button', '🛒 Acquista');
+                buyButton.style.cssText = 'padding: 6px 12px; font-size: 11px; margin-right: 4px; background: #34a853; color: white;';
+                buyButton.disabled = !hasExternalId || Number(item.quantity) <= 0;
+                if (buyButton.disabled) buyButton.title = '⚠️ Questo item non può essere acquistato (non disponibile o senza external_stock_id)';
+                buyButton.addEventListener('click', (event) => purchaseItem(itemId, event));
+                const deleteButton = createTextElement('button', '🗑️ Elimina');
+                deleteButton.style.cssText = 'padding: 6px 12px; font-size: 11px; background: #ea4335; color: white;';
+                if (!hasExternalId) deleteButton.title = '⚠️ Questo item non può essere eliminato da CardTrader senza external_stock_id';
+                deleteButton.addEventListener('click', () => deleteItem(itemId));
+                actionsCell.append(editButton, buyButton, deleteButton);
+
+                row.append(
+                    idCell,
+                    blueprintCell,
+                    externalCell,
+                    quantityCell,
+                    priceCell,
+                    propertiesCell,
+                    actionsCell
+                );
+                body.append(row);
+            }
+            table.append(head, body);
+            wrapper.append(table);
+            element.replaceChildren(summary, wrapper);
         }
         
         async function updateItem(itemId) {
@@ -1643,7 +1824,7 @@ async function testConnections() {
                     }
                     
                     html += '</div>';
-                    document.getElementById('connections-status').innerHTML = html;
+                    renderHealthDetails('connections-status', data);
                 } else {
                     showStatus('connections-status', `⚠️ Health check fallito: ${data.reason || 'Unknown error'}`, 'error');
                 }
@@ -1700,7 +1881,7 @@ async function testConnections() {
                     }
                     
                     html += '</div>';
-                    document.getElementById('enterprise-tests-status').innerHTML = html;
+                    showResult('enterprise-tests-status', { report: html });
                 }
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
@@ -1745,7 +1926,7 @@ async function testConnections() {
                 }
                 
                 html += '</div>';
-                document.getElementById('enterprise-tests-status').innerHTML = html;
+                showResult('enterprise-tests-status', { report: html });
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
             }
@@ -1775,7 +1956,7 @@ async function testConnections() {
                 }
                 
                 html += '</div>';
-                document.getElementById('enterprise-tests-status').innerHTML = html;
+                showResult('enterprise-tests-status', { report: html });
             } catch (error) {
                 showStatus('enterprise-tests-status', formatError(error), 'error');
             }
@@ -1794,46 +1975,23 @@ async function testConnections() {
                 const data = await response.json();
                 
                 if (data.error) {
-                    logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore: ${data.error}</div>`;
+                    replaceWithTextMessage(logsElement, `❌ Errore: ${text(data.error)}`, '#ea4335');
                     return;
                 }
                 
-                if (!data.logs || data.logs.length === 0) {
-                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log disponibile</div>';
+                if (!Array.isArray(data.logs) || data.logs.length === 0) {
+                    replaceWithTextMessage(logsElement, '📭 Nessun log disponibile', '#86868b');
                     return;
                 }
-                
-                // Format logs for display
-                let html = '';
-                data.logs.forEach((log, index) => {
-                    const timestamp = new Date(log.timestamp).toLocaleTimeString('it-IT');
-                    const runId = log.runId || 'unknown';
-                    const location = log.location || 'unknown';
-                    const message = log.message || '';
-                    const dataStr = log.data ? JSON.stringify(log.data, null, 2) : '';
-                    
-                    // Color coding by runId
-                    let color = '#86868b';
-                    if (runId === 'update') color = '#34a853';
-                    else if (runId === 'celery_task') color = '#4285f4';
-                    else if (runId === 'sync_update') color = '#fbbc04';
-                    else if (runId === 'sync') color = '#ea4335';
-                    else if (runId === 'get_inventory') color = '#9aa0a6';
-                    
-                    html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid ${color};">
-                        <div style="color: ${color}; font-weight: bold; margin-bottom: 4px;">
-                            [${timestamp}] ${runId.toUpperCase()} - ${location}
-                        </div>
-                        <div style="color: #f5f5f7; margin-bottom: 4px;">${message}</div>
-                        ${dataStr ? `<div style="color: #9aa0a6; font-size: 10px; margin-top: 4px; white-space: pre;">${dataStr}</div>` : ''}
-                    </div>`;
-                });
-                
-                logsElement.innerHTML = html;
+                renderLogEntries(logsElement, data.logs);
                 // Auto-scroll to top (newest logs)
                 logsElement.scrollTop = 0;
             } catch (error) {
-                logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore caricamento log: ${error.message}</div>`;
+                replaceWithTextMessage(
+                    logsElement,
+                    `❌ Errore caricamento log: ${text(error.message)}`,
+                    '#ea4335'
+                );
             }
         }
         
@@ -1896,24 +2054,23 @@ async function testConnections() {
                 document.getElementById('webhook-url-input').value = data.webhook_url;
                 document.getElementById('webhook-url-display').style.display = 'block';
                 
-                // Mostra stato
-                const statusHtml = `
-                    <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
-                        <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ URL Webhook Ottenuto</div>
-                        <div style="font-size: 12px; color: #155724;">
-                            <strong>User ID:</strong> ${data.user_id}<br>
-                            <strong>Webhook Secret Configurato:</strong> ${data.webhook_secret_configured ? '✅ Sì' : '⚠️ No'}<br>
-                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745;">
-                                <strong>📋 Prossimi Passi:</strong><br>
-                                ${data.instructions.step_1}<br>
-                                ${data.instructions.step_2}<br>
-                                ${data.instructions.step_3}<br>
-                                ${data.instructions.step_4}
-                            </div>
-                        </div>
-                    </div>
-                `;
-                document.getElementById('webhook-status').innerHTML = statusHtml;
+                const instructions = data.instructions && typeof data.instructions === 'object'
+                    ? data.instructions
+                    : {};
+                renderStatusDetails(
+                    'webhook-status',
+                    '✅ URL Webhook Ottenuto',
+                    [
+                        `User ID: ${text(data.user_id)}`,
+                        `Webhook Secret Configurato: ${data.webhook_secret_configured ? '✅ Sì' : '⚠️ No'}`,
+                        '📋 Prossimi Passi:',
+                        text(instructions.step_1),
+                        text(instructions.step_2),
+                        text(instructions.step_3),
+                        text(instructions.step_4)
+                    ],
+                    'success'
+                );
                 
                 // Carica log webhook
                 loadWebhookLogs();
@@ -1991,21 +2148,19 @@ async function testConnections() {
                 const data = await response.json();
                 
                 if (response.ok) {
-                    const statusHtml = `
-                        <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
-                            <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ Test Webhook Completato</div>
-                            <div style="font-size: 12px; color: #155724;">
-                                <strong>Status:</strong> ${data.status}<br>
-                                <strong>Webhook ID:</strong> ${data.webhook_id || data.id || 'N/A'}<br>
-                                <strong>Tempo di Risposta:</strong> ${data.processing_time_ms || 'N/A'}ms<br>
-                                ${data.user_id ? `<strong>User ID:</strong> ${data.user_id}<br>` : ''}
-                            </div>
-                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745; font-size: 11px; color: #666;">
-                                <strong>Nota:</strong> Questo è un test. Il webhook reale verrà chiamato da CardTrader quando ci sono ordini o prodotti modificati.
-                            </div>
-                        </div>
-                    `;
-                    document.getElementById('webhook-status').innerHTML = statusHtml;
+                    const details = [
+                        `Status: ${text(data.status)}`,
+                        `Webhook ID: ${text(data.webhook_id || data.id || 'N/A')}`,
+                        `Tempo di Risposta: ${text(data.processing_time_ms || 'N/A')}ms`
+                    ];
+                    if (data.user_id) details.push(`User ID: ${text(data.user_id)}`);
+                    details.push('Nota: questo è un test; il webhook reale verrà chiamato da CardTrader.');
+                    renderStatusDetails(
+                        'webhook-status',
+                        '✅ Test Webhook Completato',
+                        details,
+                        'success'
+                    );
                     console.log('✅ Test webhook completato:', data);
                 } else {
                     throw new Error(data.message || data.detail || 'Errore sconosciuto');
@@ -2036,21 +2191,19 @@ async function testConnections() {
                     throw new Error(data.detail || data.message || 'Errore sconosciuto');
                 }
                 
-                const statusHtml = `
-                    <div style="background: #d4edda; border: 1px solid #28a745; border-radius: 8px; padding: 12px; margin-top: 10px;">
-                        <div style="color: #155724; font-weight: bold; margin-bottom: 8px;">✅ Sync da CardTrader Avviato</div>
-                        <div style="font-size: 12px; color: #155724;">
-                            <strong>Status:</strong> ${data.status}<br>
-                            <strong>Task ID:</strong> ${data.task_id}<br>
-                            <strong>User ID:</strong> ${data.user_id}<br>
-                            ${data.blueprint_id ? `<strong>Blueprint ID:</strong> ${data.blueprint_id}<br>` : ''}
-                            <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #28a745;">
-                                <strong>ℹ️ Nota:</strong> La sincronizzazione è asincrona. Controlla i log per vedere lo stato.
-                            </div>
-                        </div>
-                    </div>
-                `;
-                document.getElementById('webhook-status').innerHTML = statusHtml;
+                const details = [
+                    `Status: ${text(data.status)}`,
+                    `Task ID: ${text(data.task_id)}`,
+                    `User ID: ${text(data.user_id)}`
+                ];
+                if (data.blueprint_id) details.push(`Blueprint ID: ${text(data.blueprint_id)}`);
+                details.push('ℹ️ La sincronizzazione è asincrona. Controlla i log per vedere lo stato.');
+                renderStatusDetails(
+                    'webhook-status',
+                    '✅ Sync da CardTrader Avviato',
+                    details,
+                    'success'
+                );
                 loadWebhookLogs();
                 document.getElementById('webhook-logs').style.display = 'block';
                 console.log('✅ Sync da CardTrader avviato:', data);
@@ -2072,8 +2225,12 @@ async function testConnections() {
                     throw new Error(data.detail || 'Errore caricamento log');
                 }
                 
-                if (!data.logs || data.logs.length === 0) {
-                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log webhook disponibile</div>';
+                if (!Array.isArray(data.logs) || data.logs.length === 0) {
+                    replaceWithTextMessage(
+                        logsElement,
+                        '📭 Nessun log webhook disponibile',
+                        '#86868b'
+                    );
                     return;
                 }
                 
@@ -2088,37 +2245,22 @@ async function testConnections() {
                 );
                 
                 if (webhookLogs.length === 0) {
-                    logsElement.innerHTML = '<div style="color: #86868b;">📭 Nessun log webhook disponibile. I log appariranno qui quando CardTrader invierà webhook.</div>';
+                    replaceWithTextMessage(
+                        logsElement,
+                        '📭 Nessun log webhook disponibile. I log appariranno qui quando CardTrader invierà webhook.',
+                        '#86868b'
+                    );
                     return;
                 }
-                
-                let html = '';
-                webhookLogs.slice(0, 50).forEach((log) => {
-                    const timestamp = new Date(log.timestamp).toLocaleTimeString('it-IT');
-                    const runId = log.runId || 'webhook';
-                    const location = log.location || 'unknown';
-                    const message = log.message || '';
-                    const dataStr = log.data ? JSON.stringify(log.data, null, 2) : '';
-                    
-                    let color = '#86868b';
-                    if (message.includes('accepted') || message.includes('processed')) color = '#34a853';
-                    else if (message.includes('error') || message.includes('failed')) color = '#ea4335';
-                    else if (message.includes('ignored')) color = '#fbbc04';
-                    else color = '#4285f4';
-                    
-                    html += `<div style="margin-bottom: 12px; padding: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; border-left: 3px solid ${color};">
-                        <div style="color: ${color}; font-weight: bold; margin-bottom: 4px;">
-                            [${timestamp}] ${runId.toUpperCase()} - ${location}
-                        </div>
-                        <div style="color: #f5f5f7; margin-bottom: 4px;">${escapeHtml(message)}</div>
-                        ${dataStr ? `<div style="color: #9aa0a6; font-size: 10px; margin-top: 4px; white-space: pre; max-height: 200px; overflow-y: auto;">${escapeHtml(dataStr)}</div>` : ''}
-                    </div>`;
-                });
-                
-                logsElement.innerHTML = html;
+
+                renderLogEntries(logsElement, webhookLogs.slice(0, 50), true);
                 logsElement.scrollTop = 0;
             } catch (error) {
-                logsElement.innerHTML = `<div style="color: #ea4335;">❌ Errore caricamento log webhook: ${error.message}</div>`;
+                replaceWithTextMessage(
+                    logsElement,
+                    `❌ Errore caricamento log webhook: ${text(error.message)}`,
+                    '#ea4335'
+                );
             }
         }
         
@@ -2139,12 +2281,6 @@ async function testConnections() {
                     webhookAutoRefreshInterval = null;
                 }
             }
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
         
         // Carica configurazione e log al caricamento pagina

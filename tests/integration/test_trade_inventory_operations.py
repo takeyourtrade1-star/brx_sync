@@ -2,14 +2,15 @@
 
 import asyncio
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Iterable
 
 import pytest
 from sqlalchemy import select
 
 from app.api.internal_schemas import (
-    CreditInventoryRequest,
     CreditInventoryItemRequest,
+    CreditInventoryRequest,
     ReleaseInventoryRequest,
     ReservationItemRequest,
     ReserveInventoryRequest,
@@ -26,8 +27,8 @@ from app.services.inventory_operations import (
     InventoryOperationError,
     consume_inventory,
     credit_inventory,
-    recover_stale_reservations,
     recover_stale_releases,
+    recover_stale_reservations,
     release_inventory,
     reserve_inventory,
 )
@@ -41,9 +42,11 @@ class FakeCardTraderClient:
         products: Dict[int, int],
         *,
         fail_negative_for: Iterable[int] = (),
+        fail_positive_after_apply_for: Iterable[int] = (),
     ) -> None:
         self.products = products
         self.fail_negative_for = set(fail_negative_for)
+        self.fail_positive_after_apply_for = set(fail_positive_after_apply_for)
         self.calls: list[tuple[int, int]] = []
         self.export_calls = 0
 
@@ -56,7 +59,13 @@ class FakeCardTraderClient:
     async def get_products_export(self) -> list[dict[str, int]]:
         self.export_calls += 1
         return [
-            {"id": product_id, "quantity": quantity}
+            {
+                "id": product_id,
+                "game_id": 1,
+                "blueprint_id": product_id,
+                "quantity": quantity,
+                "price_cents": 1234,
+            }
             for product_id, quantity in self.products.items()
         ]
 
@@ -73,11 +82,23 @@ class FakeCardTraderClient:
             del self.products[product_id]
             return {"quantity": 0}
         self.products[product_id] = new_quantity
+        if delta_quantity > 0 and product_id in self.fail_positive_after_apply_for:
+            raise RuntimeError("CardTrader response lost after applied increment")
         return {"quantity": new_quantity}
 
 
 def client_factory(client: FakeCardTraderClient):
     return lambda _token, _user_id: client
+
+
+def real_sync_settings(user_id: uuid.UUID) -> UserSyncSettings:
+    return UserSyncSettings(
+        user_id=user_id,
+        cardtrader_token_encrypted="encrypted",
+        sync_status=SyncStatusEnum.ACTIVE.value,
+        execution_mode="real",
+        writes_enabled=True,
+    )
 
 
 async def add_inventory_item(
@@ -88,15 +109,18 @@ async def add_inventory_item(
     source: str,
     external_stock_id: str | None = None,
     blueprint_id: int = 100,
+    environment: str = "real",
 ) -> UserInventoryItem:
     item = UserInventoryItem(
         user_id=user_id,
         blueprint_id=blueprint_id,
+        game_id=1 if source == "cardtrader" else None,
         quantity=quantity,
         price_cents=1234,
         properties={"condition": "Near Mint"},
         external_stock_id=external_stock_id,
         source=source,
+        environment=environment,
         description="snapshot",
         graded=False,
     )
@@ -110,13 +134,7 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
     user_id = uuid.uuid4()
     async with test_session_factory() as setup_session:
         async with setup_session.begin():
-            setup_session.add(
-                UserSyncSettings(
-                    user_id=user_id,
-                    cardtrader_token_encrypted="encrypted",
-                    sync_status=SyncStatusEnum.ACTIVE.value,
-                )
-            )
+            setup_session.add(real_sync_settings(user_id))
             item = await add_inventory_item(
                 setup_session,
                 user_id=user_id,
@@ -160,7 +178,7 @@ async def test_concurrent_reservations_only_one_wins(test_session_factory):
 
 
 @pytest.mark.asyncio
-async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
+async def test_reservation_is_blocked_before_stock_changes_outside_real(
     test_session_factory,
 ):
     user_id = uuid.uuid4()
@@ -171,8 +189,50 @@ async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
                     user_id=user_id,
                     cardtrader_token_encrypted="encrypted",
                     sync_status=SyncStatusEnum.ACTIVE.value,
+                    execution_mode="partial",
+                    writes_enabled=False,
                 )
             )
+            item = await add_inventory_item(
+                setup_session,
+                user_id=user_id,
+                quantity=1,
+                source="cardtrader",
+                external_stock_id="12",
+                environment="partial",
+            )
+            item_id = item.id
+
+    fake = FakeCardTraderClient({12: 1})
+    async with test_session_factory() as session:
+        with pytest.raises(InventoryOperationError) as blocked:
+            await reserve_inventory(
+                session,
+                ReserveInventoryRequest(
+                    op_key="trade:policy:reserve",
+                    user_id=user_id,
+                    items=[ReservationItemRequest(item_id=item_id, quantity=1)],
+                ),
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+
+    assert blocked.value.code == "CARDTRADER_WRITES_BLOCKED"
+    assert fake.calls == []
+    async with test_session_factory() as session:
+        stored = await session.get(UserInventoryItem, item_id)
+        assert stored is not None
+        assert (stored.quantity, stored.reserved_quantity) == (1, 0)
+
+
+@pytest.mark.asyncio
+async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
+    test_session_factory,
+):
+    user_id = uuid.uuid4()
+    async with test_session_factory() as setup_session:
+        async with setup_session.begin():
+            setup_session.add(real_sync_settings(user_id))
             first = await add_inventory_item(
                 setup_session,
                 user_id=user_id,
@@ -225,7 +285,7 @@ async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
             .scalars()
             .all()
         )
-        assert [row.quantity for row in rows] == [0, 0]
+        assert [row.quantity for row in rows] == [1, 0]
         assert [row.reserved_quantity for row in rows] == [1, 1]
         operation = (
             await session.execute(
@@ -253,34 +313,19 @@ async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
             client_factory=client_factory(fake),
             decrypt_token=lambda value: value,
         )
-    assert recovered == {"scanned": 1, "recovered": 1, "pending": 0, "ambiguous": 0}
-    assert fake.products == {101: 1, 202: 1}
-
-    async with test_session_factory() as session:
-        replayed = await reserve_inventory(
-            session,
-            request,
-            client_factory=client_factory(fake),
-            decrypt_token=lambda value: value,
-        )
-    assert replayed["replayed"] is True
-    assert fake.calls[-1] == (202, -1)
+    assert recovered == {"scanned": 1, "recovered": 0, "pending": 0, "ambiguous": 1}
+    assert fake.products == {101: 1, 202: 2}
+    assert fake.calls == calls_after_failure
 
 
 @pytest.mark.asyncio
-async def test_release_falls_back_to_trade_when_cardtrader_deleted(
+async def test_missing_product_release_stays_in_manual_review(
     test_session_factory,
 ):
     user_id = uuid.uuid4()
     async with test_session_factory() as setup_session:
         async with setup_session.begin():
-            setup_session.add(
-                UserSyncSettings(
-                    user_id=user_id,
-                    cardtrader_token_encrypted="encrypted",
-                    sync_status=SyncStatusEnum.ACTIVE.value,
-                )
-            )
+            setup_session.add(real_sync_settings(user_id))
             item = await add_inventory_item(
                 setup_session,
                 user_id=user_id,
@@ -338,17 +383,17 @@ async def test_release_falls_back_to_trade_when_cardtrader_deleted(
             client_factory=client_factory(fake),
             decrypt_token=lambda value: value,
         )
-    assert recovery == {"scanned": 1, "recovered": 1, "pending": 0, "ambiguous": 0}
+    assert recovery == {"scanned": 1, "recovered": 0, "pending": 0, "ambiguous": 1}
     calls_after_release = list(fake.calls)
     async with test_session_factory() as session:
-        release_replay = await release_inventory(
-            session,
-            release_request,
-            client_factory=client_factory(fake),
-            decrypt_token=lambda value: value,
-        )
-    assert release_replay["replayed"] is True
-    assert release_replay["items"][0]["outcome"] == "returned_as_new_row"
+        with pytest.raises(InventoryOperationError) as replay:
+            await release_inventory(
+                session,
+                release_request,
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+    assert replay.value.code == "OPERATION_IN_PROGRESS"
     assert fake.calls == calls_after_release
 
     async with test_session_factory() as session:
@@ -363,10 +408,18 @@ async def test_release_falls_back_to_trade_when_cardtrader_deleted(
             .scalars()
             .all()
         )
-        assert [(row.source, row.quantity) for row in rows] == [
-            ("cardtrader", 0),
-            ("trade", 1),
+        operation = (
+            await session.execute(
+                select(InventoryOperation).where(
+                    InventoryOperation.op_key == release_request.op_key
+                )
+            )
+        ).scalar_one()
+        assert [(row.source, row.quantity, row.reserved_quantity) for row in rows] == [
+            ("cardtrader", 0, 1),
         ]
+        assert operation.status == "processing"
+        assert operation.result_json["phase"] == "release_manual_review_required"
 
 
 @pytest.mark.asyncio
@@ -376,13 +429,7 @@ async def test_ambiguous_cardtrader_quantity_never_reopens_stock(
     user_id = uuid.uuid4()
     async with test_session_factory() as setup_session:
         async with setup_session.begin():
-            setup_session.add(
-                UserSyncSettings(
-                    user_id=user_id,
-                    cardtrader_token_encrypted="encrypted",
-                    sync_status=SyncStatusEnum.ACTIVE.value,
-                )
-            )
+            setup_session.add(real_sync_settings(user_id))
             item = await add_inventory_item(
                 setup_session,
                 user_id=user_id,
@@ -436,6 +483,151 @@ async def test_ambiguous_cardtrader_quantity_never_reopens_stock(
 
 
 @pytest.mark.asyncio
+async def test_reserve_recovery_marker_race_requires_manual_review(
+    test_session_factory,
+):
+    user_id = uuid.uuid4()
+    async with test_session_factory() as setup_session:
+        async with setup_session.begin():
+            setup_session.add(real_sync_settings(user_id))
+            item = await add_inventory_item(
+                setup_session,
+                user_id=user_id,
+                quantity=1,
+                source="cardtrader",
+                external_stock_id="360",
+            )
+            item_id = item.id
+
+    fake = FakeCardTraderClient({360: 1}, fail_negative_for={360})
+    request = ReserveInventoryRequest(
+        op_key="trade:reserve-marker-race",
+        user_id=user_id,
+        items=[ReservationItemRequest(item_id=item_id, quantity=1)],
+    )
+    async with test_session_factory() as session:
+        with pytest.raises(InventoryOperationError):
+            await reserve_inventory(
+                session,
+                request,
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+
+    fake.products.pop(360)
+    fake.fail_negative_for.clear()
+    async with test_session_factory() as session:
+        async with session.begin():
+            stored_item = await session.get(UserInventoryItem, item_id)
+            stored_item.sync_uncertain_event_id = 90
+
+    async with test_session_factory() as session:
+        recovery = await recover_stale_reservations(
+            session,
+            stale_minutes=0,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+
+    assert recovery == {
+        "scanned": 1,
+        "recovered": 0,
+        "pending": 0,
+        "ambiguous": 1,
+    }
+    async with test_session_factory() as session:
+        operation = (
+            await session.execute(
+                select(InventoryOperation).where(InventoryOperation.op_key == request.op_key)
+            )
+        ).scalar_one()
+        stored_item = await session.get(UserInventoryItem, item_id)
+        assert operation.result_json["phase"] == "manual_review_required"
+        assert stored_item.sync_uncertain_event_id == 90
+        assert stored_item.sync_state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_release_recovery_marker_race_requires_manual_review(
+    test_session_factory,
+):
+    user_id = uuid.uuid4()
+    async with test_session_factory() as setup_session:
+        async with setup_session.begin():
+            setup_session.add(real_sync_settings(user_id))
+            item = await add_inventory_item(
+                setup_session,
+                user_id=user_id,
+                quantity=2,
+                source="cardtrader",
+                external_stock_id="370",
+            )
+            item_id = item.id
+
+    fake = FakeCardTraderClient({370: 2})
+    reserve_request = ReserveInventoryRequest(
+        op_key="trade:release-marker-race:reserve",
+        user_id=user_id,
+        items=[ReservationItemRequest(item_id=item_id, quantity=1)],
+    )
+    async with test_session_factory() as session:
+        await reserve_inventory(
+            session,
+            reserve_request,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+
+    fake.fail_positive_after_apply_for.add(370)
+    release_request = ReleaseInventoryRequest(
+        op_key="trade:release-marker-race",
+        reservation_op_key=reserve_request.op_key,
+        user_id=user_id,
+    )
+    async with test_session_factory() as session:
+        with pytest.raises(InventoryOperationError):
+            await release_inventory(
+                session,
+                release_request,
+                client_factory=client_factory(fake),
+                decrypt_token=lambda value: value,
+            )
+
+    fake.fail_positive_after_apply_for.clear()
+    async with test_session_factory() as session:
+        async with session.begin():
+            stored_item = await session.get(UserInventoryItem, item_id)
+            stored_item.sync_uncertain_event_id = 91
+
+    async with test_session_factory() as session:
+        recovery = await recover_stale_releases(
+            session,
+            stale_minutes=0,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+
+    assert recovery == {
+        "scanned": 1,
+        "recovered": 0,
+        "pending": 0,
+        "ambiguous": 1,
+    }
+    async with test_session_factory() as session:
+        operation = (
+            await session.execute(
+                select(InventoryOperation).where(
+                    InventoryOperation.op_key == release_request.op_key
+                )
+            )
+        ).scalar_one()
+        stored_item = await session.get(UserInventoryItem, item_id)
+        assert operation.result_json["phase"] == "release_manual_review_required"
+        assert stored_item.sync_uncertain_event_id == 91
+        assert stored_item.sync_state == "pending"
+
+
+@pytest.mark.asyncio
 async def test_credit_is_idempotent_without_sync_settings(test_session_factory):
     user_id = uuid.uuid4()
     request = CreditInventoryRequest(
@@ -482,16 +674,8 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
         async with setup_session.begin():
             setup_session.add_all(
                 [
-                    UserSyncSettings(
-                        user_id=proposer_id,
-                        cardtrader_token_encrypted="encrypted",
-                        sync_status=SyncStatusEnum.ACTIVE.value,
-                    ),
-                    UserSyncSettings(
-                        user_id=receiver_id,
-                        cardtrader_token_encrypted="encrypted",
-                        sync_status=SyncStatusEnum.ACTIVE.value,
-                    ),
+                    real_sync_settings(proposer_id),
+                    real_sync_settings(receiver_id),
                 ]
             )
             offered = await add_inventory_item(
@@ -636,16 +820,9 @@ async def test_two_way_trade_transfer_preserves_inventory_totals(test_session_fa
     assert not_published.value.code == "INVENTORY_UNAVAILABLE"
 
 
-class FakeRedis:
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {}
-
-    def get(self, key: str):
-        return self.values.get(key)
-
-    def set(self, key: str, value: str, **_kwargs: Any) -> bool:
-        self.values[key] = value
-        return True
+class FakeMutationLease:
+    def refresh(self) -> None:
+        return None
 
 
 @pytest.mark.asyncio
@@ -659,6 +836,7 @@ async def test_reconciler_does_not_change_active_escrow_or_trade_rows(
                 user_id=user_id,
                 cardtrader_token_encrypted="encrypted",
                 sync_status=SyncStatusEnum.ACTIVE.value,
+                execution_mode="partial",
             )
             setup_session.add(settings)
             linked = await add_inventory_item(
@@ -668,6 +846,7 @@ async def test_reconciler_does_not_change_active_escrow_or_trade_rows(
                 source="cardtrader",
                 external_stock_id="606",
                 blueprint_id=606,
+                environment="partial",
             )
             internal = await add_inventory_item(
                 setup_session,
@@ -684,23 +863,45 @@ async def test_reconciler_does_not_change_active_escrow_or_trade_rows(
         return (
             [linked_row],
             1,
-            [{"id": 606, "quantity": 1, "price_cents": 1234}],
+            [
+                {
+                    "id": 606,
+                    "game_id": 1,
+                    "blueprint_id": 606,
+                    "quantity": 1,
+                    "price_cents": 1234,
+                }
+            ],
         )
 
+    @asynccontextmanager
+    async def fake_mutation_lease(_user_id):
+        yield FakeMutationLease()
+
     monkeypatch.setattr(reconciler, "_load_local_and_export", load_aligned_inventory)
-    monkeypatch.setattr(reconciler, "get_redis_sync", lambda: FakeRedis())
+    monkeypatch.setattr(
+        reconciler,
+        "cardtrader_mutation_lease",
+        fake_mutation_lease,
+    )
 
     async with test_session_factory() as session:
         sync_settings = await session.get(UserSyncSettings, user_id)
-        result = await reconciler.reconcile_user_apply(session, sync_settings)
+        result = await reconciler.reconcile_user_apply(
+            session,
+            sync_settings,
+            lambda blueprint_id: (blueprint_id, "cards_prints"),
+        )
         assert result["applied"] == {
-            "updated": 0,
-            "sold_out": 0,
+            "updated": 1,
             "created": 0,
+            "sold_out": 0,
+            "missing_quarantined": 0,
             "archived": 0,
-            "skipped_concurrent": 0,
-            "skipped_unmapped": 0,
+            "skipped_unsafe": 0,
             "skipped_zero_qty": 0,
+            "unsupported_export_rows": 0,
+            "legacy_non_magic_quarantined": 0,
         }
 
     async with test_session_factory() as session:

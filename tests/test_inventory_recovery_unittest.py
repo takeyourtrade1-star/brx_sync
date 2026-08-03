@@ -52,7 +52,13 @@ class FakeCardTraderClient:
 
     async def get_products_export(self) -> list[dict[str, int]]:
         return [
-            {"id": product_id, "quantity": quantity}
+            {
+                "id": product_id,
+                "game_id": 1,
+                "blueprint_id": product_id,
+                "quantity": quantity,
+                "price_cents": 1234,
+            }
             for product_id, quantity in self.products.items()
         ]
 
@@ -108,16 +114,20 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         user_id=user_id,
                         cardtrader_token_encrypted="encrypted",
                         sync_status=SyncStatusEnum.ACTIVE.value,
+                        execution_mode="real",
+                        writes_enabled=True,
                     )
                 )
                 item = UserInventoryItem(
                     user_id=user_id,
                     blueprint_id=100,
+                    game_id=1,
                     quantity=1,
                     price_cents=1000,
                     properties={"condition": "Near Mint"},
                     external_stock_id=external_stock_id,
                     source="cardtrader",
+                    environment="real",
                 )
                 session.add(item)
                 await session.flush()
@@ -141,6 +151,8 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     decrypt_token=lambda value: value,
                 )
         self.assertEqual(pending.exception.code, "CARDTRADER_RESERVATION_PENDING")
+        # Simulate a timeout after CardTrader applied the decrement.
+        fake.products.pop(601, None)
 
         async with self.sessions() as session:
             item = await session.get(UserInventoryItem, item_id)
@@ -157,7 +169,7 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["recovered"], 1)
         self.assertEqual(fake.products, {})
 
-    async def test_missing_product_release_falls_back_without_duplicate(self) -> None:
+    async def test_missing_product_release_stays_in_manual_review(self) -> None:
         user_id, item_id = await self._seed("701")
         fake = FakeCardTraderClient({701: 1})
         reserve_request = ReserveInventoryRequest(
@@ -196,16 +208,21 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 client_factory=_client_factory(fake),
                 decrypt_token=lambda value: value,
             )
-        self.assertEqual(result["recovered"], 1)
+        self.assertEqual(result["recovered"], 0)
+        self.assertEqual(result["ambiguous"], 1)
 
         async with self.sessions() as session:
             rows = (
-                await session.execute(
-                    select(UserInventoryItem)
-                    .where(UserInventoryItem.user_id == user_id)
-                    .order_by(UserInventoryItem.id)
+                (
+                    await session.execute(
+                        select(UserInventoryItem)
+                        .where(UserInventoryItem.user_id == user_id)
+                        .order_by(UserInventoryItem.id)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             operation = (
                 await session.execute(
                     select(InventoryOperation).where(
@@ -215,6 +232,10 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ).scalar_one()
         self.assertEqual(
             [(row.source, row.quantity, row.reserved_quantity) for row in rows],
-            [("cardtrader", 0, 0), ("trade", 1, 0)],
+            [("cardtrader", 0, 1)],
         )
-        self.assertEqual(operation.status, "succeeded")
+        self.assertEqual(operation.status, "processing")
+        self.assertEqual(
+            operation.result_json["phase"],
+            "release_manual_review_required",
+        )

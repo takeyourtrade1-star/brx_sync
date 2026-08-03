@@ -39,12 +39,12 @@ async def check_postgresql() -> Dict[str, Any]:
                 "status": "healthy",
                 "message": "PostgreSQL connection successful",
             }
-    except Exception as e:
-        logger.error(f"PostgreSQL health check failed: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("PostgreSQL health check failed (%s)", type(exc).__name__)
         return {
             "status": "unhealthy",
-            "message": f"PostgreSQL connection failed: {str(e)}",
-            "error": str(e),
+            "message": "PostgreSQL connection failed",
+            "error_type": type(exc).__name__,
         }
 
 
@@ -70,12 +70,12 @@ async def check_redis() -> Dict[str, Any]:
             "status": "healthy",
             "message": "Redis connection successful",
         }
-    except Exception as e:
-        logger.error(f"Redis health check failed: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("Redis health check failed (%s)", type(exc).__name__)
         return {
             "status": "unhealthy",
-            "message": f"Redis connection failed: {str(e)}",
-            "error": str(e),
+            "message": "Redis connection failed",
+            "error_type": type(exc).__name__,
         }
 
 
@@ -99,12 +99,12 @@ def check_mysql() -> Dict[str, Any]:
                 "status": "healthy",
                 "message": "MySQL connection pool healthy",
             }
-    except Exception as e:
-        logger.error(f"MySQL health check failed: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("MySQL health check failed (%s)", type(exc).__name__)
         return {
             "status": "unhealthy",
-            "message": f"MySQL connection pool failed: {str(e)}",
-            "error": str(e),
+            "message": "MySQL connection pool failed",
+            "error_type": type(exc).__name__,
         }
 
 
@@ -118,34 +118,26 @@ async def check_celery() -> Dict[str, Any]:
     try:
         from app.tasks.celery_app import celery_app
         
-        # Celery's inspect API is synchronous. Keep it off the event loop and
-        # bound it so a broker outage cannot wedge every readiness worker.
-        def inspect_active_queues():
-            inspect = celery_app.control.inspect(timeout=1.0)
-            return inspect.active_queues()
+        # Verify broker connectivity without enabling Celery's remote-control
+        # command plane on production workers.
+        def check_broker_connection():
+            with celery_app.connection_for_read() as connection:
+                connection.ensure_connection(max_retries=0, timeout=1)
 
-        active_queues = await asyncio.wait_for(
-            asyncio.to_thread(inspect_active_queues),
+        await asyncio.wait_for(
+            asyncio.to_thread(check_broker_connection),
             timeout=2.0,
         )
-        
-        if active_queues is None:
-            return {
-                "status": "degraded",
-                "message": "Celery broker connection check failed (no workers responding)",
-            }
-        
         return {
             "status": "healthy",
             "message": "Celery broker connection successful",
-            "active_workers": len(active_queues) if active_queues else 0,
         }
-    except Exception as e:
-        logger.error(f"Celery health check failed: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("Celery health check failed (%s)", type(exc).__name__)
         return {
             "status": "unhealthy",
-            "message": f"Celery broker check failed: {str(e)}",
-            "error": str(e),
+            "message": "Celery broker check failed",
+            "error_type": type(exc).__name__,
         }
 
 
@@ -171,19 +163,19 @@ async def get_health_status() -> Dict[str, Any]:
     if isinstance(postgresql_status, Exception):
         postgresql_status = {
             "status": "unhealthy",
-            "message": f"PostgreSQL check raised exception: {str(postgresql_status)}",
+            "message": "PostgreSQL check raised an exception",
         }
     
     if isinstance(redis_status, Exception):
         redis_status = {
             "status": "unhealthy",
-            "message": f"Redis check raised exception: {str(redis_status)}",
+            "message": "Redis check raised an exception",
         }
     
     if isinstance(celery_status, Exception):
         celery_status = {
             "status": "unhealthy",
-            "message": f"Celery check raised exception: {str(celery_status)}",
+            "message": "Celery check raised an exception",
         }
     
     # Determine overall status

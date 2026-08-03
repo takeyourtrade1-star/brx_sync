@@ -93,7 +93,7 @@ async def test_cardtrader_api(token: str):
             info = await client.get_info()
             print(f"✓ App ID: {info.get('id')}")
             print(f"✓ App Name: {info.get('name')}")
-            print(f"✓ Shared Secret: {info.get('shared_secret', 'N/A')[:20]}...")
+            print("✓ Shared Secret: ricevuto (valore non stampato)")
             
             # Test /expansions/export
             print("\n📡 Testando endpoint /expansions/export...")

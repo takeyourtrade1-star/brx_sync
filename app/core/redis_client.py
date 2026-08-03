@@ -30,11 +30,12 @@ async def get_redis() -> Optional[Redis]:
                 socket_timeout=2,
                 retry_on_timeout=False,
                 health_check_interval=30,
+                **settings.redis_tls_kwargs,
             )
             await _redis_client.ping()
             logger.info("Redis connection established")
-        except Exception as e:
-            logger.error(f"Failed to connect to Redis: {e}")
+        except Exception:
+            logger.error("Failed to connect to Redis")
             _redis_client = None
 
     return _redis_client
@@ -74,6 +75,7 @@ def get_redis_sync():
                     socket_timeout=2,
                     retry_on_timeout=False,
                     health_check_interval=30,
+                    **settings.redis_tls_kwargs,
                 )
                 logger.info("Redis sync connection pool initialized (max_connections=50)")
     

@@ -5,7 +5,7 @@ from typing import Any, Dict, NoReturn
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.internal_dependencies import verify_internal_token
+from app.api.internal_dependencies import require_internal_scope
 from app.api.internal_schemas import (
     CreditInventoryRequest,
     InventoryOperationResponse,
@@ -24,7 +24,7 @@ from app.services.inventory_operations import (
 router = APIRouter(
     prefix="/internal",
     tags=["internal"],
-    dependencies=[Depends(verify_internal_token)],
+    dependencies=[Depends(require_internal_scope("inventory:write"))],
 )
 
 

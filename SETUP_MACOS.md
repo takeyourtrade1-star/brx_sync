@@ -2,11 +2,23 @@
 
 ## 📋 PASSO 1: Installa Homebrew (se non ce l'hai)
 
-Apri il Terminale e esegui:
+Installa Homebrew separatamente dalla pagina ufficiale. Non eseguire mai un
+installer remoto tramite pipe alla shell. Per un’installazione riproducibile,
+un maintainer deve prima approvare un commit immutabile e il relativo SHA-256,
+poi scaricare, verificare e leggere lo script:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+curl --proto '=https' --tlsv1.2 -fL \
+  -o /tmp/homebrew-install.sh \
+  "https://raw.githubusercontent.com/Homebrew/install/<COMMIT-40-HEX-APPROVATO>/install.sh"
+shasum -a 256 /tmp/homebrew-install.sh
+less /tmp/homebrew-install.sh
+# Esegui solo se il digest coincide con quello approvato nel ticket di setup:
+/bin/bash /tmp/homebrew-install.sh
 ```
+
+`<COMMIT-40-HEX-APPROVATO>` e il digest non hanno valori predefiniti: il setup
+deve fermarsi finché non sono stati registrati e verificati da un maintainer.
 
 Verifica installazione:
 ```bash
@@ -99,8 +111,8 @@ source venv/bin/activate
 Installa dipendenze:
 
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip==26.2
+python -m pip install --requirement requirements.txt
 ```
 
 ---
@@ -137,11 +149,11 @@ Modifica queste righe:
 # Database PostgreSQL (usa i valori di default se hai installato con Homebrew)
 DATABASE_URL=postgresql+asyncpg://$(whoami)@localhost:5432/brx_sync_db
 
-# MySQL (per ora usa valori di test, lo configuriamo dopo)
+# MySQL locale: crea un utente dedicato in sola lettura sul database di test.
 MYSQL_HOST=localhost
 MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=root
+MYSQL_USER=brx_sync_dev_reader
+MYSQL_PASSWORD=replace-with-a-local-random-secret
 MYSQL_DATABASE=test_db
 
 # Redis (default va bene)

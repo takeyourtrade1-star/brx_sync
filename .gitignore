@@ -33,8 +33,14 @@ env/
 *~
 
 # Environment variables
-.env
-.env.local
+.env*
+!.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
 
 # Database
 *.db

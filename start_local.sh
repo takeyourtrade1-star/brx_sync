@@ -27,8 +27,7 @@ if [ ! -f .env ]; then
     fi
 fi
 
-# Carica variabili d'ambiente
-export $(cat .env | grep -v '^#' | xargs)
+# L'app usa pydantic-settings per leggere .env senza valutarlo come codice shell.
 
 echo "📦 Verifica dipendenze Python..."
 if [ ! -d "venv" ]; then
@@ -38,7 +37,7 @@ fi
 
 echo "📥 Installazione dipendenze..."
 source venv/bin/activate
-pip install -q -r requirements.txt
+python -m pip install -q --requirement requirements.txt
 
 echo ""
 echo "🧪 Esegui test connessioni..."

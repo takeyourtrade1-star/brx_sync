@@ -1,17 +1,20 @@
 """
 API endpoints for sync operations.
 """
+
 import json
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import func, or_, select, update
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
+from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.dependencies import get_current_user_id, verify_user_id_match
 from app.api.v1.schemas import (
     DeleteInventoryItemResponse,
     DisconnectSyncRequest,
@@ -27,36 +30,49 @@ from app.api.v1.schemas import (
     UpdateInventoryItemRequest,
     UpdateInventoryItemResponse,
 )
-from app.api.dependencies import get_current_user_id, verify_user_id_match
 from app.core.config import get_settings
 from app.core.database import get_db_session
-from sqlalchemy import text
 from app.core.exceptions import (
     InventoryItemMissingExternalIdError,
     InventoryItemNotFoundError,
-    SyncInProgressError,
     SyncNotFoundError,
+)
+from app.core.exceptions import (
     ValidationError as BRXValidationError,
 )
-from app.core.webhook_validator import WebhookValidationError, verify_webhook
+from app.core.webhook_validator import (
+    WebhookValidationError,
+    enforce_webhook_rate_limit,
+    verify_webhook,
+)
 from app.models.inventory import (
+    CardTraderOutbox,
+    InventoryOperation,
     SyncOperation,
     SyncStatusEnum,
     UserInventoryItem,
     UserSyncSettings,
+    WebhookInbox,
 )
-from app.tasks.celery_app import celery_app
+from app.services.cardtrader_payloads import build_product_update_payload
+from app.services.sync_policy import (
+    CardTraderWriteBlockedError,
+    assert_cardtrader_write_allowed,
+)
+from app.services.webhook_ledger_processor import WebhookLedgerProcessor
+from app.tasks.outbox_tasks import process_cardtrader_outbox_command
+from app.tasks.periodic_sync import reconcile_user
 from app.tasks.sync_tasks import (
     initial_bulk_sync,
     process_webhook_notification,
-    sync_delete_product_to_cardtrader,
-    sync_update_product_to_cardtrader,
 )
-from app.tasks.periodic_sync import reconcile_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 settings = get_settings()
+
+_ACTIVE_OUTBOX_STATUSES = ("pending", "running", "accepted")
+_POLICY_BLOCKING_OUTBOX_STATUSES = ("pending", "running", "accepted", "uncertain")
 
 
 class WebhookBodyTooLarge(ValueError):
@@ -79,6 +95,147 @@ async def _read_webhook_body(request: Request) -> bytes:
     return b"".join(chunks)
 
 
+async def _register_task_before_enqueue(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    task_id: str,
+    operation_type: str,
+) -> None:
+    """Persist task ownership before Celery can start processing it."""
+
+    session.add(
+        SyncOperation(
+            user_id=user_id,
+            operation_id=task_id,
+            operation_type=operation_type,
+            status="pending",
+        )
+    )
+    if operation_type == "bulk_sync":
+        await session.execute(
+            text("""
+                UPDATE user_sync_settings
+                SET sync_status = CAST('initial_sync' AS sync_status_enum),
+                    last_error = NULL,
+                    updated_at = NOW()
+                WHERE user_id = CAST(:user_id AS uuid)
+                """),
+            {"user_id": str(user_id)},
+        )
+    await session.commit()
+
+
+async def _assert_no_unresolved_inventory_mutation(
+    session: AsyncSession,
+    item: UserInventoryItem,
+) -> None:
+    """Reject edits until the preceding CardTrader mutation is resolved."""
+    if item.source == "cardtrader" and item.game_id != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Oggetto non riconciliato come Magic; modifica CardTrader bloccata.",
+        )
+    if item.sync_state != "synced" or item.sync_uncertain_event_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Oggetto in sincronizzazione o in riconciliazione; "
+                "attendi la conclusione prima di modificarlo di nuovo."
+            ),
+        )
+
+    unresolved_command_id = (
+        await session.execute(
+            select(CardTraderOutbox.id)
+            .where(
+                CardTraderOutbox.inventory_item_id == item.id,
+                CardTraderOutbox.status.in_(_ACTIVE_OUTBOX_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if unresolved_command_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=("Esiste già una modifica CardTrader non conclusa per questo oggetto."),
+        )
+
+
+async def _assert_user_has_no_unresolved_mutations(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> None:
+    unresolved_outbox = (
+        await session.execute(
+            select(CardTraderOutbox.id)
+            .where(
+                CardTraderOutbox.user_id == user_id,
+                CardTraderOutbox.status.in_(_POLICY_BLOCKING_OUTBOX_STATUSES),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    processing_inventory = (
+        await session.execute(
+            select(InventoryOperation.id)
+            .where(
+                InventoryOperation.status == "processing",
+                InventoryOperation.payload_json["user_id"].astext == str(user_id),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if unresolved_outbox is not None or processing_inventory is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Operazioni inventario/CardTrader ancora in corso; "
+                "completare la riconciliazione prima di cambiare collegamento."
+            ),
+        )
+
+
+async def _mark_enqueue_failed(
+    session: AsyncSession,
+    task_id: str,
+    error: Exception,
+) -> None:
+    await session.execute(
+        update(SyncOperation)
+        .where(SyncOperation.operation_id == task_id)
+        .values(
+            status="failed",
+            completed_at=datetime.utcnow(),
+            operation_metadata={"enqueue_error_type": type(error).__name__},
+        )
+    )
+    await session.execute(
+        text("""
+            UPDATE user_sync_settings AS settings
+            SET sync_status = CAST('error' AS sync_status_enum),
+                last_error = :error,
+                updated_at = NOW()
+            FROM sync_operations AS operation
+            WHERE operation.operation_id = :task_id
+              AND operation.operation_type = 'bulk_sync'
+              AND settings.user_id = operation.user_id
+            """),
+        {"task_id": task_id, "error": "enqueue failed"},
+    )
+    await session.commit()
+
+
+@router.post("/migrate/composite-index", status_code=status.HTTP_200_OK)
+async def apply_composite_index_migration(
+    user_id_from_token: str = Depends(get_current_user_id),
+) -> dict:
+    """Legacy endpoint intentionally disabled: migrations run only at deploy."""
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Endpoint migrazione disabilitato; usare la pipeline di deploy.",
+    )
+
+
 @router.post("/start/{user_id}", status_code=status.HTTP_202_ACCEPTED)
 async def start_sync(
     user_id: str,
@@ -88,11 +245,11 @@ async def start_sync(
 ) -> SyncStartResponse:
     """
     Start initial bulk sync for user.
-    
+
     Args:
         user_id: User UUID
         force: If True, allow sync even if status is 'active' or 'initial_sync'
-    
+
     Returns:
         Task ID and status
     """
@@ -100,21 +257,28 @@ async def start_sync(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user_id format"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id format"
         )
-    
+
     # Check if sync settings exist
-    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
+    # This row is the per-user admission mutex. Keep it locked through the
+    # active-operation check and durable task registration so two API workers
+    # cannot both publish bulk/reconcile work for the same user.
+    stmt = (
+        select(UserSyncSettings)
+        .where(UserSyncSettings.user_id == user_uuid)
+        .with_for_update()
+    )
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
-    
+
     if not sync_settings:
         raise SyncNotFoundError(user_id=user_id)
 
     # Reject if CardTrader link was removed (empty token)
     try:
         from app.core.crypto import get_encryption_manager
+
         enc = get_encryption_manager()
         token = enc.decrypt(sync_settings.cardtrader_token_encrypted)
         if not (token and token.strip()):
@@ -129,124 +293,216 @@ async def start_sync(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Collegamento CardTrader non configurato. Inserisci il token nello Step 1 e salva.",
         )
-    
-    # Check if sync is already in progress (unless force=True)
-    if not force:
-        status_value = sync_settings.sync_status if isinstance(sync_settings.sync_status, str) else sync_settings.sync_status.value
-        if status_value in (SyncStatusEnum.INITIAL_SYNC.value, SyncStatusEnum.ACTIVE.value):
-            raise SyncInProgressError(
-                user_id=user_id,
-                current_status=status_value,
+
+    if force:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Il force sync è disabilitato: usa la riconciliazione single-flight.",
+        )
+
+    status_value = (
+        sync_settings.sync_status
+        if isinstance(sync_settings.sync_status, str)
+        else sync_settings.sync_status.value
+    )
+    if sync_settings.execution_mode not in {"partial", "real"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Seleziona prima la modalita parziale o reale.",
+        )
+
+    if status_value == SyncStatusEnum.INITIAL_SYNC.value:
+        active_after = datetime.now(timezone.utc) - timedelta(minutes=45)
+        existing = (
+            await session.execute(
+                select(SyncOperation)
+                .where(
+                    SyncOperation.user_id == user_uuid,
+                    SyncOperation.operation_type == "bulk_sync",
+                    SyncOperation.status.in_(["pending", "processing"]),
+                    SyncOperation.created_at >= active_after,
+                )
+                .order_by(SyncOperation.created_at.desc())
+                .limit(1)
             )
-    
-    # Start Celery task
-    task = initial_bulk_sync.delay(user_id)
-    
+        ).scalar_one_or_none()
+        if existing is not None:
+            return SyncStartResponse(
+                status="accepted",
+                task_id=existing.operation_id,
+                user_id=user_id,
+                message="Sincronizzazione iniziale già in corso",
+            )
+        await session.execute(
+            update(SyncOperation)
+            .where(
+                SyncOperation.user_id == user_uuid,
+                SyncOperation.operation_type == "bulk_sync",
+                SyncOperation.status.in_(["pending", "processing"]),
+            )
+            .values(
+                status="failed",
+                completed_at=datetime.now(timezone.utc),
+                operation_metadata={"error": "stale operation recovered by API"},
+            )
+        )
+        status_value = SyncStatusEnum.ERROR.value
+
+    operation_type = "reconcile" if status_value == SyncStatusEnum.ACTIVE.value else "bulk_sync"
+    if operation_type == "reconcile":
+        active_after = datetime.now(timezone.utc) - timedelta(minutes=45)
+        existing = (
+            await session.execute(
+                select(SyncOperation)
+                .where(
+                    SyncOperation.user_id == user_uuid,
+                    SyncOperation.operation_type == "reconcile",
+                    SyncOperation.status.in_(["pending", "processing"]),
+                    SyncOperation.created_at >= active_after,
+                )
+                .order_by(SyncOperation.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return SyncStartResponse(
+                status="accepted",
+                task_id=existing.operation_id,
+                user_id=user_id,
+                message="Riconciliazione gia in corso",
+            )
+    task_id = str(uuid.uuid4())
+    await _register_task_before_enqueue(session, user_uuid, task_id, operation_type)
+
+    try:
+        if operation_type == "reconcile":
+            task = reconcile_user.apply_async(
+                kwargs={"user_id": user_id},
+                task_id=task_id,
+            )
+        else:
+            task = initial_bulk_sync.apply_async(args=[user_id], task_id=task_id)
+    except Exception as exc:
+        await _mark_enqueue_failed(session, task_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Impossibile accodare la sincronizzazione",
+        ) from exc
+
     return SyncStartResponse(
         status="accepted",
         task_id=task.id,
         user_id=user_id,
-        message="Bulk sync started" + (" (forced)" if force else ""),
+        message=(
+            "Riconciliazione avviata"
+            if operation_type == "reconcile"
+            else "Sincronizzazione iniziale avviata"
+        ),
     )
 
 
 @router.get("/task/{task_id}")
 async def get_task_status(
-    task_id: str,
+    task_id: str = Path(
+        ...,
+        min_length=36,
+        max_length=36,
+        pattern=r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+    ),
     user_id_from_token: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
     Get Celery task status by task ID.
-    
+
     Verifies that the task belongs to the authenticated user by checking SyncOperation.
-    
+
     Args:
         task_id: Celery task ID
         user_id_from_token: User ID from JWT token (automatically extracted)
-        
+
     Returns:
         Task status and result
-        
+
     Raises:
         HTTPException 403: If task doesn't belong to the authenticated user
     """
     try:
-        # Verify task ownership by checking SyncOperation in database
         try:
             user_uuid = uuid.UUID(user_id_from_token)
-        except ValueError:
+            normalized_task_id = str(uuid.UUID(task_id))
+        except ValueError as exc:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid user_id format in token"
-            )
-        
-        # Query SyncOperation to find task owner
-        # Note: operation_id in SyncOperation stores the Celery task_id
+                status_code=status.HTTP_404_NOT_FOUND, detail="Task not found"
+            ) from exc
+
+        # Query by owner as well as task ID: callers cannot use status differences
+        # to discover another user's task identifiers.
         stmt = select(SyncOperation).where(
-            SyncOperation.operation_id == task_id
+            SyncOperation.operation_id == normalized_task_id,
+            SyncOperation.user_id == user_uuid,
         )
         result = await session.execute(stmt)
         sync_op = result.scalar_one_or_none()
-        
-        if sync_op:
-            # Verify ownership
-            if sync_op.user_id != user_uuid:
-                logger.warning(
-                    f"Task ownership mismatch: task={task_id}, "
-                    f"token_user={user_id_from_token}, task_user={sync_op.user_id}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Access denied: Task does not belong to authenticated user",
-                )
-        else:
-            # Task not found in SyncOperation - might be a different task type
-            # For security, deny access if we can't verify ownership
-            logger.warning(
-                f"Task {task_id} not found in SyncOperation, denying access for security"
-            )
+
+        if sync_op is None:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access denied: Could not verify task ownership",
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found",
             )
-        
-        # Get task status from Celery
-        task = celery_app.AsyncResult(task_id)
-        
-        response = {
-            "task_id": task_id,
-            "status": task.state,
-            "ready": task.ready(),
+
+        if sync_op.status in {"completed", "failed", "uncertain", "cancelled"}:
+            successful = sync_op.status == "completed"
+            metadata = sync_op.operation_metadata or {}
+            safe_result_keys = {
+                "processed",
+                "created",
+                "updated",
+                "skipped",
+                "total_products",
+                "progress_percent",
+            }
+            safe_result = {
+                key: value
+                for key, value in metadata.items()
+                if key in safe_result_keys and isinstance(value, (bool, int, float, str))
+            }
+            return {
+                "task_id": normalized_task_id,
+                "status": "SUCCESS" if successful else "FAILURE",
+                "ready": True,
+                "result": safe_result if successful else None,
+                "error": None if successful else "Task failed",
+                "message": (
+                    "Task completed successfully"
+                    if successful else "Task could not be completed"
+                ),
+            }
+
+        public_state = {
+            "pending": "PENDING",
+            "processing": "STARTED",
+            "running": "STARTED",
+            "retry": "RETRY",
+        }.get(sync_op.status, "PENDING")
+        return {
+            "task_id": normalized_task_id,
+            "status": public_state,
+            "ready": False,
+            "message": (
+                "Task is currently running"
+                if public_state == "STARTED"
+                else "Task is waiting to be processed"
+            ),
         }
-        
-        if task.ready():
-            if task.successful():
-                response["result"] = task.result
-                response["message"] = "Task completed successfully"
-            else:
-                response["error"] = str(task.info) if task.info else "Unknown error"
-                response["message"] = "Task failed"
-        else:
-            # Task is still running
-            if task.state == "PENDING":
-                response["message"] = "Task is waiting to be processed"
-            elif task.state == "STARTED":
-                response["message"] = "Task is currently running"
-            elif task.state == "RETRY":
-                response["message"] = "Task is being retried"
-            else:
-                response["message"] = f"Task state: {task.state}"
-        
-        return response
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error getting task status for {task_id}: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("Task status lookup failed (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving task status: {str(e)}",
-        )
+            detail="Error retrieving task status",
+        ) from exc
 
 
 @router.get("/progress/{user_id}")
@@ -257,10 +513,10 @@ async def get_sync_progress(
 ) -> dict:
     """
     Get real-time sync progress for a user.
-    
+
     Args:
         user_id: User UUID
-        
+
     Returns:
         Progress information including percentage, chunks processed, etc.
     """
@@ -268,22 +524,21 @@ async def get_sync_progress(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user_id format"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id format"
         )
-    
+
     # Get the most recent sync operation for this user
     stmt = (
         select(SyncOperation)
         .where(SyncOperation.user_id == user_uuid)
-        .where(SyncOperation.operation_type == "initial_bulk_sync")
+        .where(SyncOperation.operation_type.in_(["bulk_sync", "reconcile"]))
         .order_by(SyncOperation.created_at.desc())
         .limit(1)
     )
-    
+
     result = await session.execute(stmt)
     sync_op = result.scalar_one_or_none()
-    
+
     if not sync_op:
         return {
             "user_id": user_id,
@@ -291,7 +546,7 @@ async def get_sync_progress(
             "message": "No sync operation found for this user",
             "progress_percent": 0,
         }
-    
+
     # Extract progress from metadata
     metadata = sync_op.operation_metadata or {}
     progress_pct = metadata.get("progress_percent", 0)
@@ -302,7 +557,7 @@ async def get_sync_progress(
     created = metadata.get("created", 0)
     updated = metadata.get("updated", 0)
     skipped = metadata.get("skipped", 0)
-    
+
     return {
         "user_id": user_id,
         "operation_id": sync_op.operation_id,
@@ -328,10 +583,10 @@ async def get_sync_status(
 ) -> SyncStatusResponse:
     """
     Get current sync status for a user.
-    
+
     Args:
         user_id: User UUID
-        
+
     Returns:
         Sync status information
     """
@@ -339,24 +594,23 @@ async def get_sync_status(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user_id format"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id format"
         )
-    
+
     stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
-    
+
     if not sync_settings:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found in sync settings"
+            detail=f"User {user_id} not found in sync settings",
         )
-    
     # Check if token was cleared (disconnected)
     disconnected = False
     try:
         from app.core.crypto import get_encryption_manager
+
         enc = get_encryption_manager()
         token = enc.decrypt(sync_settings.cardtrader_token_encrypted)
         if not (token and token.strip()):
@@ -366,10 +620,21 @@ async def get_sync_status(
 
     return SyncStatusResponse(
         user_id=user_id,
-        sync_status=sync_settings.sync_status.value if hasattr(sync_settings.sync_status, 'value') else str(sync_settings.sync_status),
+        sync_status=(
+            sync_settings.sync_status.value
+            if hasattr(sync_settings.sync_status, "value")
+            else str(sync_settings.sync_status)
+        ),
         last_sync_at=sync_settings.last_sync_at.isoformat() if sync_settings.last_sync_at else None,
-        last_error=sync_settings.last_error,
+        last_error=(
+            "Synchronization failed; retry or contact support"
+            if sync_settings.last_error
+            else None
+        ),
         disconnected=disconnected if disconnected else None,
+        execution_mode=sync_settings.execution_mode,
+        mode_version=sync_settings.mode_version,
+        writes_enabled=sync_settings.writes_enabled,
     )
 
 
@@ -394,7 +659,7 @@ async def disconnect_sync(
             detail="Invalid user_id format",
         )
 
-    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
+    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid).with_for_update()
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
 
@@ -403,6 +668,7 @@ async def disconnect_sync(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {user_id} not found in sync settings",
         )
+    await _assert_user_has_no_unresolved_mutations(session, user_uuid)
 
     from sqlalchemy import text
 
@@ -412,6 +678,10 @@ async def disconnect_sync(
             text("""
                 UPDATE user_sync_settings
                 SET sync_status = CAST(:status AS sync_status_enum),
+                    execution_mode = 'demo',
+                    writes_enabled = FALSE,
+                    mode_version = mode_version + 1,
+                    mode_changed_at = NOW(),
                     updated_at = NOW()
                 WHERE user_id = CAST(:user_id AS uuid)
             """),
@@ -427,6 +697,7 @@ async def disconnect_sync(
     else:
         # remove: clear token and webhook
         from app.core.crypto import get_encryption_manager
+
         enc = get_encryption_manager()
         empty_token_encrypted = enc.encrypt("")
         conn = await session.connection()
@@ -436,6 +707,10 @@ async def disconnect_sync(
                 SET sync_status = CAST(:status AS sync_status_enum),
                     cardtrader_token_encrypted = :token,
                     webhook_secret = NULL,
+                    execution_mode = 'demo',
+                    writes_enabled = FALSE,
+                    mode_version = mode_version + 1,
+                    mode_changed_at = NOW(),
                     updated_at = NOW()
                 WHERE user_id = CAST(:user_id AS uuid)
             """),
@@ -460,49 +735,32 @@ async def receive_webhook(
     request: Request,
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
-    """
-    Receive webhook notification from CardTrader for a specific user.
-    
-    Each user configures their own webhook endpoint on CardTrader:
-    https://your-domain.com/api/v1/sync/webhook/user/{user_id}
-    
-    Must respond in < 100ms. Processing happens asynchronously.
-    
-    Args:
-        user_id: User UUID (extracted from URL path)
-        
-    Returns:
-        Acknowledgment response
-    """
+    """Validate and durably enqueue a CardTrader webhook for one user."""
     start_time = time.time()
-    
+
     try:
-        # Validate user_id format
         try:
             user_uuid = uuid.UUID(user_id)
         except ValueError as e:
-            logger.error(f"Invalid user_id format in webhook: {user_id}")
+            logger.warning("Webhook rejected for malformed user id")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid user_id format",
             ) from e
-        
-        # Verify user exists and get webhook_secret
-        stmt = select(UserSyncSettings).where(
-            UserSyncSettings.user_id == user_uuid
-        )
+
+        await enforce_webhook_rate_limit(request, str(user_uuid))
+
+        stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
         result = await session.execute(stmt)
         sync_settings = result.scalar_one_or_none()
-        
+
         if not sync_settings:
-            logger.warning(f"Webhook received for unknown user: {user_id}")
+            logger.warning("Webhook rejected for unknown sync owner")
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found in sync settings",
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Webhook authentication failed",
             )
-        
-        # Bound the body before buffering it. The endpoint is public by design
-        # (HMAC-authenticated), so an unbounded request would be a memory DoS.
+
         try:
             body = await _read_webhook_body(request)
         except WebhookBodyTooLarge as exc:
@@ -510,29 +768,23 @@ async def receive_webhook(
                 status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail="Webhook body too large",
             ) from exc
-        
-        # Get signature header
+
         signature_header = request.headers.get("Signature", "")
-        
-        # Validazione firma OBBLIGATORIA (fail-closed): senza secret o con firma
-        # non valida il webhook viene rifiutato e NON accodato. Evita che chiunque
-        # conosca l'URL possa alterare le quantità di inventario.
-        shared_secret = sync_settings.webhook_secret
-        if not shared_secret:
-            logger.error(
-                f"Webhook rifiutato: nessun webhook_secret per user {user_id}. "
-                f"L'utente deve ricollegare CardTrader."
-            )
+        stored_secret = sync_settings.webhook_secret
+        if not stored_secret:
+            logger.error("Webhook rejected because its secret is unavailable")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Webhook secret not configured",
             )
+        from app.core.crypto import get_encryption_manager
+
+        encryption_manager = get_encryption_manager()
         try:
+            shared_secret = encryption_manager.decrypt_at_rest_secret(stored_secret)
             verify_webhook(body, signature_header, shared_secret)
-        except WebhookValidationError as e:
-            logger.warning(
-                f"Webhook rifiutato: firma non valida per user {user_id}: {e}"
-            )
+        except (WebhookValidationError, ValueError) as e:
+            logger.warning("Webhook rejected because its signature is invalid")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid webhook signature",
@@ -561,54 +813,141 @@ async def receive_webhook(
                 detail="Missing webhook id",
             )
         webhook_id = str(webhook_id_raw).strip()
-        if len(webhook_id) > 128:
+        if len(webhook_id) > 128 or not all(
+            character.isalnum() or character in ":_-" for character in webhook_id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid webhook id",
             )
 
-        # Queue async processing with user_id
-        try:
-            process_webhook_notification.delay(webhook_id, payload, str(user_uuid))
-        except Exception as e:
-            logger.error(
-                "Webhook %s validated but could not be enqueued; requesting retry",
-                webhook_id,
-                exc_info=True,
+        # Serialize inbox marking with snapshot apply. The route owns the
+        # settings row before it publishes this event.
+        sync_settings = (
+            await session.execute(
+                select(UserSyncSettings)
+                .where(UserSyncSettings.user_id == user_uuid)
+                .with_for_update()
             )
+        ).scalar_one()
+        locked_stored_secret = sync_settings.webhook_secret
+        if not locked_stored_secret:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Webhook processing temporarily unavailable",
-            ) from e
-        
-        elapsed = (time.time() - start_time) * 1000  # milliseconds
-        logger.info(
-            f"Webhook {webhook_id} for user {user_id} acknowledged in {elapsed:.2f}ms"
+                detail="Webhook secret not configured",
+            )
+        try:
+            locked_secret = encryption_manager.decrypt_at_rest_secret(
+                locked_stored_secret
+            )
+            verify_webhook(body, signature_header, locked_secret)
+        except (WebhookValidationError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Webhook signature no longer matches current secret",
+            ) from exc
+
+        insert_result = await session.execute(
+            pg_insert(WebhookInbox)
+            .values(
+                webhook_id=webhook_id,
+                user_id=user_uuid,
+                cause=str(payload.get("cause") or ""),
+                mode=str(payload.get("mode") or "live").lower(),
+                payload_json=payload,
+                signature_valid=True,
+                status="received",
+            )
+            .on_conflict_do_nothing(index_elements=[WebhookInbox.webhook_id])
+            .returning(WebhookInbox.id)
         )
-        
+        inserted_id = insert_result.scalar_one_or_none()
+        if inserted_id is not None:
+            inbox = await session.get(WebhookInbox, inserted_id)
+        else:
+            inbox = (
+                await session.execute(
+                    select(WebhookInbox)
+                    .where(WebhookInbox.webhook_id == webhook_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+        if inbox is None:
+            raise RuntimeError("Webhook inbox row disappeared")
+        if inbox.user_id != user_uuid:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Webhook ID associato a un altro utente",
+            )
+        if inserted_id is None and dict(inbox.payload_json or {}) != payload:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Webhook ID collision",
+            )
+        if not locked_stored_secret.startswith("fernet:"):
+            sync_settings.webhook_secret = encryption_manager.encrypt_at_rest_secret(
+                locked_secret
+            )
+        if inserted_id is None and inbox.status in ("completed", "ignored"):
+            await session.commit()
+            elapsed = (time.time() - start_time) * 1000
+            return {
+                "status": "duplicate",
+                "webhook_id": webhook_id,
+                "user_id": user_id,
+                "processing_time_ms": round(elapsed, 2),
+            }
+
+        # Strong pre-ACK invariant: inbox, quarantine and marketplace
+        # deactivation commit atomically.
+        preack_result = await WebhookLedgerProcessor().prepare_inbox(
+            session,
+            inbox=inbox,
+            payload=payload,
+            settings=sync_settings,
+        )
+        await session.commit()
+
+        if preack_result.get("status") == "reconcile_required":
+            try:
+                process_webhook_notification.delay(webhook_id)
+            except Exception as exc:
+                # Quarantine is already durable. Preserve reconcile_pending so
+                # a delivery retry or the periodic reconciler can recover it.
+                await session.execute(
+                    update(WebhookInbox)
+                    .where(WebhookInbox.webhook_id == webhook_id)
+                    .values(last_error="webhook enqueue failed")
+                )
+                await session.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Webhook salvato ma non accodato; riprovare",
+                ) from exc
+
+        elapsed = (time.time() - start_time) * 1000  # milliseconds
+        logger.info("Webhook id=%s acknowledged in %.2fms", webhook_id, elapsed)
+
         return {
             "status": "accepted",
             "webhook_id": webhook_id,
             "user_id": user_id,
             "processing_time_ms": round(elapsed, 2),
         }
-        
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(
-            f"Error processing webhook for user {user_id}: {e}",
-            exc_info=True
-        )
+    except Exception as exc:
+        logger.error("Webhook processing failed (%s)", type(exc).__name__)
         # A non-2xx response is intentional: CardTrader must retry transient
         # parsing, database, Redis or queue failures instead of losing events.
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Webhook processing temporarily unavailable",
-        ) from e
+        ) from exc
 
 
-@router.post("/webhook/{webhook_id}", status_code=status.HTTP_200_OK)
+@router.post("/webhook/{webhook_id}", status_code=status.HTTP_410_GONE)
 async def receive_webhook_legacy(
     webhook_id: str,
     request: Request,
@@ -616,10 +955,10 @@ async def receive_webhook_legacy(
 ) -> dict:
     """
     Legacy webhook endpoint (for backward compatibility).
-    
+
     This endpoint extracts user_id from the webhook payload.
     New implementations should use /webhook/user/{user_id} instead.
-    
+
     Returns:
         Acknowledgment response
     """
@@ -627,15 +966,10 @@ async def receive_webhook_legacy(
     # dell'utente dal payload, quindi la firma non è verificabile. Per sicurezza
     # (fail-closed) NON viene più processato. L'URL fornito agli utenti è sempre
     # /webhook/user/{user_id}. Se questo log compare, un utente va ricollegato lì.
-    logger.error(
-        f"Webhook legacy rifiutato (non validabile): webhook_id={webhook_id}. "
-        f"Riconfigurare l'URL su /api/v1/sync/webhook/user/{{user_id}}."
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Legacy webhook endpoint disabled",
     )
-    return {
-        "status": "rejected",
-        "webhook_id": webhook_id,
-        "message": "Legacy webhook endpoint disabled; reconfigure to /webhook/user/{user_id}",
-    }
 
 
 @router.get("/webhook-url/{user_id}")
@@ -647,41 +981,39 @@ async def get_webhook_url(
 ) -> dict:
     """
     Get the webhook URL that the user should configure on CardTrader.
-    
+
     Each user configures their own webhook endpoint on CardTrader:
     https://www.cardtrader.com/it/full_api_app
-    
+
     Args:
         user_id: User UUID
-        
+
     Returns:
         Webhook URL and configuration instructions
     """
     try:
         user_uuid = uuid.UUID(user_id)
-    except ValueError as e:
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid user_id format: {str(e)}"
-        )
-    
+            detail="Invalid user_id format",
+        ) from exc
+
     # Verify user exists
-    stmt = select(UserSyncSettings).where(
-        UserSyncSettings.user_id == user_uuid
-    )
+    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
-    
+
     if not sync_settings:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found in sync settings"
+            detail=f"User {user_id} not found in sync settings",
         )
-    
+
     # Build webhook URL
-    base_url = str(request.base_url).rstrip('/')
+    base_url = settings.PUBLIC_BASE_URL
     webhook_url = f"{base_url}/api/v1/sync/webhook/user/{user_id}"
-    
+
     return {
         "user_id": user_id,
         "webhook_url": webhook_url,
@@ -690,28 +1022,30 @@ async def get_webhook_url(
             "step_2": "Copy the webhook URL below",
             "step_3": "Paste it in the 'Indirizzo del tuo endpoint webhook' field",
             "step_4": "Click 'Salva l'endpoint del Webhook'",
-            "note": "CardTrader will send notifications to this endpoint when orders/products are created, modified, or deleted"
+            "note": "CardTrader will send notifications to this endpoint when orders/products are created, modified, or deleted",
         },
-        "webhook_secret_configured": sync_settings.webhook_secret is not None
+        "webhook_secret_configured": sync_settings.webhook_secret is not None,
     }
 
 
+@router.post("/link-cardtrader")
 @router.post("/setup-test-user")
 async def setup_test_user(
     request: SetupTestUserRequest,
+    http_request: Request,
     user_id_from_token: str = Depends(get_current_user_id),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict:
     """
     Setup test user with CardTrader token (solo per test locale).
-    
+
     Args:
         request: SetupTestUserRequest with user_id and cardtrader_token
-        
+
     Returns:
         User sync settings
     """
-    if not settings.test_endpoints_enabled:
+    if http_request.url.path.endswith("/setup-test-user") and not settings.test_endpoints_enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     try:
         owns_requested_user = uuid.UUID(user_id_from_token) == uuid.UUID(request.user_id)
@@ -725,48 +1059,79 @@ async def setup_test_user(
 
     try:
         user_uuid = uuid.UUID(request.user_id)
-    except ValueError as e:
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid user_id format: {str(e)}"
+            detail="Invalid user_id format",
+        ) from exc
+    try:
+        token_user_uuid = uuid.UUID(user_id_from_token)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authenticated user ID",
+        ) from exc
+    if token_user_uuid != user_uuid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: User ID mismatch",
         )
-    
+
     try:
         from app.core.crypto import get_encryption_manager
         from app.services.cardtrader_client import CardTraderClient
-        
+
         encryption_manager = get_encryption_manager()
-        
+
         # Encrypt token
         try:
             token_encrypted = encryption_manager.encrypt(request.cardtrader_token)
         except Exception as e:
-            logger.error(f"Encryption error: {e}")
+            logger.error("Credential encryption failed")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Error encrypting token: {str(e)}"
+                detail="Credential encryption failed",
             )
-        
+
         # Get shared_secret from CardTrader /info
         webhook_secret = None
         try:
             async with CardTraderClient(request.cardtrader_token, str(user_uuid)) as client:
                 info = await client.get_info()
                 webhook_secret = info.get("shared_secret")
-                logger.info(f"Retrieved shared_secret for user {user_uuid}")
+                logger.info("Retrieved CardTrader webhook credential")
         except Exception as e:
-            logger.warning(f"Could not fetch shared_secret from CardTrader: {e}")
-            # Non blocchiamo il setup se fallisce, ma loggiamo
-        
+            logger.error("Could not verify CardTrader credentials")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Token CardTrader non verificabile. Nessun collegamento salvato.",
+            ) from e
+        if not webhook_secret:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="CardTrader non ha restituito il webhook secret. Nessun collegamento salvato.",
+            )
+        if not isinstance(webhook_secret, str) or len(webhook_secret) > 4096:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="CardTrader ha restituito credenziali non valide.",
+            )
+        webhook_secret_encrypted = encryption_manager.encrypt_at_rest_secret(
+            webhook_secret
+        )
+
         # Create or update sync settings
-        stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
+        stmt = (
+            select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid).with_for_update()
+        )
         result = await session.execute(stmt)
         sync_settings = result.scalar_one_or_none()
-        
+        await _assert_user_has_no_unresolved_mutations(session, user_uuid)
+
         # Use raw SQL with explicit CAST for PostgreSQL enum
         # Bypass SQLAlchemy ORM validation by using direct connection
         from sqlalchemy import text
-        
+
         if sync_settings:
             # Update existing - use direct connection to bypass ORM validation
             conn = await session.connection()
@@ -776,15 +1141,19 @@ async def setup_test_user(
                     SET cardtrader_token_encrypted = :token,
                         webhook_secret = :webhook,
                         sync_status = CAST(:status AS sync_status_enum),
+                        execution_mode = 'partial',
+                        writes_enabled = FALSE,
+                        mode_version = mode_version + 1,
+                        mode_changed_at = NOW(),
                         updated_at = NOW()
                     WHERE user_id = CAST(:user_id AS uuid)
                 """),
                 {
                     "token": token_encrypted,
-                    "webhook": webhook_secret,
+                    "webhook": webhook_secret_encrypted,
                     "status": SyncStatusEnum.IDLE.value,
-                    "user_id": str(user_uuid)
-                }
+                    "user_id": str(user_uuid),
+                },
             )
             logger.info(f"Updated sync settings for user {user_uuid}")
         else:
@@ -793,44 +1162,78 @@ async def setup_test_user(
             await conn.execute(
                 text("""
                     INSERT INTO user_sync_settings 
-                    (user_id, cardtrader_token_encrypted, webhook_secret, sync_status, created_at, updated_at)
+                    (user_id, cardtrader_token_encrypted, webhook_secret, sync_status,
+                     execution_mode, mode_version, writes_enabled, mode_changed_at,
+                     created_at, updated_at)
                     VALUES 
-                    (CAST(:user_id AS uuid), :token, :webhook, CAST(:status AS sync_status_enum), NOW(), NOW())
+                    (CAST(:user_id AS uuid), :token, :webhook,
+                     CAST(:status AS sync_status_enum), 'partial', 1, FALSE, NOW(),
+                     NOW(), NOW())
                 """),
                 {
                     "user_id": str(user_uuid),
                     "token": token_encrypted,
-                    "webhook": webhook_secret,
-                    "status": SyncStatusEnum.IDLE.value
-                }
+                    "webhook": webhook_secret_encrypted,
+                    "status": SyncStatusEnum.IDLE.value,
+                },
             )
             logger.info(f"Created sync settings for user {user_uuid}")
-        
+
+        marketplace_config_exists = (
+            await conn.execute(text("SELECT to_regclass('public.mkt_sync_config')"))
+        ).scalar_one_or_none()
+        if marketplace_config_exists:
+            await conn.execute(
+                text("""
+                    INSERT INTO mkt_sync_config
+                        (id, user_id, sync_mode, mode_version, writes_enabled,
+                         is_active,
+                         created_at, updated_at)
+                    SELECT CAST(:config_id AS uuid), user_id, 'partial',
+                           mode_version, FALSE, TRUE, NOW(), NOW()
+                    FROM user_sync_settings
+                    WHERE user_id = CAST(:user_id AS uuid)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        sync_mode = 'partial',
+                        mode_version = EXCLUDED.mode_version,
+                        writes_enabled = FALSE,
+                        updated_at = NOW()
+                """),
+                {"user_id": str(user_uuid), "config_id": str(uuid.uuid4())},
+            )
+
         await session.commit()
-        
+
         # Reload sync_settings to get the updated/created object
         stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid)
         result = await session.execute(stmt)
         sync_settings = result.scalar_one()
-        
+
         # sync_status è già una stringa, non un enum
-        status_value = sync_settings.sync_status if isinstance(sync_settings.sync_status, str) else sync_settings.sync_status.value
-        
+        status_value = (
+            sync_settings.sync_status
+            if isinstance(sync_settings.sync_status, str)
+            else sync_settings.sync_status.value
+        )
+
         return {
             "status": "success",
             "user_id": request.user_id,
             "sync_status": status_value,
             "webhook_secret_configured": webhook_secret is not None,
+            "execution_mode": sync_settings.execution_mode,
+            "mode_version": sync_settings.mode_version,
+            "writes_enabled": sync_settings.writes_enabled,
         }
-        
+
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error setting up user {request.user_id}: {e}", exc_info=True)
+    except Exception as exc:
+        logger.error("CardTrader link setup failed (%s)", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error setting up user: {str(e)}"
-        )
+            detail="Unable to configure CardTrader link",
+        ) from exc
 
 
 @router.delete("/inventory/{user_id}/item/{item_id}")
@@ -842,11 +1245,11 @@ async def delete_inventory_item(
 ) -> DeleteInventoryItemResponse:
     """
     Delete an inventory item.
-    
+
     Args:
         user_id: User UUID
         item_id: Inventory item ID
-        
+
     Returns:
         Deletion result
     """
@@ -858,60 +1261,111 @@ async def delete_inventory_item(
             field="user_id",
             value=user_id,
         ) from e
-    
-    stmt = select(UserInventoryItem).where(
-        UserInventoryItem.id == item_id,
-        UserInventoryItem.user_id == user_uuid,
+
+    stmt = (
+        select(UserInventoryItem)
+        .where(
+            UserInventoryItem.id == item_id,
+            UserInventoryItem.user_id == user_uuid,
+        )
+        .with_for_update()
     )
     result = await session.execute(stmt)
     item = result.scalar_one_or_none()
-    
+
     if not item:
         raise InventoryItemNotFoundError(item_id=item_id, user_id=user_id)
+    await _assert_no_unresolved_inventory_mutation(session, item)
     if item.reserved_quantity > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Oggetto bloccato in uno scambio attivo",
         )
-    
+
+    policy = None
+    if item.source == "cardtrader" and item.external_stock_id:
+        try:
+            policy = await assert_cardtrader_write_allowed(session, user_uuid)
+        except CardTraderWriteBlockedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="CardTrader writes are not available",
+            ) from exc
+        if item.environment != policy.execution_mode:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="L'oggetto appartiene a un altro ambiente di sincronizzazione.",
+            )
+
     # Store external_stock_id before deletion for CardTrader sync
     external_stock_id = item.external_stock_id
-    
-    # Delete from local database
-    await session.delete(item)
-    await session.commit()
-    
-    # Queue async sync to CardTrader (if external_stock_id exists)
+
     delete_sync_queued = False
     delete_sync_queue_error = None
     delete_sync_task_id = None
-    if external_stock_id:
-        try:
-            task_result = sync_delete_product_to_cardtrader.delay(user_id, int(external_stock_id))
-            delete_sync_task_id = task_result.id
-            delete_sync_queued = True
-            # Register task so get_task_status can verify ownership when frontend polls
-            sync_op = SyncOperation(
+    cardtrader_delete = item.source == "cardtrader" and bool(external_stock_id)
+    if cardtrader_delete:
+        if policy is None:
+            try:
+                policy = await assert_cardtrader_write_allowed(session, user_uuid)
+            except CardTraderWriteBlockedError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="CardTrader writes are not available",
+                ) from exc
+        command_id = uuid.uuid4()
+        item.quantity = 0
+        item.lifecycle_status = "pending_delete"
+        item.sync_state = "pending"
+        item.row_version += 1
+        session.add(
+            CardTraderOutbox(
+                id=command_id,
                 user_id=user_uuid,
-                operation_id=task_result.id,
-                operation_type="sync_delete",
+                mode_version=policy.mode_version,
+                operation_type="delete_product",
+                target_product_id=str(external_stock_id),
+                inventory_item_id=item.id,
+                expected_row_version=item.row_version,
+                payload_json={"id": int(external_stock_id)},
                 status="pending",
             )
-            session.add(sync_op)
-            await session.commit()
+        )
+        session.add(
+            SyncOperation(
+                user_id=user_uuid,
+                operation_id=str(command_id),
+                operation_type="sync_delete",
+                status="pending",
+                operation_metadata={"outbox_status": "pending"},
+            )
+        )
+        await session.commit()
+        delete_sync_task_id = str(command_id)
+        delete_sync_queued = True
+        try:
+            process_cardtrader_outbox_command.apply_async(
+                args=[str(command_id)],
+                task_id=str(command_id),
+            )
             logger.info(
-                f"Queued CardTrader deletion sync for item {item_id}, "
-                f"external_stock_id {external_stock_id}, task_id={task_result.id}"
+                "Created durable CardTrader deletion command %s for item %s",
+                command_id,
+                item_id,
             )
         except Exception as sync_error:
             logger.error(
-                f"Failed to queue CardTrader deletion sync: {sync_error}",
-                exc_info=True
+                "Outbox command %s persisted but dispatch failed (%s)",
+                command_id,
+                type(sync_error).__name__,
             )
-            delete_sync_queue_error = str(sync_error)
-    
+            delete_sync_queue_error = "Command persisted; background dispatch delayed"
+    else:
+        await session.delete(item)
+        await session.commit()
+
     return DeleteInventoryItemResponse(
-        status="deleted",
+        status="pending_sync" if cardtrader_delete else "deleted",
         item_id=item_id,
         cardtrader_sync_queued=delete_sync_queued,
         external_stock_id=external_stock_id,
@@ -934,313 +1388,28 @@ async def purchase_item(
 ) -> PurchaseItemResponse:
     """
     Purchase an item (simulate buyer purchase).
-    
+
     This endpoint:
     1. Checks local DB availability (with row lock for concurrency)
     2. Verifies availability on CardTrader
     3. If available: decrements quantity on CardTrader and local DB
     4. If not available: updates local DB and returns error
-    
+
     Args:
         user_id: User UUID (seller)
         item_id: Item ID to purchase
         request: Purchase request with quantity to purchase
-        
+
     Returns:
         Purchase result with status and details
     """
-    purchase_quantity = request.quantity
-    try:
-        user_uuid = uuid.UUID(user_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user_id format"
-        )
-    
-    # PRENOTAZIONE ATOMICA (anti doppia vendita): il decremento locale avviene
-    # subito, in transazione breve, con condizione quantity >= richiesta.
-    # CardTrader viene chiamato DOPO, fuori da ogni lock; su fallimento la
-    # prenotazione viene ripristinata. Due acquisti concorrenti non possono
-    # più vendere lo stesso stock (UPDATE condizionale, niente read-then-write).
-    reservation_open = False
-    quantity_after_reserve: Optional[int] = None
-    async with session.begin():
-        stmt = select(UserInventoryItem).where(
-            UserInventoryItem.id == item_id,
-            UserInventoryItem.user_id == user_uuid,
-        )
-        result = await session.execute(stmt)
-        item = result.scalar_one_or_none()
-
-        if not item:
-            raise InventoryItemNotFoundError(item_id=item_id, user_id=user_id)
-
-        quantity_before = item.quantity
-        external_stock_id_str = str(item.external_stock_id) if item.external_stock_id else None
-
-        if external_stock_id_str and item.quantity >= purchase_quantity:
-            reserve_result = await session.execute(
-                update(UserInventoryItem)
-                .where(
-                    UserInventoryItem.id == item_id,
-                    UserInventoryItem.user_id == user_uuid,
-                    UserInventoryItem.quantity >= purchase_quantity,
-                )
-                .values(quantity=UserInventoryItem.quantity - purchase_quantity)
-                .returning(UserInventoryItem.quantity)
-            )
-            quantity_after_reserve = reserve_result.scalar_one_or_none()
-            reservation_open = quantity_after_reserve is not None
-            if reservation_open:
-                quantity_before = quantity_after_reserve + purchase_quantity
-
-    async def _restore_reservation() -> None:
-        """Ripristina la quantità prenotata (fallimento CardTrader o errore imprevisto)."""
-        nonlocal reservation_open
-        if not reservation_open:
-            return
-        reservation_open = False
-        try:
-            # execute+commit espliciti: compatibili con l'autobegin della sessione
-            # (session.begin() fallirebbe se una select precedente ha già aperto la tx).
-            await session.execute(
-                update(UserInventoryItem)
-                .where(
-                    UserInventoryItem.id == item_id,
-                    UserInventoryItem.user_id == user_uuid,
-                )
-                .values(quantity=UserInventoryItem.quantity + purchase_quantity)
-            )
-            await session.commit()
-        except Exception as restore_error:
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            logger.error(
-                f"RIPRISTINO PRENOTAZIONE FALLITO per item {item_id} (+{purchase_quantity}): "
-                f"{restore_error} — intervento manuale necessario",
-                exc_info=True,
-            )
-
-    # If insufficient quantity in local DB, sync from CardTrader and return error
-    if not reservation_open and quantity_before < purchase_quantity:
-        if external_stock_id_str:
-            try:
-                from app.core.crypto import get_encryption_manager
-                from app.services.cardtrader_client import CardTraderClient
-                
-                # Get user sync settings (new query, no lock)
-                settings_stmt = select(UserSyncSettings).where(
-                    UserSyncSettings.user_id == user_uuid
-                )
-                settings_result = await session.execute(settings_stmt)
-                sync_settings = settings_result.scalar_one_or_none()
-                
-                if sync_settings:
-                    encryption_manager = get_encryption_manager()
-                    token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
-                    if token and token.strip():
-                        # Check availability on CardTrader (outside transaction)
-                        async with CardTraderClient(token, user_id) as client:
-                            availability = await client.check_product_availability(external_stock_id_str)
-                            cardtrader_quantity = availability.get("quantity", 0)
-
-                            # Riallinea verso il basso alla verità CardTrader senza
-                            # sovrascrivere eventuali prenotazioni concorrenti (LEAST).
-                            await session.execute(
-                                update(UserInventoryItem)
-                                .where(
-                                    UserInventoryItem.id == item_id,
-                                    UserInventoryItem.user_id == user_uuid,
-                                )
-                                .values(
-                                    quantity=func.least(
-                                        UserInventoryItem.quantity, cardtrader_quantity
-                                    )
-                                )
-                            )
-                            await session.commit()
-
-                            available_quantity = cardtrader_quantity
-            except Exception as e:
-                logger.error(f"Error syncing from CardTrader during purchase: {e}")
-                available_quantity = quantity_before
-        else:
-            available_quantity = quantity_before
-        
-        return PurchaseItemResponse(
-            status="error",
-            item_id=item_id,
-            message=f"Quantità insufficiente. Disponibile: {available_quantity}, Richiesta: {purchase_quantity}",
-            available=False,
-            quantity_purchased=0,
-            quantity_before=quantity_before,
-            quantity_after=available_quantity,
-            cardtrader_sync_queued=False,
-            external_stock_id=external_stock_id_str,
-            error=f"Insufficient quantity. Available: {available_quantity}, Requested: {purchase_quantity}",
-        )
-    
-    # Step 2: Verify external_stock_id exists
-    if not external_stock_id_str:
-        return PurchaseItemResponse(
-            status="error",
-            item_id=item_id,
-            message="Item non ha external_stock_id, impossibile verificare disponibilità su CardTrader",
-            available=False,
-            quantity_purchased=0,
-            quantity_before=quantity_before,
-            quantity_after=quantity_before,
-            cardtrader_sync_queued=False,
-            external_stock_id=None,
-            error="Missing external_stock_id",
-        )
-    
-    # Step 3: Get sync settings and token (outside transaction)
-    try:
-        from app.core.crypto import get_encryption_manager
-        from app.services.cardtrader_client import CardTraderClient
-        
-        # Get user sync settings
-        settings_stmt = select(UserSyncSettings).where(
-            UserSyncSettings.user_id == user_uuid
-        )
-        settings_result = await session.execute(settings_stmt)
-        sync_settings = settings_result.scalar_one_or_none()
-        
-        if not sync_settings:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"User {user_id} not found in sync settings"
-            )
-        
-        encryption_manager = get_encryption_manager()
-        token = encryption_manager.decrypt(sync_settings.cardtrader_token_encrypted)
-        if not (token and token.strip()):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Collegamento CardTrader non configurato. Configura il token nella pagina Sincronizzazione.",
-            )
-
-        # Step 4: Check availability and update CardTrader (OUTSIDE transaction)
-        cardtrader_updated = False
-        cardtrader_quantity_after = None
-
-        async with CardTraderClient(token, user_id) as client:
-            availability = await client.check_product_availability(external_stock_id_str)
-            cardtrader_quantity = availability.get("quantity", 0)
-            
-            if cardtrader_quantity < purchase_quantity:
-                # Product not available in sufficient quantity on CardTrader
-                logger.info(
-                    f"Purchase failed: Item {item_id} (product {external_stock_id_str}) "
-                    f"has insufficient quantity on CardTrader. Available: {cardtrader_quantity}, "
-                    f"Requested: {purchase_quantity}"
-                )
-                
-                # Ripristina la prenotazione locale senza superare la verità
-                # CardTrader (LEAST: non sovrascrive prenotazioni concorrenti).
-                reservation_open = False
-                await session.execute(
-                    update(UserInventoryItem)
-                    .where(
-                        UserInventoryItem.id == item_id,
-                        UserInventoryItem.user_id == user_uuid,
-                    )
-                    .values(
-                        quantity=func.least(
-                            UserInventoryItem.quantity + purchase_quantity,
-                            cardtrader_quantity,
-                        )
-                    )
-                )
-                await session.commit()
-
-                return PurchaseItemResponse(
-                    status="error",
-                    item_id=item_id,
-                    message=f"Quantità insufficiente su CardTrader. Disponibile: {cardtrader_quantity}, Richiesta: {purchase_quantity}",
-                    available=False,
-                    quantity_purchased=0,
-                    quantity_before=quantity_before,
-                    quantity_after=cardtrader_quantity,
-                    cardtrader_sync_queued=False,
-                    external_stock_id=external_stock_id_str,
-                    error=f"Insufficient quantity on CardTrader. Available: {cardtrader_quantity}, Requested: {purchase_quantity}",
-                )
-            
-            # Step 5: Update CardTrader (decrement or delete)
-            new_cardtrader_quantity = cardtrader_quantity - purchase_quantity
-            
-            if new_cardtrader_quantity > 0:
-                # Decrement quantity
-                logger.info(
-                    f"Decrementing quantity for product {external_stock_id_str} "
-                    f"from {cardtrader_quantity} to {new_cardtrader_quantity} "
-                    f"(purchasing {purchase_quantity})"
-                )
-                await client.increment_product_quantity(int(external_stock_id_str), -purchase_quantity)
-                cardtrader_updated = True
-                cardtrader_quantity_after = new_cardtrader_quantity
-            else:
-                # Delete product if quantity reaches 0
-                logger.info(
-                    f"Deleting product {external_stock_id_str} from CardTrader "
-                    f"(purchasing {purchase_quantity}, remaining would be {new_cardtrader_quantity})"
-                )
-                await client.delete_product(int(external_stock_id_str))
-                cardtrader_updated = True
-                cardtrader_quantity_after = 0
-        
-        # Step 6: la quantità locale è già stata decrementata dalla prenotazione
-        # atomica: nessuna seconda scrittura, nessuna compensazione necessaria.
-        reservation_open = False
-        logger.info(
-            f"Purchase successful: Item {item_id} (product {external_stock_id_str}) "
-            f"purchased {purchase_quantity} units. "
-            f"Quantity: {quantity_before} -> {quantity_after_reserve} "
-            f"(CardTrader updated: {cardtrader_updated}, qty after: {cardtrader_quantity_after})"
-        )
-
-        return PurchaseItemResponse(
-            status="success",
-            item_id=item_id,
-            message=f"Acquisto completato con successo: {purchase_quantity} unità",
-            available=True,
-            quantity_purchased=purchase_quantity,
-            quantity_before=quantity_before,
-            quantity_after=quantity_after_reserve if quantity_after_reserve is not None else quantity_before - purchase_quantity,
-            cardtrader_sync_queued=False,
-            external_stock_id=external_stock_id_str,
-            error=None,
-        )
-
-    except HTTPException:
-        # Config mancante (settings/token): rilascia la prenotazione e propaga.
-        await _restore_reservation()
-        raise
-    except Exception as e:
-        logger.error(f"Error during purchase for item {item_id}: {e}", exc_info=True)
-        # Fallimento CardTrader (anche incerto): rilascia la prenotazione locale.
-        # Nota: se CardTrader avesse comunque applicato il decremento (timeout
-        # dopo accettazione), la riconciliazione periodica riallinea — non si
-        # ritenta alla cieca.
-        await _restore_reservation()
-
-        return PurchaseItemResponse(
-            status="error",
-            item_id=item_id,
-            message=f"Errore durante l'acquisto: {str(e)}",
-            available=False,
-            quantity_purchased=0,
-            quantity_before=quantity_before if 'quantity_before' in locals() else 0,
-            quantity_after=quantity_before if 'quantity_before' in locals() else 0,
-            cardtrader_sync_queued=False,
-            external_stock_id=external_stock_id_str if 'external_stock_id_str' in locals() else None,
-            error=str(e),
-        )
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail=(
+            "Endpoint acquisto legacy disabilitato. "
+            "Usare il flusso ordini marketplace con outbox verificata."
+        ),
+    )
 
 
 @router.put("/inventory/{user_id}/item/{item_id}")
@@ -1253,12 +1422,12 @@ async def update_inventory_item(
 ) -> UpdateInventoryItemResponse:
     """
     Update an inventory item.
-    
+
     Args:
         user_id: User UUID
         item_id: Inventory item ID
         update_data: Update request data (Pydantic model)
-        
+
     Returns:
         Update result
     """
@@ -1270,7 +1439,7 @@ async def update_inventory_item(
             field="user_id",
             value=user_id,
         ) from e
-    
+
     # Extract values from Pydantic model
     quantity = update_data.quantity
     price_cents = update_data.price_cents
@@ -1278,59 +1447,56 @@ async def update_inventory_item(
     user_data_field = update_data.user_data_field
     graded = update_data.graded
     properties = update_data.properties
-    
-    # CRITICAL DEBUG: Log what we received
-    print(f"\n{'='*80}")
-    print(f"UPDATE REQUEST RECEIVED for item {item_id}")
-    print(f"Properties received: {properties}")
-    print(f"Condition in properties: {'condition' in properties if properties else False}")
-    print(f"Condition value: {properties.get('condition') if properties and 'condition' in properties else 'NOT PROVIDED'}")
-    print(f"{'='*80}\n")
-    
-    logger.warning(  # Use WARNING level to ensure it's visible
-        f"🔵 UPDATE REQUEST - item_id={item_id}, "
-        f"properties={properties}, "
-        f"has_condition={'condition' in properties if properties else False}, "
-        f"condition_value={properties.get('condition') if properties and 'condition' in properties else None}"
-    )
-    
-    stmt = select(UserInventoryItem).where(
-        UserInventoryItem.id == item_id,
-        UserInventoryItem.user_id == user_uuid,
+
+    stmt = (
+        select(UserInventoryItem)
+        .where(
+            UserInventoryItem.id == item_id,
+            UserInventoryItem.user_id == user_uuid,
+        )
+        .with_for_update()
     )
     result = await session.execute(stmt)
     item = result.scalar_one_or_none()
-    
+
     if not item:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Inventory item not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Inventory item not found"
         )
+    await _assert_no_unresolved_inventory_mutation(session, item)
     if item.reserved_quantity > 0:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Oggetto bloccato in uno scambio attivo",
         )
-    
+
+    policy = None
+    if item.source == "cardtrader" and item.external_stock_id:
+        try:
+            policy = await assert_cardtrader_write_allowed(session, user_uuid)
+        except CardTraderWriteBlockedError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="CardTrader writes are not available",
+            ) from exc
+        if item.environment != policy.execution_mode:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="L'oggetto appartiene a un altro ambiente di sincronizzazione.",
+            )
+
     # Store old values for comparison
     old_quantity = item.quantity
     old_price_cents = item.price_cents
     old_description = item.description
     old_user_data_field = item.user_data_field
     old_graded = item.graded
-    
+
     # Store old properties for comparison
     old_properties = item.properties.copy() if item.properties else {}
-    
-    # Log initial state
-    logger.info(
-        f"Update request for item {item_id}: "
-        f"old_properties={old_properties}, "
-        f"received_properties={properties}, "
-        f"old_condition={old_properties.get('condition')}, "
-        f"received_condition={properties.get('condition') if properties else None}"
-    )
-    
+
+    logger.info("Validated inventory update for item %s", item_id)
+
     # Update local database
     if quantity is not None:
         item.quantity = quantity
@@ -1347,11 +1513,11 @@ async def update_inventory_item(
         # IMPORTANT: We need to handle properties correctly:
         # - Boolean properties (signed, altered, mtg_foil) are ALWAYS included (even if False)
         # - String properties (condition, mtg_language) are ALWAYS included if provided (even if empty)
-        
+
         # CRITICAL: Create a new dict to ensure SQLAlchemy detects the change
         # SQLAlchemy doesn't automatically detect changes to JSONB fields when you modify nested keys
         updated_properties = item.properties.copy() if item.properties else {}
-        
+
         # Update properties - merge strategy:
         # For booleans: always update (even if False, to explicitly set it)
         # For strings: always update if provided (including empty strings for condition)
@@ -1360,101 +1526,57 @@ async def update_inventory_item(
             if isinstance(value, bool):
                 # Always update boolean properties
                 updated_properties[key] = value
-                logger.debug(f"Updated boolean property '{key}' = {value} for item {item_id}")
             elif isinstance(value, str):
                 # For strings, always update if provided (including empty strings for condition)
                 # This allows clearing condition if needed
                 updated_properties[key] = value
-                logger.debug(f"Updated string property '{key}' = '{value}' for item {item_id}")
-                if key == "condition":
-                    print(f"\n{'='*80}")
-                    print(f"✅ CONDITION BEING UPDATED for item {item_id}: '{value}'")
-                    print(f"{'='*80}\n")
-                    logger.warning(f"✅ CONDITION UPDATED for item {item_id}: '{value}'")
             elif value is not None and not isinstance(value, (bool, str)):
                 # Update other non-None values
                 updated_properties[key] = value
-                logger.debug(f"Updated property '{key}' = {value} for item {item_id}")
             # If value is None, don't update (keep existing value)
-        
+
         # CRITICAL: Assign the new dict completely
         # In SQLAlchemy 2.0, assigning a new dict to a JSONB field should be detected automatically
         # If not, we can use object_session to mark it as modified
         item.properties = updated_properties
-        
+
         # For SQLAlchemy 2.0, try to flag as modified if possible
         try:
             from sqlalchemy.orm.attributes import flag_modified
+
             flag_modified(item, "properties")
         except (ImportError, AttributeError):
             # If flag_modified is not available, SQLAlchemy 2.0 should detect the change
             # by the complete dict assignment above
             pass
-        
-        # Log the update for debugging
-        logger.info(
-            f"Updated properties for item {item_id}: "
-            f"old={old_properties}, received={properties}, final={item.properties}, "
-            f"condition_in_received={'condition' in properties}, "
-            f"condition_value={properties.get('condition') if 'condition' in properties else None}"
-        )
-    
+
+        logger.info("Inventory properties updated for item %s", item_id)
+
     item.updated_at = datetime.utcnow()
-    
-    # CRITICAL: Verify condition is saved before commit
-    if properties and "condition" in properties:
-        print(f"\n{'='*80}")
-        print(f"🔍 BEFORE COMMIT - Item {item_id} properties: {item.properties}")
-        print(f"🔍 Condition value in item.properties: {item.properties.get('condition') if item.properties else 'NO PROPERTIES'}")
-        print(f"{'='*80}\n")
-        logger.warning(
-            f"🔍 BEFORE COMMIT - item_id={item_id}, "
-            f"item.properties={item.properties}, "
-            f"condition={item.properties.get('condition') if item.properties else None}"
-        )
-    
-    await session.commit()
-    
-    # CRITICAL: Verify condition is saved after commit
-    if properties and "condition" in properties:
-        # Refresh item to verify it was saved
-        await session.refresh(item)
-        print(f"\n{'='*80}")
-        print(f"🔍 AFTER COMMIT - Item {item_id} properties: {item.properties}")
-        print(f"🔍 Condition value after refresh: {item.properties.get('condition') if item.properties else 'NO PROPERTIES'}")
-        print(f"{'='*80}\n")
-        logger.warning(
-            f"🔍 AFTER COMMIT - item_id={item_id}, "
-            f"item.properties={item.properties}, "
-            f"condition={item.properties.get('condition') if item.properties else None}"
-        )
-    
+    await session.flush()
+
     # Check if properties changed
     # IMPORTANT: We need to compare the actual properties dict, not just reference
     # Also check if condition specifically changed
     properties_changed = False
     if properties is not None:
         # Deep comparison of properties
-        if old_properties != properties:
+        if old_properties != (item.properties or {}):
             properties_changed = True
         # Also check condition specifically
-        old_condition = old_properties.get('condition')
-        new_condition = properties.get('condition')
+        old_condition = old_properties.get("condition")
+        new_condition = properties.get("condition")
         if old_condition != new_condition:
             properties_changed = True
-            logger.info(
-                f"Condition changed for item {item_id}: "
-                f"'{old_condition}' -> '{new_condition}'"
-            )
-    
+            logger.info("Inventory condition updated for item %s", item_id)
+
     # Log final state after update
     logger.info(
-        f"After update for item {item_id}: "
-        f"final_properties={item.properties}, "
-        f"final_condition={item.properties.get('condition') if item.properties else None}, "
-        f"properties_changed={properties_changed}"
+        "Inventory update applied for item %s (properties_changed=%s)",
+        item_id,
+        properties_changed,
     )
-    
+
     # Queue async sync to CardTrader (if external_stock_id exists and values changed)
     quantity_changed = quantity is not None and quantity != old_quantity
     price_changed = price_cents is not None and price_cents != old_price_cents
@@ -1464,13 +1586,21 @@ async def update_inventory_item(
     # Check that external_stock_id exists and is not empty
     external_stock_id_str = str(item.external_stock_id).strip() if item.external_stock_id else ""
     has_external_id = bool(external_stock_id_str)
-    sync_needed = has_external_id and (
-        quantity_changed or price_changed or properties_changed or 
-        description_changed or user_data_field_changed or graded_changed
+    sync_needed = (
+        item.source == "cardtrader"
+        and has_external_id
+        and (
+            quantity_changed
+            or price_changed
+            or properties_changed
+            or description_changed
+            or user_data_field_changed
+            or graded_changed
+        )
     )
     sync_queue_error = None
     sync_task_id = None
-    
+
     # Log for debugging
     logger.info(
         f"Update item {item_id}: external_stock_id={item.external_stock_id}, "
@@ -1479,49 +1609,67 @@ async def update_inventory_item(
         f"description_changed={description_changed}, user_data_field_changed={user_data_field_changed}, "
         f"graded_changed={graded_changed}, sync_needed={sync_needed}"
     )
-    
+
     if sync_needed:
         if not has_external_id:
             raise InventoryItemMissingExternalIdError(item_id=item_id, user_id=user_id)
-        
-        try:
-            # Pass None for individual fields to ensure the task reads the latest from DB
-            task_result = sync_update_product_to_cardtrader.delay(
-                user_id,
-                item_id,
-                price_cents=None,
-                quantity=None,
-                description=None,
-                user_data_field=None,
-                graded=None,
-                properties=None,
-            )
-            sync_task_id = task_result.id
-            # Register task so get_task_status can verify ownership when frontend polls
-            sync_op = SyncOperation(
+
+        if policy is None:
+            policy = await assert_cardtrader_write_allowed(session, user_uuid)
+
+        command_id = uuid.uuid4()
+        item.row_version += 1
+        item.sync_state = "pending"
+        item.lifecycle_status = "sold_out" if item.quantity == 0 else "active"
+        payload = build_product_update_payload(item)
+        session.add(
+            CardTraderOutbox(
+                id=command_id,
                 user_id=user_uuid,
-                operation_id=task_result.id,
-                operation_type="sync_update",
+                mode_version=policy.mode_version,
+                operation_type="update_product",
+                target_product_id=external_stock_id_str,
+                inventory_item_id=item.id,
+                expected_row_version=item.row_version,
+                payload_json=payload,
+                context_json={
+                    "type": "inventory_edit",
+                    "old_quantity": old_quantity,
+                },
                 status="pending",
             )
-            session.add(sync_op)
-            await session.commit()
+        )
+        session.add(
+            SyncOperation(
+                user_id=user_uuid,
+                operation_id=str(command_id),
+                operation_type="sync_update",
+                status="pending",
+                operation_metadata={"outbox_status": "pending"},
+            )
+        )
+        await session.commit()
+        sync_task_id = str(command_id)
+        try:
+            process_cardtrader_outbox_command.apply_async(
+                args=[str(command_id)],
+                task_id=str(command_id),
+            )
             logger.info(
-                f"Queued CardTrader update sync for item {item_id}, "
-                f"external_stock_id {item.external_stock_id}, "
-                f"task_id={task_result.id}, "
-                f"quantity_changed={quantity_changed}, price_changed={price_changed}, "
-                f"properties_changed={properties_changed}, description_changed={description_changed}, "
-                f"user_data_field_changed={user_data_field_changed}, graded_changed={graded_changed}"
+                "Created durable CardTrader update command %s for item %s",
+                command_id,
+                item_id,
             )
         except Exception as sync_error:
             logger.error(
-                f"Failed to queue CardTrader update sync: {sync_error}",
-                exc_info=True
+                "Outbox command %s persisted but dispatch failed (%s)",
+                command_id,
+                type(sync_error).__name__,
             )
-            sync_needed = False
-            sync_queue_error = str(sync_error)
-    
+            sync_queue_error = "Command persisted; background dispatch delayed"
+    else:
+        await session.commit()
+
     return UpdateInventoryItemResponse(
         status="updated",
         item_id=item_id,
@@ -1537,14 +1685,16 @@ async def update_inventory_item(
         sync_queue_error=sync_queue_error,
         sync_task_id=sync_task_id,
     )
+
+
 @router.get(
     "/listings/blueprint/{blueprint_id}",
     response_model=ListingsByBlueprintResponse,
     summary="Listings by blueprint (public)",
 )
 async def get_listings_by_blueprint(
-    blueprint_id: int,
-    limit: int = 100,
+    blueprint_id: int = Path(ge=1),
+    limit: int = Query(default=100, ge=1, le=200),
     session: AsyncSession = Depends(get_db_session),
 ) -> ListingsByBlueprintResponse:
     """
@@ -1552,12 +1702,27 @@ async def get_listings_by_blueprint(
     Public endpoint: no auth required. Trade-locked CardTrader rows stay visible,
     while cards received from a trade are not listed automatically.
     """
-    limit = min(max(1, limit), 200)
+    from app.core.config import get_settings
+
+    if not get_settings().CARDTRADER_WRITES_ENABLED:
+        return ListingsByBlueprintResponse(blueprint_id=blueprint_id, listings=[])
     stmt = (
         select(UserInventoryItem)
         .where(
             UserInventoryItem.blueprint_id == blueprint_id,
             UserInventoryItem.source == "cardtrader",
+            UserInventoryItem.game_id == 1,
+            UserInventoryItem.environment == "real",
+            UserInventoryItem.lifecycle_status == "active",
+            UserInventoryItem.sync_state == "synced",
+            UserInventoryItem.sync_uncertain_event_id.is_(None),
+            UserInventoryItem.user_id.in_(
+                select(UserSyncSettings.user_id).where(
+                    UserSyncSettings.execution_mode == "real",
+                    UserSyncSettings.writes_enabled.is_(True),
+                    UserSyncSettings.sync_status == SyncStatusEnum.ACTIVE.value,
+                )
+            ),
             or_(
                 UserInventoryItem.quantity > 0,
                 UserInventoryItem.reserved_quantity > 0,
@@ -1595,19 +1760,20 @@ async def get_listings_by_blueprint(
 @router.get("/inventory/{user_id}", response_model=InventoryResponse)
 async def get_inventory(
     user_id: str,
-    limit: int = 100,
-    offset: int = 0,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=10_000),
+    include_history: bool = False,
     verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> InventoryResponse:
     """
     Get user inventory items.
-    
+
     Args:
         user_id: User UUID
         limit: Maximum number of items to return (default: 100, max: 1000)
         offset: Offset for pagination
-        
+
     Returns:
         List of inventory items
     """
@@ -1615,33 +1781,50 @@ async def get_inventory(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid user_id format"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid user_id format"
         )
-    
-    # Validate limit
-    limit = min(max(1, limit), 1000)
-    offset = max(0, offset)
-    
+
     # Query inventory items
+    settings_mode = (
+        await session.execute(
+            select(UserSyncSettings.execution_mode).where(UserSyncSettings.user_id == user_uuid)
+        )
+    ).scalar_one_or_none() or "demo"
+    inventory_filters = [
+        UserInventoryItem.user_id == user_uuid,
+        or_(
+            UserInventoryItem.source == "trade",
+            and_(
+                UserInventoryItem.source == "cardtrader",
+                UserInventoryItem.environment == settings_mode,
+            ),
+            and_(
+                UserInventoryItem.source == "internal_test",
+                UserInventoryItem.environment == "demo",
+                settings_mode == "demo",
+            ),
+        ),
+    ]
+    if not include_history:
+        inventory_filters.append(
+            UserInventoryItem.lifecycle_status.notin_(["archived", "pending_delete"])
+        )
+
     stmt = (
         select(UserInventoryItem)
-        .where(UserInventoryItem.user_id == user_uuid)
-        .order_by(UserInventoryItem.updated_at.desc())
+        .where(*inventory_filters)
+        .order_by(UserInventoryItem.updated_at.desc(), UserInventoryItem.id.desc())
         .limit(limit)
         .offset(offset)
     )
     result = await session.execute(stmt)
     items = result.scalars().all()
-    
-    
+
     # Get total count
-    count_stmt = select(UserInventoryItem).where(
-        UserInventoryItem.user_id == user_uuid
-    )
+    count_stmt = select(func.count()).select_from(UserInventoryItem).where(*inventory_filters)
     total_result = await session.execute(count_stmt)
-    total = len(total_result.scalars().all())
-    
+    total = total_result.scalar_one()
+
     return InventoryResponse(
         user_id=user_id,
         items=[
@@ -1654,10 +1837,16 @@ async def get_inventory(
                 properties=item.properties,
                 external_stock_id=item.external_stock_id,
                 source=item.source,
+                environment=item.environment,
+                lifecycle_status=item.lifecycle_status,
+                sync_state=item.sync_state,
+                mapping_status=item.mapping_status,
+                row_version=item.row_version,
                 description=item.description,
                 user_data_field=item.user_data_field,
                 graded=item.graded,
                 updated_at=item.updated_at.isoformat(),
+                created_at=item.created_at.isoformat() if item.created_at else None,
             )
             for item in items
         ],
@@ -1674,84 +1863,119 @@ async def trigger_sync_from_cardtrader(
 ) -> dict:
     """
     Manually trigger sync from CardTrader to local database.
-    
+
     This syncs products that might have been modified directly on CardTrader
     (not via our API) to ensure bidirectional synchronization.
-    
+
     Args:
         user_id: User UUID
         blueprint_id: Optional blueprint_id to sync specific product
-        
+
     Returns:
         Task information
     """
     try:
         user_uuid = uuid.UUID(user_id)
-    except ValueError as e:
+    except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid user_id format: {str(e)}"
-        )
-    
+            detail="Invalid user_id format",
+        ) from exc
+
     # Verify user exists
-    stmt = select(UserSyncSettings).where(
-        UserSyncSettings.user_id == user_uuid
-    )
+    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid).with_for_update()
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
-    
+
     if not sync_settings:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"User {user_id} not found in sync settings"
+            detail=f"User {user_id} not found in sync settings",
         )
 
     if str(sync_settings.sync_status) != "active":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Sync non attivo per l'utente (stato: {sync_settings.sync_status})"
+            detail=f"Sync non attivo per l'utente (stato: {sync_settings.sync_status})",
         )
+    if sync_settings.execution_mode not in {"partial", "real"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="La modalita demo non puo leggere l'inventario CardTrader.",
+        )
+
+    existing = (
+        await session.execute(
+            select(SyncOperation)
+            .where(
+                SyncOperation.user_id == user_uuid,
+                SyncOperation.operation_type == "reconcile",
+                SyncOperation.status.in_(["pending", "processing"]),
+                SyncOperation.created_at >= datetime.now(timezone.utc) - timedelta(minutes=45),
+            )
+            .order_by(SyncOperation.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return {
+            "status": "accepted",
+            "task_id": existing.operation_id,
+            "user_id": user_id,
+            "blueprint_id": blueprint_id,
+            "message": "Riconciliazione gia in corso",
+        }
 
     # Riconciliazione completa dell'inventario utente (reconciler v2).
     # blueprint_id è accettato per compatibilità ma il reconciler lavora
     # sempre sull'export completo (più sicuro: vede anche gli articoli spariti).
-    task = reconcile_user.delay(user_id=user_id)
+    task_id = str(uuid.uuid4())
+    await _register_task_before_enqueue(session, user_uuid, task_id, "reconcile")
+    try:
+        task = reconcile_user.apply_async(
+            kwargs={"user_id": user_id},
+            task_id=task_id,
+        )
+    except Exception as exc:
+        await _mark_enqueue_failed(session, task_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Impossibile accodare la riconciliazione",
+        ) from exc
 
-    logger.info(
-        f"Queued reconcile from CardTrader for user {user_id}, "
-        f"task_id={task.id}"
-    )
+    logger.info(f"Queued reconcile from CardTrader for user {user_id}, " f"task_id={task.id}")
 
     return {
         "status": "accepted",
         "task_id": task.id,
         "user_id": user_id,
         "blueprint_id": blueprint_id,
-        "message": "Sync from CardTrader queued"
+        "message": "Sync from CardTrader queued",
     }
 
 
-@router.get("/debug-logs")
-async def get_debug_logs(limit: int = 100) -> dict:
+@router.get("/debug-logs", include_in_schema=False)
+async def get_debug_logs(
+    limit: int = Query(default=100, ge=1, le=1000),
+    _user_id: str = Depends(get_current_user_id),
+) -> dict:
     """
     Get debug logs for frontend display.
-    
+
     Note: This endpoint reads from application logs, not from a separate debug file.
     For production, consider using a proper log aggregation service.
-    
+
     Args:
         limit: Maximum number of log entries to return (default: 100, max: 1000)
-        
+
     Returns:
         List of log entries (empty for now, as we use structured logging)
     """
-    limit = min(max(1, limit), 1000)
-    
     # TODO: Implement log reading from structured logging system
     # For now, return empty as we use standard Python logging
     return {
         "logs": [],
         "total": 0,
         "limit": limit,
-        "message": "Debug logs endpoint - use application logs for detailed information"
+        "message": "Debug logs endpoint - use application logs for detailed information",
     }

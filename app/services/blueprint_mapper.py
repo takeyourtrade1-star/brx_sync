@@ -36,7 +36,7 @@ class BlueprintMapper:
                 if len(parts) == 2:
                     return int(parts[0]), parts[1]
             except (ValueError, IndexError):
-                logger.warning(f"Invalid cache format for blueprint {blueprint_id}: {cached}")
+                logger.warning("Invalid blueprint cache record; ignoring it")
         
         return None
 
@@ -96,8 +96,12 @@ class BlueprintMapper:
                         return result["id"], "sealed_products"
                     
                     return None
-            except Exception as e:
-                logger.error(f"Error querying MySQL for blueprint {blueprint_id}: {e}")
+            except Exception as exc:
+                logger.error(
+                    "MySQL blueprint lookup failed for id=%s (%s)",
+                    blueprint_id,
+                    type(exc).__name__,
+                )
                 return None
 
     def map_blueprint_id(self, blueprint_id: int) -> Optional[Tuple[int, str]]:
@@ -195,8 +199,8 @@ class BlueprintMapper:
                         for blueprint_id in uncached_ids:
                             if blueprint_id not in results:
                                 results[blueprint_id] = None
-                except Exception as e:
-                    logger.error(f"Error batch querying MySQL: {e}")
+                except Exception as exc:
+                    logger.error("MySQL batch blueprint lookup failed (%s)", type(exc).__name__)
                     # Fallback to individual queries
                     for blueprint_id in uncached_ids:
                         if blueprint_id not in results:

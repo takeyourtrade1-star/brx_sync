@@ -88,11 +88,11 @@ source venv/bin/activate
 Con il virtual environment attivo:
 
 ```bash
-# Aggiorna pip
-pip install --upgrade pip
+# Usa la stessa versione verificata dalla build/CI
+python -m pip install --upgrade pip==26.2
 
 # Installa tutte le dipendenze
-pip install -r requirements.txt
+python -m pip install --requirement requirements.txt
 ```
 
 **⏳ Questo richiederà qualche minuto...**

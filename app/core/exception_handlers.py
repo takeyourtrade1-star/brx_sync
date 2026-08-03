@@ -4,7 +4,6 @@ Exception handlers for FastAPI.
 Centralized exception handling with structured error responses and logging.
 """
 import logging
-import traceback
 from typing import Any, Dict
 
 from fastapi import Request, status
@@ -13,6 +12,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from app.core.config import get_settings
+from app.core.trace_ids import safe_trace_id
 from app.core.exceptions import (
     BRXSyncError,
     CardTraderAPIError,
@@ -29,8 +29,6 @@ from app.core.exceptions import (
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-
-
 def get_trace_id(request: Request) -> str:
     """
     Extract trace ID from request headers or generate one.
@@ -41,19 +39,7 @@ def get_trace_id(request: Request) -> str:
     Returns:
         Trace ID string
     """
-    # Check for trace ID in headers (X-Trace-Id, X-Request-Id, etc.)
-    trace_id = (
-        request.headers.get("X-Trace-Id")
-        or request.headers.get("X-Request-Id")
-        or request.headers.get("X-Correlation-Id")
-    )
-    
-    if not trace_id:
-        # Generate a simple trace ID (in production, use proper UUID)
-        import uuid
-        trace_id = str(uuid.uuid4())
-    
-    return trace_id
+    return safe_trace_id(request)
 
 
 async def brx_sync_error_handler(
@@ -72,17 +58,11 @@ async def brx_sync_error_handler(
     """
     trace_id = get_trace_id(request)
     
-    # Log error with context
     logger.error(
-        f"BRXSyncError: {exc.error_code} - {exc.detail}",
-        extra={
-            "trace_id": trace_id,
-            "error_code": exc.error_code,
-            "status_code": exc.status_code,
-            "context": exc.context,
-            "path": request.url.path,
-            "method": request.method,
-        },
+        "BRX Sync request failed error_type=%s status_code=%d trace_id=%s",
+        type(exc).__name__,
+        exc.status_code,
+        trace_id,
         exc_info=settings.DEBUG,  # Include traceback only in debug mode
     )
     
@@ -117,22 +97,6 @@ async def cardtrader_api_error_handler(
     exc: CardTraderAPIError,
 ) -> JSONResponse:
     """Handle CardTraderAPIError exceptions."""
-    trace_id = get_trace_id(request)
-    
-    # Log with additional CardTrader context
-    logger.warning(
-        f"CardTrader API Error: {exc.error_code} - {exc.detail}",
-        extra={
-            "trace_id": trace_id,
-            "error_code": exc.error_code,
-            "status_code": exc.status_code,
-            "context": exc.context,
-            "path": request.url.path,
-            "method": request.method,
-            "service": "cardtrader",
-        },
-    )
-    
     return await brx_sync_error_handler(request, exc)
 
 
@@ -143,17 +107,9 @@ async def rate_limit_error_handler(
     """Handle RateLimitError exceptions."""
     trace_id = get_trace_id(request)
     
-    # Log rate limit with retry information
     logger.warning(
-        f"Rate limit exceeded: {exc.detail}",
-        extra={
-            "trace_id": trace_id,
-            "error_code": exc.error_code,
-            "retry_after": exc.context.get("retry_after"),
-            "user_id": exc.context.get("user_id"),
-            "path": request.url.path,
-            "method": request.method,
-        },
+        "Rate limit exceeded trace_id=%s",
+        trace_id,
     )
     
     response_data = exc.to_dict()
@@ -199,13 +155,9 @@ async def validation_error_handler(
         })
     
     logger.warning(
-        f"Validation error: {len(errors)} field(s) failed validation",
-        extra={
-            "trace_id": trace_id,
-            "errors": errors,
-            "path": request.url.path,
-            "method": request.method,
-        },
+        "Request validation failed fields=%d trace_id=%s",
+        len(errors),
+        trace_id,
     )
     
     return JSONResponse(
@@ -248,13 +200,9 @@ async def pydantic_validation_error_handler(
         })
     
     logger.warning(
-        f"Pydantic validation error: {len(errors)} field(s) failed validation",
-        extra={
-            "trace_id": trace_id,
-            "errors": errors,
-            "path": request.url.path,
-            "method": request.method,
-        },
+        "Model validation failed fields=%d trace_id=%s",
+        len(errors),
+        trace_id,
     )
     
     return JSONResponse(
@@ -287,20 +235,30 @@ async def generic_exception_handler(
     """
     trace_id = get_trace_id(request)
     
-    # Log full exception with traceback
+    # Keep exception values out of both logs and HTTP responses: driver errors
+    # can contain connection strings, SQL fragments or upstream credentials.
     logger.error(
-        f"Unhandled exception: {type(exc).__name__}: {str(exc)}",
+        "Unhandled exception: %s",
+        type(exc).__name__,
         extra={
             "trace_id": trace_id,
             "exception_type": type(exc).__name__,
-            "path": request.url.path,
-            "method": request.method,
         },
-        exc_info=True,  # Always include traceback for unhandled exceptions
     )
     
-    error_detail = str(exc) if settings.DEBUG else "An internal error occurred"
+    error_detail = "An internal error occurred"
     
+    response_headers = {
+        "X-Trace-Id": trace_id,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+    }
+    if settings.ENVIRONMENT in {"staging", "production"}:
+        response_headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -310,7 +268,7 @@ async def generic_exception_handler(
                 "trace_id": trace_id,
             }
         },
-        headers={"X-Trace-Id": trace_id},
+        headers=response_headers,
     )
 
 

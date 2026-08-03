@@ -5,11 +5,13 @@ All schemas include validation, examples, and descriptions for OpenAPI documenta
 """
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DisconnectSyncRequest(BaseModel):
     """Request schema for disconnecting/suspending CardTrader sync."""
+
+    model_config = ConfigDict(extra="forbid")
 
     action: Literal["suspend", "remove"] = Field(
         "suspend",
@@ -21,16 +23,38 @@ class DisconnectSyncRequest(BaseModel):
 
 class UpdateInventoryItemRequest(BaseModel):
     """Request schema for updating an inventory item."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "example": {
+                "quantity": 5,
+                "price_cents": 1600,
+                "description": "Near Mint condition",
+                "user_data_field": "Warehouse A",
+                "graded": True,
+                "properties": {
+                    "condition": "Near Mint",
+                    "signed": False,
+                    "altered": False,
+                    "mtg_foil": True,
+                    "mtg_language": "en",
+                },
+            }
+        },
+    )
     
     quantity: Optional[int] = Field(
         None,
         ge=0,
+        le=2_147_483_647,
         description="Item quantity (must be >= 0)",
         examples=[5],
     )
     price_cents: Optional[int] = Field(
         None,
         ge=0,
+        le=2_147_483_647,
         description="Price in cents (must be >= 0)",
         examples=[1600],
     )
@@ -86,6 +110,30 @@ class UpdateInventoryItemRequest(BaseModel):
         if v is not None and not v.strip():
             return None  # Convert empty strings to None
         return v
+
+    @field_validator("properties")
+    @classmethod
+    def validate_properties(cls, value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Keep JSONB and CardTrader payload properties bounded and scalar."""
+        if value is None:
+            return None
+        if len(value) > 32:
+            raise ValueError("properties may contain at most 32 entries")
+        for key, item in value.items():
+            if not isinstance(key, str) or not key or len(key) > 64:
+                raise ValueError("property names must contain 1..64 characters")
+            if not all(character.isalnum() or character in "_-" for character in key):
+                raise ValueError("property names contain unsupported characters")
+            if item is None or isinstance(item, bool):
+                continue
+            if isinstance(item, str):
+                if len(item) > 256:
+                    raise ValueError("property strings may contain at most 256 characters")
+                continue
+            if isinstance(item, int) and -(2**31) <= item <= 2**31 - 1:
+                continue
+            raise ValueError("property values must be bounded scalar values")
+        return value
     
     @model_validator(mode="after")
     def validate_at_least_one_field(self) -> "UpdateInventoryItemRequest":
@@ -104,28 +152,10 @@ class UpdateInventoryItemRequest(BaseModel):
             raise ValueError("At least one field must be provided for update")
         return self
     
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
-            "example": {
-                "quantity": 5,
-                "price_cents": 1600,
-                "description": "Near Mint condition",
-                "user_data_field": "Warehouse A",
-                "graded": True,
-                "properties": {
-                    "condition": "Near Mint",
-                    "signed": False,
-                    "altered": False,
-                    "mtg_foil": True,
-                    "mtg_language": "en",
-                },
-            }
-        }
-
-
 class SetupTestUserRequest(BaseModel):
     """Request schema for setting up a test user."""
+
+    model_config = ConfigDict(extra="forbid")
     
     user_id: str = Field(
         ...,
@@ -135,15 +165,10 @@ class SetupTestUserRequest(BaseModel):
     cardtrader_token: str = Field(
         ...,
         min_length=1,
+        max_length=4096,
         description="CardTrader API token (will be encrypted)",
         examples=["your_cardtrader_token_here"],
     )
-    webhook_secret: Optional[str] = Field(
-        None,
-        description="Webhook secret for signature validation",
-        examples=["your_webhook_secret"],
-    )
-    
     @field_validator("user_id")
     @classmethod
     def validate_user_id(cls, v: str) -> str:
@@ -161,6 +186,17 @@ class SetupTestUserRequest(BaseModel):
 class SyncStatusResponse(BaseModel):
     """Response schema for sync status."""
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "user_id": "db24fb13-ec73-49b8-932c-f0043dd47e86",
+                "sync_status": "idle",
+                "last_sync_at": "2026-02-19T10:00:00Z",
+                "last_error": None,
+            }
+        }
+    )
+
     user_id: str = Field(..., description="User UUID")
     sync_status: str = Field(..., description="Current sync status")
     last_sync_at: Optional[str] = Field(None, description="Last sync timestamp (ISO format)")
@@ -169,21 +205,33 @@ class SyncStatusResponse(BaseModel):
         None,
         description="True if CardTrader link was removed (no token); re-configure to sync again",
     )
+    execution_mode: Literal["demo", "partial", "real"] = Field(
+        "demo", description="Authoritative CardTrader execution mode"
+    )
+    mode_version: int = Field(1, ge=1, description="Execution-policy fence version")
+    writes_enabled: bool = Field(False, description="Whether real CardTrader writes are enabled")
     
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
-            "example": {
-                "user_id": "db24fb13-ec73-49b8-932c-f0043dd47e86",
-                "sync_status": "idle",
-                "last_sync_at": "2026-02-19T10:00:00Z",
-                "last_error": None,
-            }
-        }
-
-
 class InventoryItemResponse(BaseModel):
     """Response schema for inventory item."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": 1,
+                "blueprint_id": 230018,
+                "quantity": 5,
+                "price_cents": 1600,
+                "properties": {"condition": "Near Mint", "mtg_foil": True},
+                "external_stock_id": "392763036",
+                "source": "cardtrader",
+                "description": "Near Mint condition",
+                "user_data_field": "Warehouse A",
+                "graded": True,
+                "updated_at": "2026-02-19T10:00:00Z",
+                "created_at": "2026-02-19T09:00:00Z",
+            }
+        }
+    )
     
     id: int = Field(..., description="Item ID")
     blueprint_id: int = Field(..., description="CardTrader blueprint ID")
@@ -200,64 +248,47 @@ class InventoryItemResponse(BaseModel):
     source: Literal["cardtrader", "trade", "internal_test"] = Field(
         ..., description="Inventory origin"
     )
+    environment: Literal["demo", "partial", "real"] = Field(
+        ..., description="Inventory execution namespace"
+    )
+    lifecycle_status: Literal[
+        "active", "sold_out", "stale", "archived", "pending_delete", "sync_failed"
+    ] = Field(..., description="Inventory lifecycle state")
+    sync_state: Literal["synced", "pending", "accepted", "failed", "uncertain"] = Field(
+        ..., description="CardTrader mutation state"
+    )
+    mapping_status: Literal["mapped", "unsupported", "missing", "error"] = Field(
+        ..., description="Catalog mapping state"
+    )
+    row_version: int = Field(..., ge=1, description="Optimistic concurrency version")
     description: Optional[str] = Field(None, description="Product description")
     user_data_field: Optional[str] = Field(None, description="Custom metadata field")
     graded: Optional[bool] = Field(None, description="Whether the product is graded")
     updated_at: str = Field(..., description="Last update timestamp (ISO format)")
     created_at: Optional[str] = Field(None, description="Creation timestamp (ISO format)")
     
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
-            "example": {
-                "id": 1,
-                "blueprint_id": 230018,
-                "quantity": 5,
-                "price_cents": 1600,
-                "properties": {
-                    "condition": "Near Mint",
-                    "mtg_foil": True,
-                },
-                "external_stock_id": "392763036",
-                "source": "cardtrader",
-                "description": "Near Mint condition",
-                "user_data_field": "Warehouse A",
-                "graded": True,
-                "updated_at": "2026-02-19T10:00:00Z",
-                "created_at": "2026-02-19T09:00:00Z",
-            }
-        }
-
-
 class InventoryResponse(BaseModel):
     """Response schema for inventory list."""
-    
-    user_id: str = Field(..., description="User UUID")
-    items: List[InventoryItemResponse] = Field(..., description="List of inventory items")
-    total: int = Field(..., description="Total number of items")
-    
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "user_id": "db24fb13-ec73-49b8-932c-f0043dd47e86",
                 "items": [],
                 "total": 0,
             }
         }
-
-
+    )
+    
+    user_id: str = Field(..., description="User UUID")
+    items: List[InventoryItemResponse] = Field(..., description="List of inventory items")
+    total: int = Field(..., description="Total number of items")
+    
 class SyncStartResponse(BaseModel):
     """Response schema for sync start operation."""
-    
-    status: str = Field(..., description="Operation status")
-    task_id: str = Field(..., description="Celery task ID")
-    user_id: str = Field(..., description="User UUID")
-    message: str = Field(..., description="Status message")
-    
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "status": "accepted",
                 "task_id": "8ad5ad2b-4d47-4ce0-966a-c3505c6861f9",
@@ -265,19 +296,18 @@ class SyncStartResponse(BaseModel):
                 "message": "Bulk sync started",
             }
         }
-
-
+    )
+    
+    status: str = Field(..., description="Operation status")
+    task_id: str = Field(..., description="Celery task ID")
+    user_id: str = Field(..., description="User UUID")
+    message: str = Field(..., description="Status message")
+    
 class TaskStatusResponse(BaseModel):
     """Response schema for Celery task status."""
-    
-    task_id: str = Field(..., description="Task ID")
-    status: str = Field(..., description="Task status (PENDING, STARTED, SUCCESS, FAILURE, etc.)")
-    result: Optional[Dict[str, Any]] = Field(None, description="Task result if completed")
-    error: Optional[str] = Field(None, description="Error message if failed")
-    
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
+
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "task_id": "8ad5ad2b-4d47-4ce0-966a-c3505c6861f9",
                 "status": "SUCCESS",
@@ -285,8 +315,13 @@ class TaskStatusResponse(BaseModel):
                 "error": None,
             }
         }
-
-
+    )
+    
+    task_id: str = Field(..., description="Task ID")
+    status: str = Field(..., description="Task status (PENDING, STARTED, SUCCESS, FAILURE, etc.)")
+    result: Optional[Dict[str, Any]] = Field(None, description="Task result if completed")
+    error: Optional[str] = Field(None, description="Error message if failed")
+    
 class UpdateInventoryItemResponse(BaseModel):
     """Response schema for inventory item update."""
     
@@ -388,6 +423,22 @@ class PurchaseItemRequest(BaseModel):
 
 class PurchaseItemResponse(BaseModel):
     """Response schema for item purchase operation."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "success",
+                "item_id": 1,
+                "message": "Item purchased successfully",
+                "available": True,
+                "quantity_before": 1,
+                "quantity_after": 0,
+                "cardtrader_sync_queued": True,
+                "external_stock_id": "392763036",
+                "error": None,
+            }
+        }
+    )
     
     status: str = Field(..., description="Purchase status (success, error)")
     item_id: int = Field(..., description="Item ID that was purchased")
@@ -407,19 +458,3 @@ class PurchaseItemResponse(BaseModel):
         None,
         description="Error message if purchase failed",
     )
-    
-    class Config:
-        """Pydantic config."""
-        json_schema_extra = {
-            "example": {
-                "status": "success",
-                "item_id": 1,
-                "message": "Item purchased successfully",
-                "available": True,
-                "quantity_before": 1,
-                "quantity_after": 0,
-                "cardtrader_sync_queued": True,
-                "external_stock_id": "392763036",
-                "error": None,
-            }
-        }

@@ -3,17 +3,21 @@ FastAPI application entry point for BRX Sync Microservice.
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.v1.routes import sync as sync_router
 from app.api import internal_routes
+from app.api.internal_dependencies import require_internal_scope
 from app.core.config import get_settings
 from app.core.database import close_mysql_connection
 from app.core.exception_handlers import EXCEPTION_HANDLERS
 from app.core.logging import get_logger, setup_logging
+from app.core.http_security import RequestBodyLimitMiddleware, SecurityHeadersMiddleware
+from app.core.probe_cache import AsyncProbeCache
 from app.core.redis_client import close_redis
 
 # Setup logging first
@@ -21,6 +25,21 @@ setup_logging()
 
 settings = get_settings()
 logger = get_logger(__name__)
+secure_environment = settings.ENVIRONMENT in {"staging", "production"}
+
+
+async def _critical_dependencies_ready() -> bool:
+    from app.core.health import get_health_status
+
+    health_status = await get_health_status()
+    return health_status.get("status") == "healthy"
+
+
+readiness_probe = AsyncProbeCache(
+    _critical_dependencies_ready,
+    ttl_seconds=4.0,
+    timeout_seconds=3.0,
+)
 
 
 @asynccontextmanager
@@ -45,6 +64,11 @@ app = FastAPI(
     version=settings.APP_VERSION,
     description="Microservice for synchronizing inventory between Ebartex and CardTrader V2 API",
     debug=settings.DEBUG,
+    docs_url=None if secure_environment else "/docs",
+    redoc_url=None if secure_environment else "/redoc",
+    openapi_url=(
+        None if secure_environment else "/openapi.json"
+    ),
     lifespan=lifespan,
 )
 
@@ -52,13 +76,8 @@ app = FastAPI(
 # Parse ALLOWED_ORIGINS (comma-separated, no spaces around URLs)
 _raw = (settings.ALLOWED_ORIGINS or "").strip()
 allowed_origins = [o.strip() for o in _raw.split(",") if o.strip()] if _raw else ["*"]
-# Always include Amplify frontend origin if not already present (avoid "Failed to fetch" from Amplify)
-_amplify_origin = "https://main.d8ry9s45st8bf.amplifyapp.com"
-if allowed_origins != ["*"] and _amplify_origin not in allowed_origins:
-    allowed_origins.append(_amplify_origin)
-if "*" in allowed_origins and settings.ENVIRONMENT.strip().lower() not in {
+if "*" in allowed_origins and settings.ENVIRONMENT not in {
     "development",
-    "local",
     "test",
 }:
     raise RuntimeError("ALLOWED_ORIGINS='*' is allowed only in local/test environments")
@@ -67,11 +86,21 @@ logger.info("CORS allowed_origins: %s", allowed_origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_credentials=True,
+    allow_credentials="*" not in allowed_origins,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
     expose_headers=["X-Request-ID"],
 )
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[host.strip() for host in settings.TRUSTED_HOSTS.split(",")],
+)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_bytes=settings.REQUEST_MAX_BODY_BYTES,
+    max_messages=settings.REQUEST_MAX_BODY_MESSAGES,
+)
+app.add_middleware(SecurityHeadersMiddleware, hsts=secure_environment)
 
 
 # Register exception handlers
@@ -94,11 +123,7 @@ async def health_ready():
     Checks all critical dependencies (PostgreSQL, Redis, MySQL, Celery).
     Returns 200 if all are healthy, 503 otherwise.
     """
-    from app.core.health import get_health_status
-    
-    health_status = await get_health_status()
-    
-    if health_status["status"] == "healthy":
+    if await readiness_probe.get():
         return {"status": "ready"}
     else:
         return JSONResponse(
@@ -110,10 +135,14 @@ async def health_ready():
 @app.get("/health")
 async def health():
     """Minimal public health response; dependency details stay in server logs."""
-    return {"status": "healthy", "service": settings.APP_NAME}
+    return {"status": "healthy"}
 
 
-@app.get("/metrics")
+@app.get(
+    "/metrics",
+    dependencies=[Depends(require_internal_scope("metrics:read"))],
+    include_in_schema=False,
+)
 async def metrics():
     """
     Prometheus metrics endpoint.
@@ -143,18 +172,20 @@ try:
             """Redirect to test page."""
             from fastapi.responses import RedirectResponse
             return RedirectResponse(url="/static/index.html")
-except Exception as e:
-    logger.warning(f"Static files not available: {e}")
+except Exception:
+    logger.warning("Static test files are unavailable")
 
 
 @app.get("/")
 async def root():
     """Root endpoint."""
-    return {
+    payload = {
         "service": settings.APP_NAME,
-        "version": settings.APP_VERSION,
         "status": "running",
     }
+    if settings.ENVIRONMENT in {"development", "test"}:
+        payload["version"] = settings.APP_VERSION
+    return payload
 
 
 if __name__ == "__main__":
@@ -165,4 +196,9 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=settings.DEBUG,
+        proxy_headers=False,
+        limit_concurrency=128,
+        limit_max_requests=10_000,
+        timeout_keep_alive=5,
+        timeout_graceful_shutdown=30,
     )

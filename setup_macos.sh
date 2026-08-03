@@ -3,7 +3,7 @@
 # Script di setup automatico per macOS
 # Esegue i passi principali di configurazione
 
-set -e  # Exit on error
+set -euo pipefail
 
 echo "🍎 BRX Sync - Setup Automatico macOS"
 echo "======================================"
@@ -17,7 +17,7 @@ NC='\033[0m' # No Color
 
 # Funzione per check
 check_command() {
-    if command -v $1 &> /dev/null; then
+    if command -v "$1" &> /dev/null; then
         echo -e "${GREEN}✓${NC} $1 installato"
         return 0
     else
@@ -29,8 +29,9 @@ check_command() {
 # PASSO 1: Verifica Homebrew
 echo "📦 Verifica Homebrew..."
 if ! check_command brew; then
-    echo -e "${YELLOW}⚠️  Homebrew non trovato. Installazione...${NC}"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    echo -e "${RED}✗${NC} Homebrew non trovato."
+    echo "Installa Homebrew separatamente seguendo la documentazione ufficiale e verifica lo script prima di eseguirlo."
+    exit 1
 fi
 
 # PASSO 2: Verifica PostgreSQL
@@ -95,8 +96,8 @@ source venv/bin/activate
 # PASSO 6: Installa Dipendenze
 echo ""
 echo "📥 Installazione dipendenze..."
-pip install --upgrade pip --quiet
-pip install -r requirements.txt --quiet
+python -m pip install --upgrade pip==26.2 --quiet
+python -m pip install --requirement requirements.txt --quiet
 echo -e "${GREEN}✓${NC} Dipendenze installate"
 
 # PASSO 7: Genera Fernet Key
@@ -113,26 +114,8 @@ if [ ! -f .env ]; then
         cp .env.example .env
         echo -e "${GREEN}✓${NC} File .env creato da .env.example"
     else
-        echo -e "${YELLOW}⚠️  .env.example non trovato, creazione .env base...${NC}"
-        cat > .env << EOF
-DATABASE_URL=postgresql+asyncpg://$(whoami)@localhost:5432/brx_sync_db
-MYSQL_HOST=localhost
-MYSQL_PORT=3306
-MYSQL_USER=root
-MYSQL_PASSWORD=root
-MYSQL_DATABASE=test_db
-REDIS_URL=redis://localhost:6379/0
-FERNET_KEY=${FERNET_KEY}
-DEBUG=true
-ENVIRONMENT=development
-PROJECT_NAME=BRX Sync
-APP_NAME=brx-sync
-APP_VERSION=1.0.0
-CARDTRADER_API_BASE_URL=https://api.cardtrader.com/api/v2
-RATE_LIMIT_REQUESTS=200
-RATE_LIMIT_WINDOW_SECONDS=10
-EOF
-        echo -e "${GREEN}✓${NC} File .env creato"
+        echo -e "${RED}✗${NC} .env.example non trovato; setup interrotto senza creare credenziali predefinite"
+        exit 1
     fi
 else
     echo -e "${YELLOW}⚠️  File .env già esistente${NC}"

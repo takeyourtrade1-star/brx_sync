@@ -3,35 +3,67 @@
 # Segreti da AWS SSM Parameter Store, mai scritti su disco.
 services:
   brx-sync-api:
-    image: 000876600482.dkr.ecr.eu-south-1.amazonaws.com/ebartex-sync:latest
+    image: ${BRX_SYNC_IMAGE:?set immutable BRX_SYNC_IMAGE with @sha256 digest}
     container_name: brx-sync-api
     restart: unless-stopped
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --no-server-header --no-proxy-headers --limit-concurrency 128 --limit-max-requests 10000 --timeout-keep-alive 5 --timeout-graceful-shutdown 30
+    stop_grace_period: 30s
     ports:
-      - "8002:8000"
+      - "127.0.0.1:8002:8000"
+    read_only: true
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
+      - SERVICE_ROLE=api
       - DATABASE_URL
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
       # 2 uvicorn workers x (3 pool + 2 overflow) = 10 connessioni massime.
       - DB_POOL_SIZE=3
       - DB_MAX_OVERFLOW=2
+      - DB_SYNC_POOL_SIZE=1
+      - DB_SYNC_MAX_OVERFLOW=1
+      - DB_ISOLATED_POOL_SIZE=1
+      - DB_ISOLATED_MAX_OVERFLOW=1
       - MYSQL_HOST
       - MYSQL_PORT
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
-      - MYSQL_POOL_SIZE=5
-      - MYSQL_POOL_MAX_OVERFLOW=5
+      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - MYSQL_POOL_SIZE=3
+      - MYSQL_POOL_MAX_OVERFLOW=2
       - REDIS_URL
+      - REDIS_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
       - FERNET_KEY
+      - FERNET_PREVIOUS_KEYS
       - JWT_PUBLIC_KEY
-      - INTERNAL_API_TOKEN
-      - WEBHOOK_PUBLIC_URL
+      - JWT_ISSUER
+      - JWT_AUDIENCE
+      - JWT_REQUIRE_ISSUER_AUDIENCE
+      - JWT_REQUIRE_JTI
+      - JWT_LEGACY_ROLLOUT_ACK
+      - JWT_LEGACY_ROLLOUT_EXPIRES_AT
+      - JWT_MAX_ACCESS_TOKEN_SECONDS
+      - INTERNAL_API_TOKEN=
+      - INTERNAL_CALLER_TOKENS=${INTERNAL_CALLER_TOKENS:?required scoped caller map}
+      - INTERNAL_API_ALLOWED_CIDRS
+      - PUBLIC_BASE_URL
+      - TRUSTED_HOSTS
       - AWS_REGION
       - ENVIRONMENT
       - DEBUG
       - ENABLE_TEST_ENDPOINTS=false
       - AWS_SSM_ENABLED
       - ALLOWED_ORIGINS
+      - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
+      - REQUEST_MAX_BODY_MESSAGES=1024
       - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:
@@ -39,7 +71,7 @@ services:
     networks:
       - brx-sync-net
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -51,31 +83,62 @@ services:
         max-file: "3"
 
   brx-sync-worker:
-    image: 000876600482.dkr.ecr.eu-south-1.amazonaws.com/ebartex-sync:latest
+    image: ${BRX_SYNC_IMAGE:?set immutable BRX_SYNC_IMAGE with @sha256 digest}
     container_name: brx-sync-worker
     restart: unless-stopped
-    command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,default --concurrency=4
+    command: celery -A app.tasks.celery_app worker -B --loglevel=info --queues=high-priority,bulk-sync,sync-real,default --concurrency=4
+    stop_grace_period: 60s
+    read_only: true
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
+      - SERVICE_ROLE=worker
       - DATABASE_URL
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
       # Celery ha quattro processi: pool piccolo per processo, con backpressure.
       - DB_POOL_SIZE=2
       - DB_MAX_OVERFLOW=1
+      - DB_SYNC_POOL_SIZE=1
+      - DB_SYNC_MAX_OVERFLOW=0
+      - DB_ISOLATED_POOL_SIZE=1
+      - DB_ISOLATED_MAX_OVERFLOW=0
       - MYSQL_HOST
       - MYSQL_PORT
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
-      - MYSQL_POOL_SIZE=5
-      - MYSQL_POOL_MAX_OVERFLOW=5
+      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - MYSQL_POOL_SIZE=2
+      - MYSQL_POOL_MAX_OVERFLOW=1
       - REDIS_URL
+      - REDIS_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
       - FERNET_KEY
+      - FERNET_PREVIOUS_KEYS
       - JWT_PUBLIC_KEY
-      - WEBHOOK_PUBLIC_URL
+      - JWT_ISSUER
+      - JWT_AUDIENCE
+      - JWT_REQUIRE_ISSUER_AUDIENCE
+      - JWT_REQUIRE_JTI
+      - JWT_LEGACY_ROLLOUT_ACK
+      - JWT_LEGACY_ROLLOUT_EXPIRES_AT
+      - JWT_MAX_ACCESS_TOKEN_SECONDS
+      - PUBLIC_BASE_URL
+      - TRUSTED_HOSTS
       - AWS_REGION
       - ENVIRONMENT
       - DEBUG
       - ENABLE_TEST_ENDPOINTS=false
       - AWS_SSM_ENABLED
+      - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
+      - CARDTRADER_JOB_POLL_TIMEOUT_SECONDS=${CARDTRADER_JOB_POLL_TIMEOUT_SECONDS:-180}
+      - CARDTRADER_JOB_POLL_INTERVAL_SECONDS=${CARDTRADER_JOB_POLL_INTERVAL_SECONDS:-1.1}
       - SYNC_LOG_TO_FILE=false
     depends_on:
       brx-sync-redis:
@@ -88,16 +151,111 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # One-shot schema owner. It deliberately receives no runtime database URL,
+  # Fernet/JWT keys, MySQL/Redis credentials or internal caller tokens.
+  brx-sync-schema-migrate:
+    profiles: ["maintenance"]
+    image: ${BRX_SYNC_IMAGE:?set immutable BRX_SYNC_IMAGE with @sha256 digest}
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        psql -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_foundations.sql
+        psql -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_visibility.sql
+        psql -v ON_ERROR_STOP=1 -f migrations/20260716_cardtrader_execution_policy.sql
+    read_only: true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - PGHOST=${SYNC_MIGRATION_DB_HOST:?required migration DB host}
+      - PGPORT=5432
+      - PGDATABASE=${SYNC_MIGRATION_DB_NAME:?required migration DB name}
+      - PGUSER=${SYNC_MIGRATION_DB_USER:?required dedicated migration DB user}
+      - PGPASSWORD=${SYNC_MIGRATION_DB_PASSWORD:?required migration DB password}
+      - PGSSLMODE=verify-full
+      - PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
+      - PGCONNECT_TIMEOUT=5
+      - PGOPTIONS=-c statement_timeout=120000 -c lock_timeout=5000
+    networks:
+      - brx-sync-maintenance-net
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
+
+  # Credential maintenance needs DML plus the encryption key, but no schema
+  # owner, MySQL, Redis, JWT or service-to-service credentials.
+  brx-sync-credential-rotation:
+    profiles: ["maintenance"]
+    image: ${BRX_SYNC_IMAGE:?set immutable BRX_SYNC_IMAGE with @sha256 digest}
+    restart: "no"
+    command: ["python", "-m", "app.maintenance.rotate_credentials"]
+    read_only: true
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - DATABASE_URL=${DATABASE_URL:?required runtime DML database URL}
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - FERNET_KEY=${FERNET_KEY:?required primary Fernet key}
+      - FERNET_PREVIOUS_KEYS=${FERNET_PREVIOUS_KEYS:-}
+    networks:
+      - brx-sync-maintenance-net
+    healthcheck:
+      disable: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "2"
+
   brx-sync-redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:?set immutable REDIS_IMAGE with @sha256 digest}
     container_name: brx-sync-redis
     restart: unless-stopped
-    # Redis listen on 6381 on host to avoid conflict with other services
-    ports:
-      - "127.0.0.1:6381:6379"
+    stop_grace_period: 30s
+    read_only: true
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 128
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Redis is reachable only on the service network; no host socket is published.
+    expose:
+      - "6379"
     # Persistenza: i contatori del reconciler e il dedup webhook devono
     # sopravvivere ai redeploy
-    command: redis-server --appendonly yes
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - noeviction
     volumes:
       - brx-sync-redis-data:/data
     networks:
@@ -117,6 +275,12 @@ networks:
   brx-sync-net:
     driver: bridge
     name: brx-sync-net
+  # Only one-shot jobs join this network, so they cannot address API/worker/Redis
+  # by Docker service name. A bridge still has NAT egress: production additionally
+  # requires the host-level DB-only firewall gate in docs/PRODUCTION_SECURITY_GATES.md.
+  brx-sync-maintenance-net:
+    driver: bridge
+    name: brx-sync-maintenance-net
 
 volumes:
   brx-sync-redis-data:

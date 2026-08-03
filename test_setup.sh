@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script di test per verificare che tutto funzioni correttamente
 
-set -e  # Exit on error
+set -euo pipefail
 
 echo "🧪 BRX Sync - Test Setup Completo"
 echo "=================================="
@@ -17,11 +17,11 @@ NC='\033[0m' # No Color
 
 # Funzione per test
 test_step() {
-    local name=$1
-    local command=$2
+    local name="$1"
+    shift
     
     echo -n "Testing $name... "
-    if eval "$command" > /dev/null 2>&1; then
+    if "$@" > /dev/null 2>&1; then
         echo -e "${GREEN}✅ OK${NC}"
         return 0
     else
@@ -42,8 +42,8 @@ source venv/bin/activate
 # Installa dipendenze se necessario
 if [ ! -f "venv/.deps_installed" ]; then
     echo "📦 Installazione dipendenze..."
-    pip install -q -r requirements.txt
-    pip install -q -r requirements-dev.txt 2>/dev/null || echo "⚠️  requirements-dev.txt non trovato (ok per produzione)"
+    python -m pip install -q --requirement requirements.txt
+    python -m pip install -q --requirement requirements-dev.txt
     touch venv/.deps_installed
 fi
 
@@ -51,21 +51,21 @@ echo ""
 echo "1️⃣  Test Import Moduli"
 echo "-------------------"
 
-test_step "Exceptions" "python3 -c 'from app.core.exceptions import BRXSyncError, SyncError, InventoryError; print(\"OK\")'"
-test_step "Exception Handlers" "python3 -c 'from app.core.exception_handlers import EXCEPTION_HANDLERS; print(\"OK\")'"
-test_step "Logging" "python3 -c 'from app.core.logging import get_logger, LogContext; print(\"OK\")'"
-test_step "Health Checks" "python3 -c 'from app.core.health import get_health_status; print(\"OK\")'"
-test_step "Metrics" "python3 -c 'from app.core.metrics import increment_counter, get_metrics; print(\"OK\")'"
-test_step "Validators" "python3 -c 'from app.core.validators import validate_uuid, validate_blueprint_id; print(\"OK\")'"
-test_step "Security" "python3 -c 'from app.core.security import sanitize_string; print(\"OK\")'"
-test_step "Schemas" "python3 -c 'from app.api.v1.schemas import UpdateInventoryItemRequest, InventoryItemResponse; print(\"OK\")'"
+test_step "Exceptions" python3 -c 'from app.core.exceptions import BRXSyncError, SyncError, InventoryError'
+test_step "Exception Handlers" python3 -c 'from app.core.exception_handlers import EXCEPTION_HANDLERS'
+test_step "Logging" python3 -c 'from app.core.logging import get_logger, LogContext'
+test_step "Health Checks" python3 -c 'from app.core.health import get_health_status'
+test_step "Metrics" python3 -c 'from app.core.metrics import increment_counter, get_metrics'
+test_step "Validators" python3 -c 'from app.core.validators import validate_uuid, validate_blueprint_id'
+test_step "Security" python3 -c 'from app.core.security import sanitize_string'
+test_step "Schemas" python3 -c 'from app.api.v1.schemas import UpdateInventoryItemRequest, InventoryItemResponse'
 
 echo ""
 echo "2️⃣  Test Type Checking"
 echo "-------------------"
 if command -v mypy &> /dev/null; then
-    test_step "Type Check (exceptions)" "mypy app/core/exceptions.py --no-error-summary"
-    test_step "Type Check (logging)" "mypy app/core/logging.py --no-error-summary"
+    test_step "Type Check (exceptions)" mypy app/core/exceptions.py --no-error-summary
+    test_step "Type Check (logging)" mypy app/core/logging.py --no-error-summary
 else
     echo -e "${YELLOW}⚠️  mypy non installato. Salta type checking.${NC}"
     echo "   Installa con: pip install mypy"
@@ -75,7 +75,7 @@ echo ""
 echo "3️⃣  Test Code Formatting"
 echo "-------------------"
 if command -v black &> /dev/null; then
-    test_step "Black Format Check" "black --check app/core/exceptions.py app/core/logging.py 2>/dev/null || true"
+    test_step "Black Format Check" black --check app/core/exceptions.py app/core/logging.py
 else
     echo -e "${YELLOW}⚠️  black non installato. Salta format check.${NC}"
 fi
@@ -83,7 +83,7 @@ fi
 echo ""
 echo "4️⃣  Test Configurazione"
 echo "-------------------"
-test_step "Config Loading" "python3 -c 'from app.core.config import get_settings; s = get_settings(); print(\"OK\")'"
+test_step "Config Loading" python3 -c 'from app.core.config import get_settings; get_settings()'
 
 echo ""
 echo "5️⃣  Test Exception Hierarchy"

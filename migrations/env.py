@@ -20,7 +20,8 @@ config = context.config
 
 # Get database URL from settings
 settings = get_settings()
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# ConfigParser treats percent escapes in URL-encoded passwords as interpolation.
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
 
 # Interpret the config file for Python logging
 if config.config_file_name is not None:
@@ -60,6 +61,7 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args=settings.postgres_connect_args,
     )
 
     async with connectable.connect() as connection:

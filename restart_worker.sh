@@ -55,7 +55,7 @@ source venv/bin/activate
 echo "📦 Verifica dipendenze..."
 if ! python -c "import celery" &> /dev/null; then
     echo "⚠️  Celery non trovato. Installazione dipendenze..."
-    pip install -q -r requirements.txt
+    python -m pip install -q --requirement requirements.txt
 fi
 
 # Crea directory logs se non esiste

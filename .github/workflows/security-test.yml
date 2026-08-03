@@ -1,0 +1,109 @@
+name: Security gate
+# Required repository variables (reviewed immutable refs):
+# PYTHON_BASE_IMAGE and POSTGRES_TEST_IMAGE, both ending in @sha256:<64 hex>.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brx-sync-security-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  security-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: ${{ vars.POSTGRES_TEST_IMAGE }}
+        env:
+          POSTGRES_DB: brx_sync_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d brx_sync_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      PYTHON_BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE }}
+      POSTGRES_TEST_IMAGE: ${{ vars.POSTGRES_TEST_IMAGE }}
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/brx_sync_test
+      TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/brx_sync_test
+      MYSQL_HOST: localhost
+      MYSQL_USER: test
+      MYSQL_PASSWORD: test
+      MYSQL_DATABASE: test
+      REDIS_URL: redis://localhost:6379/0
+      FERNET_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
+      JWT_PUBLIC_KEY: test-public-key
+      INTERNAL_API_TOKEN: test-internal-token-0000000000000
+      PUBLIC_BASE_URL: http://localhost:8000
+      AWS_SSM_ENABLED: "false"
+      ENVIRONMENT: test
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Require reviewed image digests
+        shell: bash
+        run: |
+          [[ "$PYTHON_BASE_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
+          [[ "$POSTGRES_TEST_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
+
+      - name: Build reviewed Python 3.12 image
+        run: |
+          docker build --build-arg PYTHON_BASE_IMAGE="$PYTHON_BASE_IMAGE" --tag brx-sync-ci .
+          docker run --rm --entrypoint python brx-sync-ci -c \
+            'import sys; assert sys.version_info[:2] == (3, 12), sys.version'
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Install pinned dependency auditor
+        run: python -m pip install --disable-pip-version-check pip-audit==2.10.1
+
+      - name: Audit runtime and complete development dependency sets
+        run: |
+          python -m pip_audit --requirement requirements.txt --strict
+          # requirements-dev.txt includes requirements.txt via a reviewed -r line.
+          python -m pip_audit --requirement requirements-dev.txt --strict
+
+      - name: Compile source and migrations
+        run: python -m compileall -q app migrations tests
+
+      - name: Reject syntax errors and undefined names
+        run: ruff check --select E9,F63,F7,F82 app migrations tests
+
+      - name: Run blocking security regressions
+        run: |
+          pytest -q -o addopts='' \
+            tests/test_deploy_contract_unittest.py \
+            tests/test_internal_security_unittest.py \
+            tests/unit/test_internal_auth.py \
+            tests/unit/test_jwt_contract.py \
+            tests/unit/test_cardtrader_client_resilience.py \
+            tests/unit/test_http_body_limit_route.py \
+            tests/unit/test_security_boundaries.py
+
+      - name: Run complete test suite with PostgreSQL
+        run: pytest -q -o addopts=''

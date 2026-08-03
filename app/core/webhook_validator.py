@@ -6,8 +6,22 @@ import base64
 import hashlib
 import hmac
 import logging
+import time
+
+from fastapi import HTTPException, Request, status
+
+from app.core.config import get_settings
+from app.core.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
+_RATE_LIMIT_SCRIPT = """
+local current = redis.call('INCR', KEYS[1])
+local ttl = redis.call('TTL', KEYS[1])
+if current == 1 or ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+end
+return current
+"""
 
 
 class WebhookValidationError(Exception):
@@ -40,11 +54,15 @@ def validate_webhook_signature(
     if not shared_secret:
         raise WebhookValidationError("Missing shared_secret")
     
+    if len(signature_header) > 128:
+        raise WebhookValidationError("Invalid signature format")
     try:
         # Decode base64 signature
-        expected_signature = base64.b64decode(signature_header)
-    except Exception as e:
-        raise WebhookValidationError(f"Invalid signature format: {e}") from e
+        expected_signature = base64.b64decode(signature_header, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise WebhookValidationError("Invalid signature format") from exc
+    if len(expected_signature) != hashlib.sha256().digest_size:
+        raise WebhookValidationError("Invalid signature format")
     
     # Compute HMAC-SHA256
     computed_signature = hmac.new(
@@ -79,3 +97,42 @@ def verify_webhook(
     """
     if not validate_webhook_signature(body, signature_header, shared_secret):
         raise WebhookValidationError("Invalid webhook signature")
+
+
+async def enforce_webhook_rate_limit(request: Request, user_id: str) -> None:
+    """Bound HMAC/DB work per peer and per requested owner.
+
+    The peer-wide bucket is intentionally consumed first. Without it, an attacker
+    could rotate arbitrary UUIDs and create an unbounded number of Redis keys while
+    bypassing the per-user quota.
+    """
+    redis = await get_redis()
+    if redis is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook protection unavailable",
+        )
+    peer = request.client.host if request.client else "unknown"
+    minute = int(time.time() // 60)
+    peer_key = f"webhook:rate:peer:{peer}:{minute}"
+    user_key = f"webhook:rate:user:{peer}:{user_id}:{minute}"
+    try:
+        peer_count = int(await redis.eval(_RATE_LIMIT_SCRIPT, 1, peer_key, 65))
+        if peer_count > get_settings().WEBHOOK_PEER_RATE_LIMIT_PER_MINUTE:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many webhook requests",
+            )
+        count = int(await redis.eval(_RATE_LIMIT_SCRIPT, 1, user_key, 65))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Webhook protection unavailable",
+        ) from exc
+    if count > get_settings().WEBHOOK_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many webhook requests",
+        )

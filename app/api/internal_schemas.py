@@ -12,7 +12,7 @@ class StrictInternalRequest(BaseModel):
 
 class ReservationItemRequest(StrictInternalRequest):
     item_id: int = Field(..., gt=0)
-    quantity: int = Field(..., gt=0)
+    quantity: int = Field(..., gt=0, le=2_147_483_647)
 
 
 class ReserveInventoryRequest(StrictInternalRequest):
@@ -38,12 +38,35 @@ class ReleaseInventoryRequest(StrictInternalRequest):
 
 
 class CreditInventoryItemRequest(StrictInternalRequest):
-    blueprint_id: int = Field(..., gt=0)
-    quantity: int = Field(..., gt=0)
-    price_cents: int = Field(..., ge=0)
+    blueprint_id: int = Field(..., gt=0, le=2_147_483_647)
+    quantity: int = Field(..., gt=0, le=2_147_483_647)
+    price_cents: int = Field(..., ge=0, le=2_147_483_647)
     properties: Dict[str, Any] | None = None
     description: str | None = Field(default=None, max_length=5000)
     graded: bool | None = None
+
+    @field_validator("properties")
+    @classmethod
+    def validate_properties(cls, value: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if value is None:
+            return None
+        if len(value) > 32:
+            raise ValueError("properties may contain at most 32 entries")
+        for key, item in value.items():
+            if (
+                not isinstance(key, str)
+                or not 1 <= len(key) <= 64
+                or not all(character.isalnum() or character in "_-" for character in key)
+            ):
+                raise ValueError("invalid property name")
+            if item is None or isinstance(item, bool):
+                continue
+            if isinstance(item, str) and len(item) <= 256:
+                continue
+            if isinstance(item, int) and -(2**31) <= item <= 2**31 - 1:
+                continue
+            raise ValueError("property values must be bounded scalar values")
+        return value
 
 
 class CreditInventoryRequest(StrictInternalRequest):

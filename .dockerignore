@@ -1,7 +1,14 @@
 .git
 .env
 .env.*
+.env*
 !.env.example
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,3 +16,11 @@ __pycache__/
 .ruff_cache/
 htmlcov/
 coverage.xml
+tests/
+static/
+*.md
+*.txt
+!requirements.txt
+docker-compose*.yml
+deploy/
+scripts/
