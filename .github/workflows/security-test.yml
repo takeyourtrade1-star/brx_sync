@@ -106,4 +106,8 @@ jobs:
             tests/unit/test_security_boundaries.py
 
       - name: Run complete test suite with PostgreSQL
+        env:
+          # The production default stays fail-closed. Integration tests explicitly
+          # enable writes so they can exercise the CardTrader mutation/recovery path.
+          CARDTRADER_WRITES_ENABLED: "true"
         run: pytest -q -o addopts=''
