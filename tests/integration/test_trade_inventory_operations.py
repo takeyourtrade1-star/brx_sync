@@ -48,6 +48,9 @@ class FakeCardTraderClient:
         self.fail_negative_for = set(fail_negative_for)
         self.fail_positive_after_apply_for = set(fail_positive_after_apply_for)
         self.calls: list[tuple[int, int]] = []
+        self.create_calls: list[dict[str, Any]] = []
+        self.product_payloads: dict[int, dict[str, Any]] = {}
+        self.next_product_id = max(products, default=0) + 1000
         self.export_calls = 0
 
     async def __aenter__(self) -> "FakeCardTraderClient":
@@ -56,18 +59,42 @@ class FakeCardTraderClient:
     async def __aexit__(self, *_args: Any) -> None:
         return None
 
-    async def get_products_export(self) -> list[dict[str, int]]:
+    async def get_products_export(self) -> list[dict[str, Any]]:
         self.export_calls += 1
         return [
             {
                 "id": product_id,
                 "game_id": 1,
-                "blueprint_id": product_id,
+                "blueprint_id": self.product_payloads.get(product_id, {}).get(
+                    "blueprint_id", product_id
+                ),
                 "quantity": quantity,
-                "price_cents": 1234,
+                "price_cents": int(
+                    float(self.product_payloads.get(product_id, {}).get("price", 12.34))
+                    * 100
+                ),
+                "user_data_field": self.product_payloads.get(product_id, {}).get(
+                    "user_data_field"
+                ),
             }
             for product_id, quantity in self.products.items()
         ]
+
+    async def create_product(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.create_calls.append(dict(payload))
+        product_id = self.next_product_id
+        self.next_product_id += 1
+        self.products[product_id] = int(payload["quantity"])
+        self.product_payloads[product_id] = dict(payload)
+        return {
+            "result": "ok",
+            "resource": {
+                "id": product_id,
+                "blueprint_id": int(payload["blueprint_id"]),
+                "quantity": int(payload["quantity"]),
+                "user_data_field": payload.get("user_data_field"),
+            },
+        }
 
     async def increment_product_quantity(
         self, product_id: int, delta_quantity: int
@@ -319,7 +346,7 @@ async def test_cardtrader_mid_batch_failure_stays_locked_and_recovers_forward(
 
 
 @pytest.mark.asyncio
-async def test_missing_product_release_stays_in_manual_review(
+async def test_deleted_product_is_recreated_when_release_restores_stock(
     test_session_factory,
 ):
     user_id = uuid.uuid4()
@@ -367,34 +394,27 @@ async def test_missing_product_release_stays_in_manual_review(
         user_id=user_id,
     )
     async with test_session_factory() as session:
-        with pytest.raises(InventoryOperationError) as pending_release:
-            await release_inventory(
-                session,
-                release_request,
-                client_factory=client_factory(fake),
-                decrypt_token=lambda value: value,
-            )
-    assert pending_release.value.code == "CARDTRADER_RELEASE_PENDING"
-
-    async with test_session_factory() as session:
-        recovery = await recover_stale_releases(
+        released = await release_inventory(
             session,
-            stale_minutes=0,
+            release_request,
             client_factory=client_factory(fake),
             decrypt_token=lambda value: value,
         )
-    assert recovery == {"scanned": 1, "recovered": 0, "pending": 0, "ambiguous": 1}
-    calls_after_release = list(fake.calls)
+    assert released["status"] == "succeeded"
+    assert len(fake.create_calls) == 1
+    recreated_id = next(iter(fake.products))
+    assert recreated_id != 303
+    assert fake.products[recreated_id] == 1
+
     async with test_session_factory() as session:
-        with pytest.raises(InventoryOperationError) as replay:
-            await release_inventory(
-                session,
-                release_request,
-                client_factory=client_factory(fake),
-                decrypt_token=lambda value: value,
-            )
-    assert replay.value.code == "OPERATION_IN_PROGRESS"
-    assert fake.calls == calls_after_release
+        replay = await release_inventory(
+            session,
+            release_request,
+            client_factory=client_factory(fake),
+            decrypt_token=lambda value: value,
+        )
+    assert replay["replayed"] is True
+    assert len(fake.create_calls) == 1
 
     async with test_session_factory() as session:
         rows = (
@@ -415,11 +435,25 @@ async def test_missing_product_release_stays_in_manual_review(
                 )
             )
         ).scalar_one()
-        assert [(row.source, row.quantity, row.reserved_quantity) for row in rows] == [
-            ("cardtrader", 0, 1),
+        assert [
+            (
+                row.source,
+                row.quantity,
+                row.reserved_quantity,
+                row.external_stock_id,
+                row.user_data_field,
+            )
+            for row in rows
+        ] == [
+            (
+                "cardtrader",
+                1,
+                0,
+                str(recreated_id),
+                f"ebartex_inventory:{user_id}:{item_id}",
+            ),
         ]
-        assert operation.status == "processing"
-        assert operation.result_json["phase"] == "release_manual_review_required"
+        assert operation.status == "succeeded"
 
 
 @pytest.mark.asyncio

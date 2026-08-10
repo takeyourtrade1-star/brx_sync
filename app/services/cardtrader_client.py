@@ -351,6 +351,39 @@ class CardTraderClient:
             "POST", "/products/bulk_update", json={"products": products}
         )
 
+    async def create_product(self, product: Dict[str, Any]) -> Dict[str, Any]:
+        """Create one product synchronously, with a bounded strict payload."""
+        if not isinstance(product, dict):
+            raise ValueError("Invalid CardTrader create payload")
+        allowed = {
+            "blueprint_id",
+            "price",
+            "quantity",
+            "description",
+            "error_mode",
+            "user_data_field",
+            "properties",
+            "graded",
+        }
+        if set(product) - allowed:
+            raise ValueError("Unsupported CardTrader create field")
+        blueprint_id = product.get("blueprint_id")
+        quantity = product.get("quantity")
+        price = product.get("price")
+        if (
+            not isinstance(blueprint_id, int)
+            or isinstance(blueprint_id, bool)
+            or blueprint_id <= 0
+            or not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or not 1 <= quantity <= 1_000_000
+            or not isinstance(price, (int, float))
+            or isinstance(price, bool)
+            or not 0 < float(price) <= 1_000_000
+        ):
+            raise ValueError("Invalid CardTrader create identity or stock")
+        return await self._make_request("POST", "/products", json=product)
+
     async def get_job_status(self, job_uuid: str) -> Dict[str, Any]:
         """
         Get status of an asynchronous job.

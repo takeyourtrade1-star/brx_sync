@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Mapping, Optional
 
 from app.core.cardtrader_properties import (
     filter_properties_for_cardtrader,
@@ -65,6 +65,42 @@ def build_product_update_payload(item: UserInventoryItem) -> Dict[str, Any]:
     if isinstance(language, str) and language.strip():
         properties["mtg_language"] = language.strip()[:2].lower()
 
+    if properties:
+        payload["properties"] = properties
+    return payload
+
+
+def build_product_create_payload(
+    snapshot: Mapping[str, Any],
+    *,
+    quantity: int,
+    user_data_field: Optional[str],
+) -> Dict[str, Any]:
+    """Recreate a product deleted by a full trade reservation."""
+    blueprint_id = int(snapshot["blueprint_id"])
+    price_cents = int(snapshot["price_cents"])
+    if blueprint_id <= 0 or price_cents <= 0 or quantity <= 0:
+        raise ValueError("Invalid CardTrader recreation payload")
+
+    source_properties = dict(snapshot.get("properties") or {})
+    normalised = validate_and_normalize_properties(source_properties, strict=True)
+    properties = filter_properties_for_cardtrader(
+        normalised,
+        include_read_only=False,
+    )
+    properties.pop("graded", None)
+
+    payload: Dict[str, Any] = {
+        "blueprint_id": blueprint_id,
+        "price": price_cents / 100.0,
+        "quantity": quantity,
+        "error_mode": "strict",
+        "graded": bool(snapshot.get("graded")),
+        "user_data_field": user_data_field,
+    }
+    description = snapshot.get("description")
+    if isinstance(description, str):
+        payload["description"] = description
     if properties:
         payload["properties"] = properties
     return payload

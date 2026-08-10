@@ -77,11 +77,13 @@ class DeployContractTest(unittest.TestCase):
         foundations = COMPOSE_FILE.index("20260714_trade_inventory_foundations.sql")
         visibility = COMPOSE_FILE.index("20260714_trade_inventory_visibility.sql")
         execution_policy = COMPOSE_FILE.index("20260716_cardtrader_execution_policy.sql")
+        outbound_create = COMPOSE_FILE.index("20260810_cardtrader_outbound_create.sql")
         schema_job = START_SCRIPT.index("brx-sync-schema-migrate")
         credential_rotation = START_SCRIPT.index("brx-sync-credential-rotation")
 
         self.assertLess(foundations, visibility)
         self.assertLess(visibility, execution_policy)
+        self.assertLess(execution_policy, outbound_create)
         self.assertLess(schema_job, credential_rotation)
         self.assertIn("run --rm --no-deps brx-sync-schema-migrate", START_SCRIPT)
         self.assertIn("run --rm --no-deps brx-sync-credential-rotation", START_SCRIPT)

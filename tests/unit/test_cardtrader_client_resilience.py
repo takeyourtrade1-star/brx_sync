@@ -83,6 +83,46 @@ def _client_with_response(response, *, telemetry_error=False):
 
 
 @pytest.mark.asyncio
+async def test_single_product_create_uses_strict_cardtrader_v2_endpoint():
+    client = object.__new__(CardTraderClient)
+    client._make_request = AsyncMock(
+        return_value={"result": "ok", "resource": {"id": 10}}
+    )
+    payload = {
+        "blueprint_id": 42,
+        "price": 2.0,
+        "quantity": 3,
+        "error_mode": "strict",
+        "user_data_field": "ebartex_listing:listing-1",
+        "properties": {"condition": "Near Mint", "mtg_language": "en"},
+        "graded": False,
+    }
+
+    result = await client.create_product(payload)
+
+    assert result["resource"]["id"] == 10
+    client._make_request.assert_awaited_once_with("POST", "/products", json=payload)
+
+
+@pytest.mark.asyncio
+async def test_single_product_create_rejects_unbounded_or_unknown_fields():
+    client = object.__new__(CardTraderClient)
+    client._make_request = AsyncMock()
+
+    with pytest.raises(ValueError, match="Unsupported"):
+        await client.create_product(
+            {
+                "blueprint_id": 42,
+                "price": 2.0,
+                "quantity": 1,
+                "admin": True,
+            }
+        )
+
+    client._make_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_successful_write_with_invalid_json_is_uncertain_and_not_retried():
     client = _client_with_response(_Response(202, invalid_json=True))
 

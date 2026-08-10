@@ -465,7 +465,7 @@ class CardTraderOutbox(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "operation_type IN ('update_product','delete_product')",
+            "operation_type IN ('create_product','update_product','delete_product')",
             name="ck_cardtrader_sync_outbox_operation",
         ),
         CheckConstraint(

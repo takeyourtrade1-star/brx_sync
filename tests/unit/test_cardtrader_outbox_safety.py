@@ -106,6 +106,48 @@ def test_post_job_verification_accepts_only_matching_product_or_zero_absence():
     )
 
 
+def test_create_verification_requires_exact_marker_identity_and_stock():
+    payload = {
+        "blueprint_id": 42,
+        "quantity": 3,
+        "price": 2.0,
+        "description": "Native Ebartex listing",
+        "user_data_field": "ebartex_listing:listing-1",
+        "graded": False,
+        "properties": {
+            "condition": "Near Mint",
+            "mtg_language": "en",
+        },
+    }
+    product = {
+        "id": 999,
+        "blueprint_id": 42,
+        "quantity": 3,
+        "price": {"cents": 200, "currency": "EUR"},
+        "description": "Native Ebartex listing",
+        "user_data_field": "ebartex_listing:listing-1",
+        "graded": False,
+        "properties": {
+            "condition": "Near Mint",
+            "mtg_language": "en",
+            "signed": False,
+        },
+    }
+
+    assert _mutation_matches_product("create_product", payload, product)
+    assert not _mutation_matches_product(
+        "create_product",
+        payload,
+        {**product, "user_data_field": "another-listing"},
+    )
+    assert not _mutation_matches_product(
+        "create_product",
+        payload,
+        {**product, "blueprint_id": 43},
+    )
+    assert not _mutation_matches_product("create_product", payload, None)
+
+
 def test_increment_quantity_accepts_omitted_identity_but_validates_it_when_present():
     assert (
         _authoritative_remote_quantity(

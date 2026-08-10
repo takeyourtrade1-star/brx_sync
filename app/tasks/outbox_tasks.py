@@ -94,6 +94,8 @@ def _export_price_cents(product: Dict[str, Any]) -> Optional[int]:
 
 
 def _payload_matches_product(payload: Dict[str, Any], product: Dict[str, Any]) -> bool:
+    if "blueprint_id" in payload and product.get("blueprint_id") != payload["blueprint_id"]:
+        return False
     if "quantity" in payload and product.get("quantity") != payload["quantity"]:
         return False
     if "price" in payload:
@@ -120,6 +122,8 @@ def _mutation_matches_product(
 ) -> bool:
     if operation_type == "delete_product":
         return product is None
+    if operation_type == "create_product":
+        return product is not None and _payload_matches_product(payload, product)
     if product is None:
         return payload.get("quantity") == 0
     return _payload_matches_product(payload, product)
@@ -211,7 +215,7 @@ async def _update_command_state(
                     if command.operation_type == "delete_product":
                         item.lifecycle_status = "sync_failed"
 
-        await _apply_marketplace_result(session, command, status)
+        await _apply_marketplace_result(session, command, status, result=result)
 
 
 async def _apply_marketplace_result(
@@ -220,6 +224,7 @@ async def _apply_marketplace_result(
     status: str,
     *,
     restore_local: bool = True,
+    result: Optional[Dict[str, Any]] = None,
 ) -> None:
     context = command.context_json or {}
     context_type = context.get("type")
@@ -247,7 +252,160 @@ async def _apply_marketplace_result(
         ).one_or_none()
         return bool(row and row.sync_state == "synced" and row.sync_uncertain_event_id is None)
 
-    if context_type == "marketplace_purchase":
+    if context_type == "marketplace_listing_create":
+        listing_id = context.get("listing_id")
+        product = (result or {}).get("product")
+        if status == "verified" and isinstance(product, dict):
+            try:
+                product_id = int(product["id"])
+                blueprint_id = int(product["blueprint_id"])
+                quantity = int(product["quantity"])
+                price_cents = _export_price_cents(product)
+            except (KeyError, TypeError, ValueError):
+                await quarantine_listing(listing_id)
+                return
+            if product_id <= 0 or blueprint_id <= 0 or quantity < 0 or price_cents is None:
+                await quarantine_listing(listing_id)
+                return
+
+            item = (
+                await session.execute(
+                    select(UserInventoryItem).where(
+                        UserInventoryItem.user_id == command.user_id,
+                        UserInventoryItem.environment == "real",
+                        UserInventoryItem.blueprint_id == blueprint_id,
+                        UserInventoryItem.external_stock_id == str(product_id),
+                    )
+                )
+            ).scalar_one_or_none()
+            properties = product.get("properties_hash") or product.get("properties")
+            if not isinstance(properties, dict):
+                properties = dict(command.payload_json.get("properties") or {})
+            if item is None:
+                item = UserInventoryItem(
+                    user_id=command.user_id,
+                    blueprint_id=blueprint_id,
+                    game_id=1,
+                    quantity=quantity,
+                    reserved_quantity=0,
+                    price_cents=price_cents,
+                    properties=properties,
+                    external_stock_id=str(product_id),
+                    source="cardtrader",
+                    environment="real",
+                    lifecycle_status="active" if quantity > 0 else "sold_out",
+                    sync_state="synced",
+                    description=product.get("description")
+                    if isinstance(product.get("description"), str)
+                    else command.payload_json.get("description"),
+                    user_data_field=product.get("user_data_field")
+                    if isinstance(product.get("user_data_field"), str)
+                    else command.payload_json.get("user_data_field"),
+                    graded=bool(product.get("graded", command.payload_json.get("graded", False))),
+                    last_external_update_at=datetime.now(timezone.utc),
+                )
+                session.add(item)
+                await session.flush()
+            else:
+                item.quantity = quantity
+                item.price_cents = price_cents
+                item.properties = properties
+                item.lifecycle_status = "active" if quantity > 0 else "sold_out"
+                item.sync_state = "synced"
+                item.last_external_update_at = datetime.now(timezone.utc)
+
+            command.target_product_id = str(product_id)
+            command.inventory_item_id = item.id
+            command.expected_row_version = item.row_version
+            await session.execute(
+                text("""
+                    UPDATE mkt_listings
+                    SET cardtrader_article_id = :product_id,
+                        cardtrader_synced_at = NOW(),
+                        status = CASE WHEN :quantity > 0 THEN 'active' ELSE 'sold' END,
+                        updated_at = NOW()
+                    WHERE id = CAST(:listing_id AS uuid)
+                      AND user_id = CAST(:user_id AS uuid)
+                      AND cardtrader_article_id IS NULL
+                """),
+                {
+                    "listing_id": listing_id,
+                    "user_id": str(command.user_id),
+                    "product_id": product_id,
+                    "quantity": quantity,
+                },
+            )
+        elif status in {"failed", "cancelled"}:
+            await session.execute(
+                text("""
+                    UPDATE mkt_listings
+                    SET status = 'sync_failed', updated_at = NOW()
+                    WHERE id = CAST(:listing_id AS uuid)
+                      AND cardtrader_article_id IS NULL
+                """),
+                {"listing_id": listing_id},
+            )
+        elif status == "uncertain":
+            await quarantine_listing(listing_id)
+    elif context_type == "marketplace_listing_update":
+        listing_id = context.get("listing_id")
+        if status == "verified":
+            await session.execute(
+                text("""
+                    UPDATE mkt_listings
+                    SET status = CASE WHEN quantity > 0 THEN 'active' ELSE 'sold' END,
+                        cardtrader_synced_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = CAST(:listing_id AS uuid)
+                """),
+                {"listing_id": listing_id},
+            )
+        elif status in {"failed", "cancelled"} and restore_local:
+            old_inventory = context.get("old_inventory") or {}
+            old_listing = context.get("old_listing") or {}
+            item = await session.get(UserInventoryItem, command.inventory_item_id)
+            if (
+                item is None
+                or command.expected_row_version is None
+                or item.row_version != command.expected_row_version
+                or item.sync_uncertain_event_id is not None
+            ):
+                await quarantine_listing(listing_id)
+                return
+            item.quantity = int(old_inventory["quantity"])
+            item.price_cents = int(old_inventory["price_cents"])
+            item.properties = dict(old_inventory.get("properties") or {})
+            item.description = old_inventory.get("description")
+            item.user_data_field = old_inventory.get("user_data_field")
+            item.graded = old_inventory.get("graded")
+            item.lifecycle_status = "active" if item.quantity > 0 else "sold_out"
+            item.sync_state = "synced"
+            item.row_version += 1
+            await session.execute(
+                text("""
+                    UPDATE mkt_listings
+                    SET title = :title,
+                        price = :price,
+                        quantity = :quantity,
+                        condition = :condition,
+                        language = :language,
+                        status = :status,
+                        updated_at = NOW()
+                    WHERE id = CAST(:listing_id AS uuid)
+                """),
+                {
+                    "listing_id": listing_id,
+                    "title": old_listing["title"],
+                    "price": old_listing["price"],
+                    "quantity": int(old_listing["quantity"]),
+                    "condition": old_listing["condition"],
+                    "language": old_listing["language"],
+                    "status": old_listing["status"],
+                },
+            )
+        else:
+            await quarantine_listing(listing_id)
+    elif context_type == "marketplace_purchase":
         order_id = context.get("order_id")
         listing_id = context.get("listing_id")
         quantity = int(context.get("quantity") or 0)
@@ -418,6 +576,23 @@ async def resolve_uncertain_command_from_export(
         )
         next_status = "verified" if verified else "failed"
         now = datetime.now(timezone.utc)
+        if command.operation_type == "create_product":
+            command.status = next_status
+            command.last_error = (
+                None
+                if verified
+                else "Validated Magic export does not contain the requested listing marker"
+            )
+            command.completed_at = now
+            await _apply_marketplace_result(
+                session,
+                command,
+                next_status,
+                restore_local=False,
+                result={"product": product} if verified and product is not None else None,
+            )
+            return next_status
+
         values: Dict[str, Any] = {
             "sync_state": "synced",
             "row_version": UserInventoryItem.row_version + 1,
@@ -556,6 +731,32 @@ async def _revalidate_claim_before_remote_write(command_id: uuid.UUID) -> bool:
                 restore_local=True,
             )
             return False
+
+        if command.operation_type == "create_product":
+            listing_id = (command.context_json or {}).get("listing_id")
+            listing_ready = (
+                await session.execute(
+                    text("""
+                        SELECT 1
+                        FROM mkt_listings
+                        WHERE id = CAST(:listing_id AS uuid)
+                          AND user_id = CAST(:user_id AS uuid)
+                          AND status = 'pending_sync'
+                          AND cardtrader_article_id IS NULL
+                        FOR UPDATE
+                    """),
+                    {"listing_id": listing_id, "user_id": str(command.user_id)},
+                )
+            ).scalar_one_or_none()
+            if listing_ready is None:
+                await _cancel_locked_command(
+                    session,
+                    command,
+                    "Marketplace listing changed before CardTrader publication",
+                    restore_local=False,
+                )
+                return False
+            return True
 
         item = (
             await session.execute(
@@ -762,6 +963,31 @@ async def _process_command(command_id: uuid.UUID) -> Dict[str, Any]:
                         "job_uuid": job_uuid,
                         "job": job_result,
                     }
+                elif claimed["operation_type"] == "create_product":
+                    if not await _revalidate_claim_before_remote_write(command_id):
+                        return {
+                            "status": "cancelled",
+                            "command_id": str(command_id),
+                        }
+                    lease.refresh()
+                    remote_started = True
+                    response = await client.create_product(claimed["payload"])
+                    lease.refresh()
+                    product = response.get("resource") if isinstance(response, dict) else None
+                    if not isinstance(product, dict) or not _mutation_matches_product(
+                        "create_product",
+                        claimed["payload"],
+                        product,
+                    ):
+                        raise CardTraderAPIError(
+                            "CardTrader create response does not match requested product",
+                            outcome_unknown=True,
+                        )
+                    result = {
+                        "status": "verified",
+                        "command_id": str(command_id),
+                        "product": product,
+                    }
                 elif claimed["operation_type"] == "delete_product":
                     if not await _revalidate_claim_before_remote_write(command_id):
                         return {
@@ -959,9 +1185,21 @@ async def _recover_mature_uncertain(limit: int) -> Dict[str, int]:
                 products_by_id = {str(product["id"]): product for product in normalized}
                 for command in user_commands:
                     lease.refresh()
+                    product = products_by_id.get(str(command.target_product_id))
+                    if command.operation_type == "create_product":
+                        marker = command.payload_json.get("user_data_field")
+                        matches = [
+                            candidate
+                            for candidate in normalized
+                            if candidate.get("user_data_field") == marker
+                        ]
+                        if len(matches) > 1:
+                            deferred += 1
+                            continue
+                        product = matches[0] if matches else None
                     resolution = await resolve_uncertain_command_from_export(
                         command.id,
-                        products_by_id.get(str(command.target_product_id)),
+                        product,
                     )
                     if resolution in {"verified", "failed"}:
                         recovered += 1

@@ -43,6 +43,9 @@ class FakeCardTraderClient:
     ) -> None:
         self.products = products
         self.fail_negative_for = set(fail_negative_for)
+        self.product_payloads: dict[int, dict[str, Any]] = {}
+        self.create_calls: list[dict[str, Any]] = []
+        self.next_product_id = max(products, default=0) + 1000
 
     async def __aenter__(self) -> "FakeCardTraderClient":
         return self
@@ -50,17 +53,41 @@ class FakeCardTraderClient:
     async def __aexit__(self, *_args: Any) -> None:
         return None
 
-    async def get_products_export(self) -> list[dict[str, int]]:
+    async def get_products_export(self) -> list[dict[str, Any]]:
         return [
             {
                 "id": product_id,
                 "game_id": 1,
-                "blueprint_id": product_id,
+                "blueprint_id": self.product_payloads.get(product_id, {}).get(
+                    "blueprint_id", product_id
+                ),
                 "quantity": quantity,
-                "price_cents": 1234,
+                "price_cents": int(
+                    float(self.product_payloads.get(product_id, {}).get("price", 12.34))
+                    * 100
+                ),
+                "user_data_field": self.product_payloads.get(product_id, {}).get(
+                    "user_data_field"
+                ),
             }
             for product_id, quantity in self.products.items()
         ]
+
+    async def create_product(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.create_calls.append(dict(payload))
+        product_id = self.next_product_id
+        self.next_product_id += 1
+        self.products[product_id] = int(payload["quantity"])
+        self.product_payloads[product_id] = dict(payload)
+        return {
+            "result": "ok",
+            "resource": {
+                "id": product_id,
+                "blueprint_id": int(payload["blueprint_id"]),
+                "quantity": int(payload["quantity"]),
+                "user_data_field": payload.get("user_data_field"),
+            },
+        }
 
     async def increment_product_quantity(
         self,
@@ -169,7 +196,7 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["recovered"], 1)
         self.assertEqual(fake.products, {})
 
-    async def test_missing_product_release_stays_in_manual_review(self) -> None:
+    async def test_deleted_product_is_recreated_when_release_restores_stock(self) -> None:
         user_id, item_id = await self._seed("701")
         fake = FakeCardTraderClient({701: 1})
         reserve_request = ReserveInventoryRequest(
@@ -192,24 +219,17 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
             user_id=user_id,
         )
         async with self.sessions() as session:
-            with self.assertRaises(InventoryOperationError) as pending:
-                await release_inventory(
-                    session,
-                    release_request,
-                    client_factory=_client_factory(fake),
-                    decrypt_token=lambda value: value,
-                )
-        self.assertEqual(pending.exception.code, "CARDTRADER_RELEASE_PENDING")
-
-        async with self.sessions() as session:
-            result = await recover_stale_releases(
+            result = await release_inventory(
                 session,
-                stale_minutes=0,
+                release_request,
                 client_factory=_client_factory(fake),
                 decrypt_token=lambda value: value,
             )
-        self.assertEqual(result["recovered"], 0)
-        self.assertEqual(result["ambiguous"], 1)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(len(fake.create_calls), 1)
+        recreated_id = next(iter(fake.products))
+        self.assertNotEqual(recreated_id, 701)
+        self.assertEqual(fake.products[recreated_id], 1)
 
         async with self.sessions() as session:
             rows = (
@@ -231,11 +251,24 @@ class InventoryRecoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             ).scalar_one()
         self.assertEqual(
-            [(row.source, row.quantity, row.reserved_quantity) for row in rows],
-            [("cardtrader", 0, 1)],
+            [
+                (
+                    row.source,
+                    row.quantity,
+                    row.reserved_quantity,
+                    row.external_stock_id,
+                    row.user_data_field,
+                )
+                for row in rows
+            ],
+            [
+                (
+                    "cardtrader",
+                    1,
+                    0,
+                    str(recreated_id),
+                    f"ebartex_inventory:{user_id}:{item_id}",
+                )
+            ],
         )
-        self.assertEqual(operation.status, "processing")
-        self.assertEqual(
-            operation.result_json["phase"],
-            "release_manual_review_required",
-        )
+        self.assertEqual(operation.status, "succeeded")
