@@ -313,7 +313,7 @@ log_header "HEALTH CHECK"
 log_step "Attendo readiness verificata..."
 ready="false"
 for i in $(seq 1 20); do
-  if curl -sf --max-time 5 http://localhost:8002/health/ready >/dev/null 2>&1; then
+  if curl -sf --max-time 5 "http://${SERVICE_BIND_IP}:8002/health/ready" >/dev/null 2>&1; then
     ready="true"
     break
   fi
@@ -333,8 +333,8 @@ echo ""
 echo -e "${GREEN}Il servizio brx-sync e' attivo!${NC}"
 echo ""
 echo "  API:         ${PUBLIC_BASE_URL}"
-echo "  Health live: http://localhost:8002/health/live"
-echo "  Health full: http://localhost:8002/health"
+echo "  Health live: http://${SERVICE_BIND_IP}:8002/health/live"
+echo "  Health full: http://${SERVICE_BIND_IP}:8002/health"
 echo "  Docs:        disabilitate in produzione"
 echo ""
 echo "  Segreti:     AWS SSM Parameter Store (solo in memoria, mai su disco)"
