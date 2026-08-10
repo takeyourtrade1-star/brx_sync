@@ -185,6 +185,7 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn("validate_service_bind_ip", START_SCRIPT)
         self.assertIn("SERVICE_BIND_IP is not assigned to this host", START_SCRIPT)
         self.assertIn('"http://${SERVICE_BIND_IP}:8002/health/ready"', START_SCRIPT)
+        self.assertIn('-H "Host: sync.ebartex.com"', START_SCRIPT)
         self.assertEqual(COMPOSE_FILE.count("- ALLOWED_ORIGINS"), 2)
         self.assertEqual(COMPOSE_FILE.count("read_only: true"), 5)
         self.assertEqual(COMPOSE_FILE.count("no-new-privileges:true"), 5)
