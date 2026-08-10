@@ -9,7 +9,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --no-server-header --no-proxy-headers --limit-concurrency 128 --limit-max-requests 10000 --timeout-keep-alive 5 --timeout-graceful-shutdown 30
     stop_grace_period: 30s
     ports:
-      - "127.0.0.1:8002:8000"
+      - "${SERVICE_BIND_IP:?required private service bind IP}:8002:8000"
     read_only: true
     mem_limit: 1g
     cpus: 1.0
