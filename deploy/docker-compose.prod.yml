@@ -238,6 +238,7 @@ services:
   brx-sync-redis:
     image: ${REDIS_IMAGE:?set immutable REDIS_IMAGE with @sha256 digest}
     container_name: brx-sync-redis
+    user: "999:1000"
     restart: unless-stopped
     stop_grace_period: 30s
     read_only: true
