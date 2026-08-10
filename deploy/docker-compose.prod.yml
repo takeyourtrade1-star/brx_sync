@@ -164,6 +164,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_foundations.sql
         psql -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_visibility.sql
         psql -v ON_ERROR_STOP=1 -f migrations/20260716_cardtrader_execution_policy.sql
+        psql -v ON_ERROR_STOP=1 -f migrations/20260810_cardtrader_outbound_create.sql
     read_only: true
     mem_limit: 256m
     cpus: 0.5

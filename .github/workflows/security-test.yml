@@ -1,6 +1,7 @@
 name: Security gate
 # Required repository variables (reviewed immutable refs):
-# PYTHON_BASE_IMAGE and POSTGRES_TEST_IMAGE, both ending in @sha256:<64 hex>.
+# PYTHON_BASE_IMAGE, POSTGRES_TEST_IMAGE and REDIS_TEST_IMAGE, all ending in
+# @sha256:<64 hex>.
 
 permissions:
   contents: read
@@ -33,10 +34,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: ${{ vars.REDIS_TEST_IMAGE }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     env:
       PYTHON_BASE_IMAGE: ${{ vars.PYTHON_BASE_IMAGE }}
       POSTGRES_TEST_IMAGE: ${{ vars.POSTGRES_TEST_IMAGE }}
+      REDIS_TEST_IMAGE: ${{ vars.REDIS_TEST_IMAGE }}
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/brx_sync_test
       TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/brx_sync_test
       MYSQL_HOST: localhost
@@ -69,6 +80,7 @@ jobs:
         run: |
           [[ "$PYTHON_BASE_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
           [[ "$POSTGRES_TEST_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
+          [[ "$REDIS_TEST_IMAGE" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]
 
       - name: Build reviewed Python 3.12 image
         run: |
@@ -106,4 +118,8 @@ jobs:
             tests/unit/test_security_boundaries.py
 
       - name: Run complete test suite with PostgreSQL
+        env:
+          # The production default stays fail-closed. Integration tests explicitly
+          # enable writes so they can exercise the CardTrader mutation/recovery path.
+          CARDTRADER_WRITES_ENABLED: "true"
         run: pytest -q -o addopts=''

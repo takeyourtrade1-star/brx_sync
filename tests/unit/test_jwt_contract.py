@@ -1,5 +1,6 @@
 """JWT consumer contract shared with the Auth service."""
 
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from uuid import uuid4
@@ -46,6 +47,16 @@ def _token(**overrides) -> str:
         "jti": str(uuid4()),
     }
     payload.update(overrides)
+    if "iss" in payload and not isinstance(payload["iss"], str):
+        unchecked_payload = payload.copy()
+        for claim in ("iat", "exp", "nbf"):
+            if isinstance(unchecked_payload.get(claim), datetime):
+                unchecked_payload[claim] = int(unchecked_payload[claim].timestamp())
+        return jwt.api_jws.PyJWS().encode(
+            json.dumps(unchecked_payload, separators=(",", ":")).encode("utf-8"),
+            _PRIVATE_KEY,
+            algorithm="RS256",
+        )
     return jwt.encode(payload, _PRIVATE_KEY, algorithm="RS256")
 
 

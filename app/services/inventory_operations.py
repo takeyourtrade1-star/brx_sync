@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,7 @@ from app.models.inventory import (
 )
 from app.services.cardtrader_client import CardTraderAPIError, CardTraderClient
 from app.services.cardtrader_mutation_lease import cardtrader_mutation_lease
+from app.services.cardtrader_payloads import build_product_create_payload
 from app.services.sync_policy import (
     CardTraderWriteBlockedError,
     SyncPolicySnapshot,
@@ -126,6 +127,28 @@ async def _increment_cardtrader_for_trade(
         lease.refresh()
         return await asyncio.wait_for(
             client.increment_product_quantity(product_id, delta_quantity),
+            timeout=settings.TRADE_CARDTRADER_MUTATION_TIMEOUT_SECONDS,
+        )
+
+
+async def _create_cardtrader_for_trade(
+    session: AsyncSession,
+    user_id: UUID,
+    client: Any,
+    payload: Dict[str, Any],
+    *,
+    expected_mode_version: int,
+) -> Dict[str, Any]:
+    await _assert_trade_write_allowed(
+        session,
+        user_id,
+        expected_mode_version=expected_mode_version,
+    )
+    await session.rollback()
+    async with cardtrader_mutation_lease(user_id) as lease:
+        lease.refresh()
+        return await asyncio.wait_for(
+            client.create_product(payload),
             timeout=settings.TRADE_CARDTRADER_MUTATION_TIMEOUT_SECONDS,
         )
 
@@ -299,6 +322,7 @@ def _snapshot_from_row(row: Any, requested_quantity: int) -> Dict[str, Any]:
         "price_cents": int(row.price_cents),
         "properties": row.properties,
         "description": row.description,
+        "user_data_field": row.user_data_field,
         "graded": row.graded,
         "source": row.source,
         "external_stock_id": row.external_stock_id,
@@ -566,6 +590,7 @@ async def reserve_inventory(
                         UserInventoryItem.price_cents,
                         UserInventoryItem.properties,
                         UserInventoryItem.description,
+                        UserInventoryItem.user_data_field,
                         UserInventoryItem.graded,
                         UserInventoryItem.source,
                         UserInventoryItem.external_stock_id,
@@ -858,7 +883,6 @@ async def recover_stale_reservations(
                 availability = {
                     str(product["id"]): int(product.get("quantity", 0)) for product in normalized
                 }
-
             for op_key, snapshots in user_operations:
                 try:
                     for item in snapshots:
@@ -1039,9 +1063,24 @@ async def _apply_released_cardtrader_item(
     staged: List[Dict[str, Any]],
     item: Dict[str, Any],
     remote_quantity: int,
+    external_stock_id: Optional[str] = None,
 ) -> None:
     """Apply local release and operation progress in the same transaction."""
     async with session.begin():
+        old_external_stock_id = str(item["external_stock_id"])
+        values: Dict[str, Any] = {
+            "quantity": remote_quantity,
+            "reserved_quantity": (
+                UserInventoryItem.reserved_quantity - int(item["quantity"])
+            ),
+            "lifecycle_status": "active",
+            "sync_state": "synced",
+            "row_version": UserInventoryItem.row_version + 1,
+            "updated_at": func.now(),
+        }
+        if external_stock_id is not None:
+            values["external_stock_id"] = external_stock_id
+            values["user_data_field"] = item.get("restore_user_data_field")
         updated = await session.execute(
             update(UserInventoryItem)
             .where(
@@ -1054,14 +1093,7 @@ async def _apply_released_cardtrader_item(
                 UserInventoryItem.sync_uncertain_event_id.is_(None),
                 UserInventoryItem.reserved_quantity >= int(item["quantity"]),
             )
-            .values(
-                quantity=remote_quantity,
-                reserved_quantity=(UserInventoryItem.reserved_quantity - int(item["quantity"])),
-                lifecycle_status="active",
-                sync_state="synced",
-                row_version=UserInventoryItem.row_version + 1,
-                updated_at=func.now(),
-            )
+            .values(**values)
             .returning(UserInventoryItem.id, UserInventoryItem.row_version)
         )
         updated_row = updated.one_or_none()
@@ -1071,6 +1103,28 @@ async def _apply_released_cardtrader_item(
             )
         item["target_item_id"] = int(updated_row.id)
         item["row_version"] = int(updated_row.row_version)
+        if external_stock_id is not None:
+            item["external_stock_id"] = external_stock_id
+            item["restored_external_stock_id"] = external_stock_id
+            listing_table_exists = await session.scalar(
+                text("SELECT to_regclass('mkt_listings') IS NOT NULL")
+            )
+            if listing_table_exists:
+                await session.execute(
+                    text("""
+                        UPDATE mkt_listings
+                        SET cardtrader_article_id = CAST(:new_product_id AS integer),
+                            cardtrader_synced_at = NOW(),
+                            updated_at = NOW()
+                        WHERE user_id = CAST(:user_id AS uuid)
+                          AND cardtrader_article_id = CAST(:old_product_id AS integer)
+                    """),
+                    {
+                        "user_id": str(user_id),
+                        "old_product_id": old_external_stock_id,
+                        "new_product_id": external_stock_id,
+                    },
+                )
         item["outcome"] = "returned_to_owner"
         item["cardtrader_restored"] = True
         item["cardtrader_state"] = "applied"
@@ -1178,6 +1232,7 @@ async def recover_stale_releases(
             for item in staged
         )
         availability: Dict[str, int] = {}
+        products_by_marker: Dict[str, List[Dict[str, Any]]] = {}
         client_context: Any = None
         client: Any = None
         try:
@@ -1200,6 +1255,10 @@ async def recover_stale_releases(
                 availability = {
                     str(product["id"]): int(product.get("quantity", 0)) for product in normalized
                 }
+                for product in normalized:
+                    marker = product.get("user_data_field")
+                    if isinstance(marker, str) and marker:
+                        products_by_marker.setdefault(marker, []).append(product)
 
             for op_key, staged in user_operations:
                 try:
@@ -1209,19 +1268,37 @@ async def recover_stale_releases(
                         if item.get("cardtrader_state") == "applied":
                             continue
                         external_id = str(item["external_stock_id"])
-                        current = availability.get(external_id, 0)
                         quantity_before = int(item["quantity_before"])
                         quantity_after = int(item["quantity_after"])
+                        restored_external_stock_id: Optional[str] = None
 
-                        if current == quantity_before:
-                            # Exact authoritative target proves the unknown
-                            # increment is already reflected. Never resend.
+                        if item.get("recreate_product"):
+                            marker = str(item.get("restore_user_data_field") or "")
+                            matches = products_by_marker.get(marker, [])
+                            if len(matches) != 1:
+                                raise _ReservationRecoveryAmbiguous(
+                                    f"release item={item['item_id']} recreate marker count={len(matches)}"
+                                )
+                            recreated = matches[0]
+                            current = int(recreated.get("quantity") or 0)
+                            if current != quantity_before:
+                                raise _ReservationRecoveryAmbiguous(
+                                    f"release item={item['item_id']} recreated={current} "
+                                    f"before={quantity_before}"
+                                )
                             remote_quantity = current
+                            restored_external_stock_id = str(recreated["id"])
                         else:
-                            raise _ReservationRecoveryAmbiguous(
-                                f"release item={item['item_id']} current={current} "
-                                f"before={quantity_before} after={quantity_after}"
-                            )
+                            current = availability.get(external_id, 0)
+                            if current == quantity_before:
+                                # Exact authoritative target proves the unknown
+                                # increment is already reflected. Never resend.
+                                remote_quantity = current
+                            else:
+                                raise _ReservationRecoveryAmbiguous(
+                                    f"release item={item['item_id']} current={current} "
+                                    f"before={quantity_before} after={quantity_after}"
+                                )
 
                         await _apply_released_cardtrader_item(
                             session,
@@ -1230,6 +1307,7 @@ async def recover_stale_releases(
                             staged=staged,
                             item=item,
                             remote_quantity=remote_quantity,
+                            external_stock_id=restored_external_stock_id,
                         )
 
                     if await _complete_recovered_release(
@@ -1434,6 +1512,15 @@ async def release_inventory(
             client_context = client_factory(token, str(request.user_id))
             client = await client_context.__aenter__()
             for item in ct_items:
+                if int(item["quantity_after"]) == 0:
+                    # A reservation that removes the whole remote quantity makes
+                    # CardTrader delete the product.  Use our own stable, unique
+                    # marker for the compensating create so recovery can prove
+                    # whether the write happened even if the response is lost.
+                    item["restore_user_data_field"] = (
+                        f"ebartex_inventory:{request.user_id}:{item['item_id']}"
+                    )
+                    item["recreate_product"] = True
                 item["cardtrader_state"] = "applying"
                 await _persist_release_progress(
                     session,
@@ -1442,18 +1529,69 @@ async def release_inventory(
                     staged=staged,
                     phase="cardtrader_release_applying",
                 )
-                increment_result = await _increment_cardtrader_for_trade(
-                    session,
-                    request.user_id,
-                    client,
-                    int(item["external_stock_id"]),
-                    int(item["quantity"]),
-                    expected_mode_version=policy.mode_version,
-                )
-                remote_quantity = _authoritative_remote_quantity(
-                    increment_result,
-                    expected_product_id=int(item["external_stock_id"]),
-                )
+                restored_external_stock_id: Optional[str] = None
+                if item.get("recreate_product"):
+                    create_payload = build_product_create_payload(
+                        item,
+                        quantity=int(item["quantity_before"]),
+                        user_data_field=str(item["restore_user_data_field"]),
+                    )
+                    create_result = await _create_cardtrader_for_trade(
+                        session,
+                        request.user_id,
+                        client,
+                        create_payload,
+                        expected_mode_version=policy.mode_version,
+                    )
+                    resource = (
+                        create_result.get("resource")
+                        if isinstance(create_result, dict)
+                        else None
+                    )
+                    if not isinstance(resource, dict):
+                        raise CardTraderAPIError(
+                            "CardTrader recreate response has no product resource",
+                            outcome_unknown=True,
+                        )
+                    try:
+                        new_product_id = int(resource["id"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise CardTraderAPIError(
+                            "CardTrader recreate response has no product id",
+                            outcome_unknown=True,
+                        ) from exc
+                    if (
+                        int(resource.get("blueprint_id") or 0) != int(item["blueprint_id"])
+                        or resource.get("user_data_field")
+                        != item["restore_user_data_field"]
+                    ):
+                        raise CardTraderAPIError(
+                            "CardTrader recreated a different product",
+                            outcome_unknown=True,
+                        )
+                    remote_quantity = _authoritative_remote_quantity(
+                        create_result,
+                        expected_product_id=new_product_id,
+                    )
+                    if remote_quantity != int(item["quantity_before"]):
+                        raise CardTraderAPIError(
+                            "CardTrader recreate quantity does not match the reservation",
+                            outcome_unknown=True,
+                        )
+                    restored_external_stock_id = str(new_product_id)
+                else:
+                    increment_result = await _increment_cardtrader_for_trade(
+                        session,
+                        request.user_id,
+                        client,
+                        int(item["external_stock_id"]),
+                        int(item["quantity"]),
+                        expected_mode_version=policy.mode_version,
+                    )
+                    remote_quantity = _authoritative_remote_quantity(
+                        increment_result,
+                        expected_product_id=int(item["external_stock_id"]),
+                    )
                 await _apply_released_cardtrader_item(
                     session,
                     op_key=request.op_key,
@@ -1461,6 +1599,7 @@ async def release_inventory(
                     staged=staged,
                     item=item,
                     remote_quantity=remote_quantity,
+                    external_stock_id=restored_external_stock_id,
                 )
     except Exception as external_error:
         await _persist_release_progress(
