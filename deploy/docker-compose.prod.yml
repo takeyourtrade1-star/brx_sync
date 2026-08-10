@@ -23,7 +23,7 @@ services:
     environment:
       - SERVICE_ROLE=api
       - DATABASE_URL
-      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/aws-rds-global-bundle.pem
       # 2 uvicorn workers x (3 pool + 2 overflow) = 10 connessioni massime.
       - DB_POOL_SIZE=3
       - DB_MAX_OVERFLOW=2
@@ -103,7 +103,7 @@ services:
     environment:
       - SERVICE_ROLE=worker
       - DATABASE_URL
-      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/aws-rds-global-bundle.pem
       # Celery ha quattro processi: pool piccolo per processo, con backpressure.
       - DB_POOL_SIZE=2
       - DB_MAX_OVERFLOW=1
@@ -186,9 +186,11 @@ services:
       - PGUSER=${SYNC_MIGRATION_DB_USER:?required dedicated migration DB user}
       - PGPASSWORD=${SYNC_MIGRATION_DB_PASSWORD:?required migration DB password}
       - PGSSLMODE=verify-full
-      - PGSSLROOTCERT=/etc/ssl/certs/ca-certificates.crt
+      - PGSSLROOTCERT=/etc/ssl/certs/aws-rds-global-bundle.pem
       - PGCONNECT_TIMEOUT=5
       - PGOPTIONS=-c statement_timeout=120000 -c lock_timeout=5000
+    volumes:
+      - ./certs/aws-rds-global-bundle.pem:/etc/ssl/certs/aws-rds-global-bundle.pem:ro
     networks:
       - brx-sync-maintenance-net
     healthcheck:
@@ -218,9 +220,11 @@ services:
       - no-new-privileges:true
     environment:
       - DATABASE_URL=${DATABASE_URL:?required runtime DML database URL}
-      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - DATABASE_SSL_CA_FILE=/etc/ssl/certs/aws-rds-global-bundle.pem
       - FERNET_KEY=${FERNET_KEY:?required primary Fernet key}
       - FERNET_PREVIOUS_KEYS=${FERNET_PREVIOUS_KEYS:-}
+    volumes:
+      - ./certs/aws-rds-global-bundle.pem:/etc/ssl/certs/aws-rds-global-bundle.pem:ro
     networks:
       - brx-sync-maintenance-net
     healthcheck:

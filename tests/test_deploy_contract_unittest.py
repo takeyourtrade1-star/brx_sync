@@ -106,7 +106,7 @@ class DeployContractTest(unittest.TestCase):
         self.assertNotIn('get_ssm "/prod/ebartex/db_password"', START_SCRIPT)
         self.assertNotIn('get_ssm "/prod/ebartex/mysql_password"', START_SCRIPT)
 
-    def test_mysql_uses_the_verified_amazon_rds_ca_bundle(self) -> None:
+    def test_databases_use_the_verified_amazon_rds_ca_bundle(self) -> None:
         ca_path = "/etc/ssl/certs/aws-rds-global-bundle.pem"
 
         self.assertIn(
@@ -116,7 +116,9 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn("--proto '=https' --tlsv1.2", START_SCRIPT)
         self.assertIn("Amazon RDS eu-south-1 Root CA RSA2048 G1", START_SCRIPT)
         self.assertEqual(COMPOSE_FILE.count(f"MYSQL_SSL_CA_FILE={ca_path}"), 2)
-        self.assertEqual(COMPOSE_FILE.count(f"{ca_path}:ro"), 2)
+        self.assertEqual(COMPOSE_FILE.count(f"DATABASE_SSL_CA_FILE={ca_path}"), 3)
+        self.assertIn(f"PGSSLROOTCERT={ca_path}", COMPOSE_FILE)
+        self.assertEqual(COMPOSE_FILE.count(f"{ca_path}:ro"), 4)
 
     def test_production_requires_service_scoped_caller_map(self) -> None:
         self.assertIn(
