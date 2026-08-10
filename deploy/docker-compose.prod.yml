@@ -36,7 +36,7 @@ services:
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
-      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/aws-rds-global-bundle.pem
       - MYSQL_POOL_SIZE=3
       - MYSQL_POOL_MAX_OVERFLOW=2
       - REDIS_URL
@@ -65,6 +65,8 @@ services:
       - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
       - REQUEST_MAX_BODY_MESSAGES=1024
       - SYNC_LOG_TO_FILE=false
+    volumes:
+      - ./certs/aws-rds-global-bundle.pem:/etc/ssl/certs/aws-rds-global-bundle.pem:ro
     depends_on:
       brx-sync-redis:
         condition: service_healthy
@@ -114,7 +116,7 @@ services:
       - MYSQL_USER
       - MYSQL_PASSWORD
       - MYSQL_DATABASE
-      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/ca-certificates.crt
+      - MYSQL_SSL_CA_FILE=/etc/ssl/certs/aws-rds-global-bundle.pem
       - MYSQL_POOL_SIZE=2
       - MYSQL_POOL_MAX_OVERFLOW=1
       - REDIS_URL
@@ -140,6 +142,8 @@ services:
       - CARDTRADER_JOB_POLL_TIMEOUT_SECONDS=${CARDTRADER_JOB_POLL_TIMEOUT_SECONDS:-180}
       - CARDTRADER_JOB_POLL_INTERVAL_SECONDS=${CARDTRADER_JOB_POLL_INTERVAL_SECONDS:-1.1}
       - SYNC_LOG_TO_FILE=false
+    volumes:
+      - ./certs/aws-rds-global-bundle.pem:/etc/ssl/certs/aws-rds-global-bundle.pem:ro
     depends_on:
       brx-sync-redis:
         condition: service_healthy
