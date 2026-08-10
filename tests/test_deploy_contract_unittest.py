@@ -95,6 +95,13 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn('exit 1', START_SCRIPT)
         self.assertNotIn("169.254.169.254", START_SCRIPT)
 
+        previous_key = START_SCRIPT.index('get_ssm "/prod/ebartex/fernet_key"')
+        clear_previous_key = START_SCRIPT.index("unset FERNET_PREVIOUS_KEYS", credential_rotation)
+        launch = START_SCRIPT.index("up -d --force-recreate --remove-orphans")
+        self.assertLess(previous_key, credential_rotation)
+        self.assertLess(credential_rotation, clear_previous_key)
+        self.assertLess(clear_previous_key, launch)
+
     def test_deploy_uses_dedicated_database_roles_and_passwords(self) -> None:
         self.assertIn("/prod/ebartex/brx_sync_db_user", START_SCRIPT)
         self.assertIn("/prod/ebartex/brx_sync_db_password", START_SCRIPT)

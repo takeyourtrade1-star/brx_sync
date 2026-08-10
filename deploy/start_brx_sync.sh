@@ -211,6 +211,16 @@ log_step "FERNET_KEY (/prod/ebartex/sync_encryption_key)..."
 export FERNET_KEY="$(get_ssm "/prod/ebartex/sync_encryption_key")"
 log_ok "FERNET_KEY recuperato (sync_encryption_key)"
 
+log_step "Chiave Fernet legacy per la sola rotazione..."
+LEGACY_FERNET_KEY="$(get_ssm "/prod/ebartex/fernet_key")"
+if [[ "$LEGACY_FERNET_KEY" != "$FERNET_KEY" ]]; then
+  export FERNET_PREVIOUS_KEYS="$LEGACY_FERNET_KEY"
+else
+  export FERNET_PREVIOUS_KEYS=""
+fi
+unset LEGACY_FERNET_KEY
+log_ok "Compatibilita Fernet legacy configurata per il job one-shot"
+
 log_step "JWT_PUBLIC_KEY (/prod/ebartex/jwt_public_key)..."
 export JWT_PUBLIC_KEY="$(get_ssm "/prod/ebartex/jwt_public_key")"
 log_ok "JWT_PUBLIC_KEY recuperato"
@@ -274,6 +284,7 @@ log_ok "Migrazioni schema applicate dal ruolo migration dedicato"
 log_step "Cifro i webhook secret legacy e ruoto le credenziali Fernet..."
 docker compose -f "$COMPOSE_FILE" run --rm --no-deps brx-sync-credential-rotation
 log_ok "Credenziali cifrate con la chiave primaria"
+unset FERNET_PREVIOUS_KEYS
 
 # ── Avvio container ───────────────────────────────────────────────────────────
 log_header "AVVIO CONTAINER"
