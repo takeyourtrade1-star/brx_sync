@@ -313,7 +313,8 @@ log_header "HEALTH CHECK"
 log_step "Attendo readiness verificata..."
 ready="false"
 for i in $(seq 1 20); do
-  if curl -sf --max-time 5 "http://${SERVICE_BIND_IP}:8002/health/ready" >/dev/null 2>&1; then
+  if curl -sf --max-time 5 -H "Host: sync.ebartex.com" \
+    "http://${SERVICE_BIND_IP}:8002/health/ready" >/dev/null 2>&1; then
     ready="true"
     break
   fi
