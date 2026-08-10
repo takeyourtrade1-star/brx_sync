@@ -36,6 +36,7 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn('python-version: "3.12"', gate)
         self.assertIn("vars.PYTHON_BASE_IMAGE", gate)
         self.assertIn("vars.POSTGRES_TEST_IMAGE", gate)
+        self.assertIn("vars.REDIS_TEST_IMAGE", gate)
         self.assertIn("Run blocking security regressions", gate)
         self.assertIn("pip-audit==2.10.1", gate)
         self.assertIn("python -m pip_audit --requirement requirements.txt", gate)
