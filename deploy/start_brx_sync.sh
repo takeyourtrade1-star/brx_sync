@@ -165,6 +165,16 @@ validate_database_name() {
     || { log_err "$label database name from SSM is invalid"; exit 1; }
 }
 
+validate_service_bind_ip() {
+  local value="$1"
+  python3 -c 'import ipaddress,sys; address=ipaddress.ip_address(sys.argv[1]); assert address.version == 4 and address.is_private and not (address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified)' "$value" \
+    || { log_err "SERVICE_BIND_IP must be a private non-loopback IPv4 address"; exit 1; }
+  ip -o -4 addr show scope global \
+    | awk '{sub(/\/.*/, "", $4); print $4}' \
+    | grep -Fxq "$value" \
+    || { log_err "SERVICE_BIND_IP is not assigned to this host"; exit 1; }
+}
+
 # ── Parametri da SSM condivisi (/prod/ebartex/*) ──────────────────────────────
 log_step "Dedicated brx_sync PostgreSQL credentials..."
 DB_HOST="$(get_ssm "/prod/ebartex/auth_db_host")"
@@ -204,6 +214,10 @@ export MYSQL_DATABASE="$(get_ssm "/prod/ebartex/search_mysql_database")"
 validate_database_host "MySQL" "$MYSQL_HOST"
 validate_database_name "MySQL" "$MYSQL_DATABASE"
 log_ok "MySQL credentials e destinazione recuperate da SSM e validate"
+
+export SERVICE_BIND_IP="${SERVICE_BIND_IP:?set SERVICE_BIND_IP to this instance private IPv4 address}"
+validate_service_bind_ip "$SERVICE_BIND_IP"
+log_ok "Private service bind address verified"
 
 # Produzione sync usa sync_encryption_key (token CT cifrati con questa chiave).
 # NON usare fernet_key se i due hash SSM differiscono — altrimenti i token utente non si decifrano.

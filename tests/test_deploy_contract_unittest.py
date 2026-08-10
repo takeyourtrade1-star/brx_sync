@@ -177,8 +177,13 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn("ca-certificates postgresql-client", DOCKERFILE)
 
     def test_production_services_are_not_public_and_run_hardened(self) -> None:
-        self.assertIn('"127.0.0.1:8002:8000"', COMPOSE_FILE)
+        self.assertIn(
+            '"${SERVICE_BIND_IP:?required private service bind IP}:8002:8000"',
+            COMPOSE_FILE,
+        )
         self.assertNotIn('- "8002:8000"', COMPOSE_FILE)
+        self.assertIn("validate_service_bind_ip", START_SCRIPT)
+        self.assertIn("SERVICE_BIND_IP is not assigned to this host", START_SCRIPT)
         self.assertEqual(COMPOSE_FILE.count("read_only: true"), 5)
         self.assertEqual(COMPOSE_FILE.count("no-new-privileges:true"), 5)
         self.assertEqual(COMPOSE_FILE.count("cap_drop:"), 5)
