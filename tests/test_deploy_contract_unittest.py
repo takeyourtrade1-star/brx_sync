@@ -187,6 +187,10 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn('"http://${SERVICE_BIND_IP}:8002/health/ready"', START_SCRIPT)
         self.assertIn('-H "Host: sync.ebartex.com"', START_SCRIPT)
         self.assertEqual(COMPOSE_FILE.count("- ALLOWED_ORIGINS"), 2)
+        worker = COMPOSE_FILE.split("  brx-sync-worker:", 1)[1].split(
+            "\n  # One-shot", 1
+        )[0]
+        self.assertIn("healthcheck:\n      disable: true", worker)
         self.assertEqual(COMPOSE_FILE.count("read_only: true"), 5)
         self.assertEqual(COMPOSE_FILE.count("no-new-privileges:true"), 5)
         self.assertEqual(COMPOSE_FILE.count("cap_drop:"), 5)
