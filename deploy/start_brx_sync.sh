@@ -102,7 +102,7 @@ curl --fail --silent --show-error --location \
   --output "$RDS_CA_TMP"
 if ! openssl crl2pkcs7 -nocrl -certfile "$RDS_CA_TMP" \
     | openssl pkcs7 -print_certs -noout \
-    | grep -Fq "CN=Amazon RDS eu-south-1 Root CA RSA2048 G1"; then
+    | grep -Eq "CN ?= ?Amazon RDS eu-south-1 Root CA RSA2048 G1"; then
   log_err "Il bundle Amazon RDS non contiene la CA attesa per eu-south-1"
   exit 1
 fi
