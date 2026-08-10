@@ -150,6 +150,9 @@ services:
         condition: service_healthy
     networks:
       - brx-sync-net
+    # The image probe targets the API port; this process is a Celery worker.
+    healthcheck:
+      disable: true
     logging:
       driver: "json-file"
       options:
