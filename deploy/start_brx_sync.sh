@@ -23,6 +23,9 @@ export CARDTRADER_WRITES_ENABLED="${CARDTRADER_WRITES_ENABLED:-false}"
 
 REDIS_URL_VALUE="redis://brx-sync-redis:6379"
 WEBHOOK_PUBLIC_URL_VALUE="https://sync.ebartex.com"
+RDS_CA_URL="https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem"
+RDS_CA_FILE="certs/aws-rds-global-bundle.pem"
+RDS_CA_TMP="${RDS_CA_FILE}.tmp"
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -57,6 +60,7 @@ cleanup() {
   unset PUBLIC_BASE_URL
   unset BRX_SYNC_IMAGE
   unset REDIS_IMAGE
+  rm -f "${RDS_CA_TMP}"
   if [[ -n "${ECR_REGISTRY:-}" ]]; then
     docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true
   fi
@@ -74,6 +78,14 @@ command -v docker >/dev/null 2>&1 \
   && log_ok "docker trovato" \
   || { log_err "docker non trovato"; exit 1; }
 
+command -v curl >/dev/null 2>&1 \
+  && log_ok "curl trovato" \
+  || { log_err "curl non trovato"; exit 1; }
+
+command -v openssl >/dev/null 2>&1 \
+  && log_ok "openssl trovato" \
+  || { log_err "openssl non trovato"; exit 1; }
+
 docker compose version >/dev/null 2>&1 \
   && log_ok "docker compose v2 trovato" \
   || { log_err "docker compose v2 non trovato — installa con: apt-get install docker-compose-v2"; exit 1; }
@@ -81,6 +93,22 @@ docker compose version >/dev/null 2>&1 \
 [[ -f "$COMPOSE_FILE" ]] \
   && log_ok "$COMPOSE_FILE trovato" \
   || { log_err "File non trovato: $COMPOSE_FILE (esegui questo script dalla stessa cartella)"; exit 1; }
+
+log_step "Aggiorno il bundle CA ufficiale Amazon RDS..."
+install -d -m 0755 "$(dirname "$RDS_CA_FILE")"
+curl --fail --silent --show-error --location \
+  --proto '=https' --tlsv1.2 \
+  "$RDS_CA_URL" \
+  --output "$RDS_CA_TMP"
+if ! openssl crl2pkcs7 -nocrl -certfile "$RDS_CA_TMP" \
+    | openssl pkcs7 -print_certs -noout \
+    | grep -Fq "CN=Amazon RDS eu-south-1 Root CA RSA2048 G1"; then
+  log_err "Il bundle Amazon RDS non contiene la CA attesa per eu-south-1"
+  exit 1
+fi
+chmod 0644 "$RDS_CA_TMP"
+mv -f "$RDS_CA_TMP" "$RDS_CA_FILE"
+log_ok "Bundle CA Amazon RDS verificato"
 
 # Verifica identity AWS (usa instance profile, zero credenziali su disco)
 log_step "Verifico credenziali AWS (instance profile)..."

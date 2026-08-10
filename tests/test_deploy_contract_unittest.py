@@ -106,6 +106,18 @@ class DeployContractTest(unittest.TestCase):
         self.assertNotIn('get_ssm "/prod/ebartex/db_password"', START_SCRIPT)
         self.assertNotIn('get_ssm "/prod/ebartex/mysql_password"', START_SCRIPT)
 
+    def test_mysql_uses_the_verified_amazon_rds_ca_bundle(self) -> None:
+        ca_path = "/etc/ssl/certs/aws-rds-global-bundle.pem"
+
+        self.assertIn(
+            "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",
+            START_SCRIPT,
+        )
+        self.assertIn("--proto '=https' --tlsv1.2", START_SCRIPT)
+        self.assertIn("Amazon RDS eu-south-1 Root CA RSA2048 G1", START_SCRIPT)
+        self.assertEqual(COMPOSE_FILE.count(f"MYSQL_SSL_CA_FILE={ca_path}"), 2)
+        self.assertEqual(COMPOSE_FILE.count(f"{ca_path}:ro"), 2)
+
     def test_production_requires_service_scoped_caller_map(self) -> None:
         self.assertIn(
             'get_ssm "/prod/ebartex/sync_internal_caller_tokens"',
@@ -138,7 +150,14 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn("rds.amazonaws.com", START_SCRIPT)
         self.assertIn("address.is_private", START_SCRIPT)
         self.assertIsNone(re.search(r"(?<![0-9])[0-9]{12}(?![0-9])", START_SCRIPT))
-        self.assertNotRegex(START_SCRIPT, r"[A-Za-z0-9.-]+\.rds\.amazonaws\.com")
+        script_without_truststore = START_SCRIPT.replace(
+            "https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem",
+            "",
+        )
+        self.assertNotRegex(
+            script_without_truststore,
+            r"[A-Za-z0-9.-]+\.rds\.amazonaws\.com",
+        )
         self.assertNotIn('DB_NAME="ebartex_', START_SCRIPT)
 
     def test_container_build_requires_a_caller_supplied_base_image(self) -> None:
