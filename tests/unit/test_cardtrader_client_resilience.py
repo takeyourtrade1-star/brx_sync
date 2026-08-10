@@ -4,8 +4,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from app.services import circuit_breaker as circuit_breaker_module
-from app.core.exceptions import RateLimitError
-from app.services.cardtrader_client import CardTraderAPIError, CardTraderClient
+from app.services.cardtrader_client import (
+    CardTraderAPIError,
+    CardTraderClient,
+    RateLimitError,
+)
 from app.services.circuit_breaker import CircuitState
 
 
