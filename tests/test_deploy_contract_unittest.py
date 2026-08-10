@@ -202,6 +202,10 @@ class DeployContractTest(unittest.TestCase):
         self.assertIn("REQUEST_MAX_BODY_MESSAGES=1024", COMPOSE_FILE)
         self.assertIn("--maxmemory-policy", COMPOSE_FILE)
         self.assertNotIn("ports:\n      - \"6379:6379\"", COMPOSE_FILE)
+        redis_service = COMPOSE_FILE.rsplit("  brx-sync-redis:", 1)[1].split(
+            "networks:", 1
+        )[0]
+        self.assertIn('user: "999:1000"', redis_service)
 
     def test_production_root_does_not_fingerprint_version(self) -> None:
         main = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
