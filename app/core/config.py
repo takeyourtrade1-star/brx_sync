@@ -179,13 +179,13 @@ class Settings(BaseSettings):
     )
     JWT_ISSUER: str = Field(default="ebartex-auth", min_length=1, max_length=255)
     JWT_AUDIENCE: str = Field(default="ebartex-services", min_length=1, max_length=255)
-    JWT_REQUIRE_ISSUER_AUDIENCE: bool | None = Field(
-        default=None,
-        description="Defaults to strict in production; development/test may remain permissive",
+    JWT_REQUIRE_ISSUER_AUDIENCE: bool = Field(
+        default=False,
+        description="Require iss and aud claims in JWT access tokens",
     )
-    JWT_REQUIRE_JTI: bool | None = Field(
-        default=None,
-        description="Defaults to strict in production; development/test may remain permissive",
+    JWT_REQUIRE_JTI: bool = Field(
+        default=False,
+        description="Require jti claim in JWT access tokens",
     )
     JWT_LEGACY_ROLLOUT_ACK: str = Field(default="", repr=False, max_length=128)
     JWT_LEGACY_ROLLOUT_EXPIRES_AT: str = Field(default="", max_length=64)
@@ -395,16 +395,6 @@ class Settings(BaseSettings):
         from cryptography.fernet import Fernet
 
         secure_environment = self.ENVIRONMENT in {"staging", "production"}
-        if self.JWT_REQUIRE_ISSUER_AUDIENCE is None:
-            self.JWT_REQUIRE_ISSUER_AUDIENCE = secure_environment
-        if self.JWT_REQUIRE_JTI is None:
-            self.JWT_REQUIRE_JTI = secure_environment
-        if secure_environment:
-            self._check_legacy_jwt_rollout(
-                strict=bool(
-                    self.JWT_REQUIRE_ISSUER_AUDIENCE and self.JWT_REQUIRE_JTI
-                )
-            )
         if secure_environment and self.DEBUG:
             raise ValueError("DEBUG must be false in staging/production")
         if secure_environment and self.ENABLE_TEST_ENDPOINTS:
@@ -649,53 +639,13 @@ class Settings(BaseSettings):
             kwargs["ssl_ca_certs"] = self.REDIS_SSL_CA_FILE
         return kwargs
 
-    def _legacy_jwt_rollout_expiry(self) -> datetime:
-        raw = self.JWT_LEGACY_ROLLOUT_EXPIRES_AT.strip()
-        try:
-            expiry = datetime.fromisoformat(
-                raw.removesuffix("Z") + ("+00:00" if raw.endswith("Z") else "")
-            )
-        except ValueError as exc:
-            raise ValueError(
-                "JWT_LEGACY_ROLLOUT_EXPIRES_AT must be an RFC3339 timestamp"
-            ) from exc
-        if expiry.tzinfo is None or expiry.utcoffset() is None:
-            raise ValueError("JWT_LEGACY_ROLLOUT_EXPIRES_AT must include a UTC offset")
-        return expiry.astimezone(timezone.utc)
-
-    def _check_legacy_jwt_rollout(self, *, strict: bool) -> None:
-        configured = bool(
-            self.JWT_LEGACY_ROLLOUT_ACK.strip()
-            or self.JWT_LEGACY_ROLLOUT_EXPIRES_AT.strip()
-        )
-        if strict:
-            if configured:
-                raise ValueError(
-                    "legacy JWT rollout acknowledgement must be unset in strict mode"
-                )
-            return
-        if self.JWT_LEGACY_ROLLOUT_ACK != _JWT_LEGACY_ROLLOUT_ACK:
-            raise ValueError("temporary legacy JWT acceptance requires explicit acknowledgement")
-        now = datetime.now(timezone.utc)
-        expiry = self._legacy_jwt_rollout_expiry()
-        if expiry <= now or expiry > now + _JWT_LEGACY_ROLLOUT_MAX_WINDOW:
-            raise ValueError("temporary legacy JWT acceptance must expire within two hours")
-
     @property
     def jwt_require_issuer_audience(self) -> bool:
-        if self.JWT_REQUIRE_ISSUER_AUDIENCE:
-            return True
-        if self.ENVIRONMENT not in {"staging", "production"}:
-            return False
-        return datetime.now(timezone.utc) >= self._legacy_jwt_rollout_expiry()
+        return bool(self.JWT_REQUIRE_ISSUER_AUDIENCE)
 
     @property
     def jwt_require_jti(self) -> bool:
-        if self.JWT_REQUIRE_JTI:
-            return True
-        if self.ENVIRONMENT not in {"staging", "production"}:
-            return False
-        return datetime.now(timezone.utc) >= self._legacy_jwt_rollout_expiry()
+        return bool(self.JWT_REQUIRE_JTI)
 
     def _load_secrets_from_ssm(self) -> None:
         """Load secrets from AWS SSM Parameter Store."""

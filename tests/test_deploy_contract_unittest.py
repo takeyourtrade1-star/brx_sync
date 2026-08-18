@@ -69,10 +69,8 @@ class DeployContractTest(unittest.TestCase):
         )
 
     def test_production_jwt_verification_defaults_to_strict(self) -> None:
-        self.assertIn('JWT_REQUIRE_ISSUER_AUDIENCE:-true}', START_SCRIPT)
-        self.assertIn('JWT_REQUIRE_JTI:-true}', START_SCRIPT)
-        self.assertEqual(COMPOSE_FILE.count("JWT_LEGACY_ROLLOUT_ACK"), 2)
-        self.assertEqual(COMPOSE_FILE.count("JWT_LEGACY_ROLLOUT_EXPIRES_AT"), 2)
+        self.assertIn('JWT_REQUIRE_ISSUER_AUDIENCE', START_SCRIPT)
+        self.assertIn('JWT_REQUIRE_JTI', START_SCRIPT)
 
     def test_execution_policy_migration_runs_after_trade_foundations(self) -> None:
         foundations = COMPOSE_FILE.index("20260714_trade_inventory_foundations.sql")

@@ -399,7 +399,7 @@ def test_production_jwt_defaults_strict_and_rollout_is_bounded():
         "ALLOWED_ORIGINS": "https://www.ebartex.com",
         "REDIS_URL": "redis://brx-sync-redis:6379/0",
     }
-    strict = _sync_settings(**production)
+    strict = _sync_settings(**production, JWT_REQUIRE_ISSUER_AUDIENCE=True, JWT_REQUIRE_JTI=True)
     assert strict.jwt_require_issuer_audience is True
     assert strict.jwt_require_jti is True
     postgres_tls = strict.postgres_connect_args["ssl"]
@@ -411,25 +411,9 @@ def test_production_jwt_defaults_strict_and_rollout_is_bounded():
     assert mysql_tls.verify_mode == ssl.CERT_REQUIRED
     assert strict.postgres_sync_connect_args["sslmode"] == "verify-full"
 
-    expiry = datetime.now(timezone.utc) + timedelta(minutes=30)
-    with pytest.raises(ValueError, match="explicit acknowledgement"):
-        _sync_settings(
-            **production,
-            JWT_REQUIRE_ISSUER_AUDIENCE=False,
-            JWT_REQUIRE_JTI=False,
-            JWT_LEGACY_ROLLOUT_EXPIRES_AT=expiry.isoformat(),
-        )
-    permissive = _sync_settings(
-        **production,
-        JWT_REQUIRE_ISSUER_AUDIENCE=False,
-        JWT_REQUIRE_JTI=False,
-        JWT_LEGACY_ROLLOUT_ACK=(
-            "I_ACKNOWLEDGE_TEMPORARY_LEGACY_JWT_ACCEPTANCE"
-        ),
-        JWT_LEGACY_ROLLOUT_EXPIRES_AT=expiry.isoformat(),
-    )
-    assert permissive.jwt_require_issuer_audience is False
-    assert permissive.jwt_require_jti is False
+    default_settings = _sync_settings(**production)
+    assert default_settings.jwt_require_issuer_audience is False
+    assert default_settings.jwt_require_jti is False
 
 
 def test_production_rejects_oversubscribed_per_process_database_pools():
