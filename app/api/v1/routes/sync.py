@@ -454,28 +454,57 @@ async def get_task_status(
         if sync_op.status in {"completed", "failed", "uncertain", "cancelled"}:
             successful = sync_op.status == "completed"
             metadata = sync_op.operation_metadata or {}
-            safe_result_keys = {
-                "processed",
-                "created",
-                "updated",
-                "skipped",
-                "total_products",
-                "progress_percent",
-            }
+            
+            # Direct keys (bulk_sync)
+            processed = metadata.get("processed")
+            created = metadata.get("created")
+            updated = metadata.get("updated")
+            skipped = metadata.get("skipped")
+            total_products = metadata.get("total_products")
+            progress_percent = metadata.get("progress_percent", 100 if successful else 0)
+
+            # Reconcile result structure (nested under result -> applied)
+            result_obj = metadata.get("result")
+            if isinstance(result_obj, dict):
+                applied = result_obj.get("applied")
+                if isinstance(applied, dict):
+                    if created is None:
+                        created = applied.get("created", 0)
+                    if updated is None:
+                        updated = applied.get("updated", 0)
+                    if skipped is None:
+                        skipped = (
+                            int(applied.get("skipped_unsafe", 0))
+                            + int(applied.get("skipped_zero_qty", 0))
+                            + int(applied.get("unsupported_export_rows", 0))
+                        )
+                if total_products is None:
+                    total_products = result_obj.get("magic_export_size") or result_obj.get("export_size")
+                if processed is None and created is not None and updated is not None:
+                    processed = int(created) + int(updated) + int(skipped or 0)
+
+            error_msg = None
+            if not successful:
+                error_val = metadata.get("error")
+                error_msg = str(error_val) if error_val else "Task failed"
+
             safe_result = {
-                key: value
-                for key, value in metadata.items()
-                if key in safe_result_keys and isinstance(value, (bool, int, float, str))
+                "processed": int(processed) if isinstance(processed, (int, float)) else 0,
+                "created": int(created) if isinstance(created, (int, float)) else 0,
+                "updated": int(updated) if isinstance(updated, (int, float)) else 0,
+                "skipped": int(skipped) if isinstance(skipped, (int, float)) else 0,
+                "total_products": int(total_products) if isinstance(total_products, (int, float)) else (int(processed) if isinstance(processed, (int, float)) else 0),
+                "progress_percent": int(progress_percent) if isinstance(progress_percent, (int, float)) else 100,
             }
             return {
                 "task_id": normalized_task_id,
                 "status": "SUCCESS" if successful else "FAILURE",
                 "ready": True,
                 "result": safe_result if successful else None,
-                "error": None if successful else "Task failed",
+                "error": error_msg,
                 "message": (
                     "Task completed successfully"
-                    if successful else "Task could not be completed"
+                    if successful else (error_msg or "Task could not be completed")
                 ),
             }
 
