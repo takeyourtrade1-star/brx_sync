@@ -306,7 +306,11 @@ async def _initial_bulk_sync_locked(
                 logger.info(f"Exported {len(products)} products from CardTrader")
                 from app.services.reconciler import (
                     _filter_cards_prints,
+                    _is_confirmed_suspicious_set,
+                    _previous_snapshot_size,
+                    _record_snapshot,
                     _snapshot_checksum,
+                    _snapshot_id_set_checksum,
                     normalize_magic_snapshot,
                     validate_snapshot,
                 )
@@ -317,13 +321,31 @@ async def _initial_bulk_sync_locked(
                     blueprint_mapper.map_blueprint_id,
                 )
 
+                checksum = _snapshot_id_set_checksum(products)
+                previous_size = await _previous_snapshot_size(session, user_uuid, environment)
+                confirmed_shrink = await _is_confirmed_suspicious_set(
+                    session, user_uuid, environment, checksum
+                )
+
                 snapshot_ok, snapshot_problems = validate_snapshot(
                     products,
-                    previous_snapshot_size=None,
+                    previous_snapshot_size=previous_size,
                     local_active_rows=local_active_rows,
+                    allow_confirmed_shrink=confirmed_shrink,
                 )
                 all_snapshot_problems = shape_problems + mapping_problems + snapshot_problems
                 if not snapshot_ok or all_snapshot_problems:
+                    await _record_snapshot(
+                        session,
+                        snapshot_id=uuid.uuid4(),
+                        user_id=user_uuid,
+                        environment=environment,
+                        status="rejected",
+                        product_count=len(products),
+                        checksum=checksum,
+                        problems=all_snapshot_problems,
+                    )
+                    await session.commit()
                     raise ValueError(
                         "CardTrader export rejected: " + "; ".join(all_snapshot_problems)
                     )
