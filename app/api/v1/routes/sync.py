@@ -1231,28 +1231,10 @@ async def setup_test_user(
             )
             logger.info(f"Created sync settings for user {user_uuid}")
 
-        marketplace_config_exists = (
-            await conn.execute(text("SELECT to_regclass('public.mkt_sync_config')"))
-        ).scalar_one_or_none()
-        if marketplace_config_exists:
-            await conn.execute(
-                text("""
-                    INSERT INTO mkt_sync_config
-                        (id, user_id, sync_mode, mode_version, writes_enabled,
-                         is_active,
-                         created_at, updated_at)
-                    SELECT CAST(:config_id AS uuid), user_id, 'partial',
-                           mode_version, FALSE, TRUE, NOW(), NOW()
-                    FROM user_sync_settings
-                    WHERE user_id = CAST(:user_id AS uuid)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        sync_mode = 'partial',
-                        mode_version = EXCLUDED.mode_version,
-                        writes_enabled = FALSE,
-                        updated_at = NOW()
-                """),
-                {"user_id": str(user_uuid), "config_id": str(uuid.uuid4())},
-            )
+        # `user_sync_settings` is the authoritative execution policy.  Do not
+        # mirror it here by writing directly to Marketplace-owned tables: the
+        # production Sync role is intentionally not allowed to mutate them.
+        # Marketplace refreshes its projection from this row with its own role.
 
         await session.commit()
 
