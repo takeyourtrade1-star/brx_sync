@@ -77,15 +77,16 @@ async def test_deferred_webhooks_are_processed_before_export(monkeypatch) -> Non
 
 def test_periodic_task_fans_out_one_task_per_user(monkeypatch) -> None:
     user_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    task_specs = [(user_id, f"task-{index}") for index, user_id in enumerate(user_ids, start=1)]
     queued: list[str] = []
 
     def return_user_ids(coroutine):
         coroutine.close()
-        return user_ids
+        return task_specs
 
-    def enqueue(*, args):
+    def enqueue(*, args, task_id):
         queued.append(args[0])
-        return SimpleNamespace(id=f"task-{len(queued)}")
+        return SimpleNamespace(id=task_id)
 
     monkeypatch.setattr(periodic_sync, "run_async", return_user_ids)
     monkeypatch.setattr(periodic_sync.reconcile_user, "apply_async", enqueue)
@@ -96,5 +97,38 @@ def test_periodic_task_fans_out_one_task_per_user(monkeypatch) -> None:
     assert result == {
         "users": 2,
         "queued": 2,
+        "dispatch_failures": 0,
         "task_ids": ["task-1", "task-2"],
     }
+
+
+@pytest.mark.parametrize(
+    ("outcome", "operation_status", "failure_code"),
+    [
+        ("rejected", "failed", "snapshot_rejected"),
+        ("deferred", "cancelled", "reconcile_deferred"),
+        ("superseded", "cancelled", "reconcile_superseded"),
+        ("locked", "cancelled", "reconcile_locked"),
+        ("skipped", "cancelled", "reconcile_skipped"),
+    ],
+)
+def test_non_success_domain_outcomes_cannot_be_reported_completed(
+    outcome: str,
+    operation_status: str,
+    failure_code: str,
+) -> None:
+    status, metadata = periodic_sync._terminal_reconcile_operation(
+        {"status": outcome, "user_id": str(uuid.uuid4())}
+    )
+
+    assert status == operation_status
+    assert metadata["failure_code"] == failure_code
+
+
+def test_only_ok_is_a_successful_reconcile_operation() -> None:
+    result = {"status": "ok", "applied": {"updated": 3}}
+
+    status, metadata = periodic_sync._terminal_reconcile_operation(result)
+
+    assert status == "completed"
+    assert metadata == {"result": result}

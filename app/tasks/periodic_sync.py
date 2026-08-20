@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import String, cast, select
+from sqlalchemy import String, and_, cast, select
 
 from app.core.database import get_isolated_db_session
 from app.core.redis_client import get_redis_sync
@@ -43,6 +43,30 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+TERMINAL_RECONCILE_FAILURE_CODES = {
+    "rejected": "snapshot_rejected",
+    "deferred": "reconcile_deferred",
+    "superseded": "reconcile_superseded",
+    "locked": "reconcile_locked",
+    "skipped": "reconcile_skipped",
+}
+
+
+def _terminal_reconcile_operation(
+    result: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Map domain outcomes to durable operation states without false success."""
+
+    outcome = str(result.get("status") or "")
+    if outcome == "ok":
+        return "completed", {"result": result}
+    if outcome in TERMINAL_RECONCILE_FAILURE_CODES:
+        operation_status = "failed" if outcome == "rejected" else "cancelled"
+        return operation_status, {
+            "result": result,
+            "failure_code": TERMINAL_RECONCILE_FAILURE_CODES[outcome],
+        }
+    raise RuntimeError("unexpected reconciliation outcome")
 
 
 def _build_blueprint_mapper():
@@ -97,16 +121,41 @@ async def _reconcile_one(session, settings_row, redis, map_blueprint) -> dict[st
 def reconcile_all_users(self) -> dict[str, Any]:
     """Fan-out: accoda un task indipendente per ogni utente sync attivo."""
     try:
-        user_ids = run_async(_active_user_ids_async())
-        task_ids = [reconcile_user.apply_async(args=[user_id]).id for user_id in user_ids]
+        task_specs = run_async(_register_active_reconciles_async())
+        task_ids: list[str] = []
+        dispatch_failures = 0
+        for user_id, task_id in task_specs:
+            try:
+                reconcile_user.apply_async(args=[user_id], task_id=task_id)
+                task_ids.append(task_id)
+            except Exception as exc:  # noqa: BLE001 - broker failures vary
+                dispatch_failures += 1
+                run_async(
+                    _update_registered_reconcile(
+                        task_id,
+                        user_id,
+                        "failed",
+                        {
+                            "trigger": "periodic",
+                            "failure_code": "dispatch_failed",
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                )
+                logger.error(
+                    "Riconciliazione periodica non accodata per %s (%s)",
+                    user_id,
+                    type(exc).__name__,
+                )
         result = {
-            "users": len(user_ids),
+            "users": len(task_specs),
             "queued": len(task_ids),
+            "dispatch_failures": dispatch_failures,
             "task_ids": task_ids,
         }
         logger.info(
             "Riconciliazione periodica accodata per %d utenti",
-            len(user_ids),
+            len(task_specs),
         )
         return result
     except Exception as exc:
@@ -117,22 +166,39 @@ def reconcile_all_users(self) -> dict[str, Any]:
         raise self.retry(exc=RuntimeError(type(exc).__name__))
 
 
-async def _active_user_ids_async() -> list[str]:
+async def _register_active_reconciles_async() -> list[tuple[str, str]]:
+    """Register auditable periodic tasks only for CardTrader-reading modes."""
+
     async with get_isolated_db_session() as session:
         rows = (
             (
                 await session.execute(
                     select(UserSyncSettings.user_id).where(
-                        # la colonna è un enum Postgres: confronto come testo
-                        cast(UserSyncSettings.sync_status, String)
-                        == "active"
+                        and_(
+                            # la colonna è un enum Postgres: confronto come testo
+                            cast(UserSyncSettings.sync_status, String) == "active",
+                            UserSyncSettings.execution_mode.in_(("partial", "real")),
+                        )
                     )
                 )
             )
             .scalars()
             .all()
         )
-    return [str(user_id) for user_id in rows]
+        task_specs = [(str(user_id), str(uuid.uuid4())) for user_id in rows]
+        session.add_all(
+            [
+                SyncOperation(
+                    user_id=uuid.UUID(user_id),
+                    operation_id=task_id,
+                    operation_type="reconcile",
+                    status="pending",
+                    operation_metadata={"trigger": "periodic"},
+                )
+                for user_id, task_id in task_specs
+            ]
+        )
+    return task_specs
 
 
 async def _update_registered_reconcile(
@@ -141,7 +207,7 @@ async def _update_registered_reconcile(
     status: str,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
-    """Update only API-registered reconcile tasks; fan-out creates no ledger."""
+    """Update an API or periodic reconcile task when its durable ledger exists."""
 
     if not task_id:
         return False
@@ -167,14 +233,16 @@ async def _update_registered_reconcile(
         operation.status = status
         operation.operation_metadata = metadata
         operation.completed_at = (
-            datetime.now(timezone.utc) if status in {"completed", "failed"} else None
+            datetime.now(timezone.utc)
+            if status in {"completed", "failed", "cancelled", "uncertain"}
+            else None
         )
         return True
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
 def reconcile_user(self, user_id: str) -> dict[str, Any]:
-    """Riconciliazione manuale di un singolo utente (trigger da API)."""
+    """Riconcilia un utente da trigger API o fan-out periodico registrato."""
     task_id = getattr(self.request, "id", None)
     try:
         run_async(
@@ -186,14 +254,22 @@ def reconcile_user(self, user_id: str) -> dict[str, Any]:
             )
         )
         result = run_async(_reconcile_single_user_async(user_id))
-        if result.get("status") == "error":
+        outcome = str(result.get("status") or "")
+        if outcome == "error":
             raise RuntimeError(result.get("error") or "reconciliation failed")
+        terminal_status, metadata = _terminal_reconcile_operation(result)
+        if terminal_status != "completed":
+            logger.warning(
+                "Riconciliazione conclusa senza applicazione per %s (outcome=%s)",
+                user_id,
+                outcome,
+            )
         run_async(
             _update_registered_reconcile(
                 task_id,
                 user_id,
-                "completed",
-                {"result": result},
+                terminal_status,
+                metadata,
             )
         )
         return result
@@ -211,7 +287,8 @@ def reconcile_user(self, user_id: str) -> dict[str, Any]:
                 user_id,
                 "failed" if terminal else "processing",
                 {
-                    "error": type(exc).__name__,
+                    "failure_code": "reconcile_failed",
+                    "error_type": type(exc).__name__,
                     "attempt": retries + 1,
                     "retrying": not terminal,
                 },
@@ -241,6 +318,12 @@ async def _reconcile_single_user_async(user_id: str) -> dict[str, Any]:
                 "user_id": user_id,
                 "status": "skipped",
                 "reason": f"sync_status={settings_row.sync_status}",
+            }
+        if str(settings_row.execution_mode) not in {"partial", "real"}:
+            return {
+                "user_id": user_id,
+                "status": "skipped",
+                "reason": f"execution_mode={settings_row.execution_mode}",
             }
 
         return await _reconcile_one(session, settings_row, redis, map_blueprint)

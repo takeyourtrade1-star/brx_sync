@@ -121,9 +121,7 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
                 {"user_id": str(user_uuid), "operation_id": operation_id},
             )
     except Exception as exc:
-        logger.warning(
-            "Could not pre-create SyncOperation (%s)", type(exc).__name__
-        )
+        logger.warning("Could not pre-create SyncOperation (%s)", type(exc).__name__)
         # Continue anyway; async path will create it (may cause brief 403 on early polls)
 
     try:
@@ -172,7 +170,7 @@ def initial_bulk_sync(self, user_id: str) -> Dict[str, Any]:
                         """),
                     {
                         "operation_id": operation_id,
-                        "metadata": '{"error": "initial bulk sync failed"}',
+                        "metadata": '{"failure_code": "initial_bulk_failed"}',
                     },
                 )
             logger.info(f"Updated sync status to error for user {user_uuid}")
@@ -306,7 +304,8 @@ async def _initial_bulk_sync_locked(
                 logger.info(f"Exported {len(products)} products from CardTrader")
                 from app.services.reconciler import (
                     _filter_cards_prints,
-                    _is_confirmed_suspicious_set,
+                    _apply_missing_products,
+                    _is_confirmed_suspicious_shrink,
                     _previous_snapshot_size,
                     _record_snapshot,
                     _snapshot_checksum,
@@ -323,8 +322,8 @@ async def _initial_bulk_sync_locked(
 
                 checksum = _snapshot_id_set_checksum(products)
                 previous_size = await _previous_snapshot_size(session, user_uuid, environment)
-                confirmed_shrink = await _is_confirmed_suspicious_set(
-                    session, user_uuid, environment, checksum
+                confirmed_shrink = await _is_confirmed_suspicious_shrink(
+                    session, user_uuid, environment, len(products)
                 )
 
                 snapshot_ok, snapshot_problems = validate_snapshot(
@@ -355,6 +354,9 @@ async def _initial_bulk_sync_locked(
                 total_created = 0
                 total_updated = 0
                 total_skipped = 0
+                total_missing_quarantined = 0
+                total_archived = 0
+                snapshot_id = uuid.uuid4()
 
                 total_chunks = (len(products) + CHUNK_SIZE - 1) // CHUNK_SIZE
                 chunks = [products[i : i + CHUNK_SIZE] for i in range(0, len(products), CHUNK_SIZE)]
@@ -378,6 +380,7 @@ async def _initial_bulk_sync_locked(
                             blueprint_mapper,
                             environment,
                             watermark,
+                            snapshot_id,
                         )
                         for chunk in batch_chunks
                     ]
@@ -420,7 +423,6 @@ async def _initial_bulk_sync_locked(
                         }
                     await session.commit()
 
-                # Update through the mapped canonical PostgreSQL enum type.
                 locked_settings = (
                     await session.execute(
                         select(UserSyncSettings)
@@ -428,6 +430,46 @@ async def _initial_bulk_sync_locked(
                         .with_for_update()
                     )
                 ).scalar_one()
+                if (
+                    locked_settings.execution_mode != environment
+                    or locked_settings.mode_version != mode_version
+                ):
+                    raise RuntimeError("Sync mode changed before missing-row reconciliation")
+
+                linked_rows = list(
+                    (
+                        await session.execute(
+                            select(UserInventoryItem).where(
+                                UserInventoryItem.user_id == user_uuid,
+                                UserInventoryItem.environment == environment,
+                                UserInventoryItem.source == "cardtrader",
+                                UserInventoryItem.external_stock_id.isnot(None),
+                                UserInventoryItem.external_stock_id != "",
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                missing_result = await _apply_missing_products(
+                    session,
+                    local_items=linked_rows,
+                    present_ids={str(product["id"]) for product in products},
+                    map_blueprint=blueprint_mapper.map_blueprint_id,
+                    user_id=user_uuid,
+                    environment=environment,
+                    watermark=watermark,
+                    progress_check=lambda: _assert_mutation_lease(
+                        mutation_lease,
+                        lost_lease,
+                    ),
+                )
+                total_missing_quarantined = missing_result["missing_quarantined"]
+                total_archived = missing_result["archived"]
+                total_skipped += missing_result["skipped_unsafe"]
+                _assert_mutation_lease(mutation_lease, lost_lease)
+
+                # Update through the mapped canonical PostgreSQL enum type.
                 if (
                     locked_settings.execution_mode != environment
                     or locked_settings.mode_version != mode_version
@@ -490,12 +532,14 @@ async def _initial_bulk_sync_locked(
                         "updated": total_updated,
                         "skipped": total_skipped,
                         "unsupported_rows": unsupported_rows,
+                        "missing_quarantined": total_missing_quarantined,
+                        "archived": total_archived,
                         "snapshot_watermark": watermark,
                         "superseded_by_inbox": (latest_unresolved if superseded else None),
                     }
                 session.add(
                     SyncSnapshot(
-                        id=uuid.uuid4(),
+                        id=snapshot_id,
                         user_id=user_uuid,
                         environment=environment,
                         status="rejected" if superseded else "applied",
@@ -512,6 +556,8 @@ async def _initial_bulk_sync_locked(
                             "created": total_created,
                             "updated": total_updated,
                             "skipped": total_skipped,
+                            "missing_quarantined": total_missing_quarantined,
+                            "archived": total_archived,
                             "snapshot_watermark": watermark,
                             "superseded_by_inbox": (latest_unresolved if superseded else None),
                         },
@@ -528,10 +574,13 @@ async def _initial_bulk_sync_locked(
                     "created": total_created,
                     "updated": total_updated,
                     "skipped": total_skipped,
+                    "missing_quarantined": total_missing_quarantined,
+                    "archived": total_archived,
                 }
 
         except Exception as e:
             error_type = type(e).__name__
+            await session.rollback()
             # Update sync status to error - try with async session first, fallback to sync
             try:
                 update_stmt = (
@@ -543,7 +592,10 @@ async def _initial_bulk_sync_locked(
                 if sync_op:
                     sync_op.status = "failed"
                     sync_op.completed_at = datetime.utcnow()
-                    sync_op.operation_metadata = {"error_type": error_type}
+                    sync_op.operation_metadata = {
+                        "failure_code": "initial_bulk_failed",
+                        "error_type": error_type,
+                    }
                 await session.commit()
             except Exception as update_error:
                 # If async update fails, use sync connection as fallback
@@ -589,6 +641,7 @@ async def _process_products_chunk(
     blueprint_mapper,
     environment: str,
     snapshot_watermark: int,
+    snapshot_id: uuid.UUID,
 ) -> Dict[str, int]:
     """
     Process a chunk of products using optimized batch operations.
@@ -728,6 +781,7 @@ async def _process_products_chunk(
                         "sync_state": "synced",
                         "sync_uncertain_event_id": None,
                         "missing_snapshot_count": 0,
+                        "last_seen_snapshot_id": snapshot_id,
                         "updated_at": now,
                     }
                 )
@@ -748,6 +802,7 @@ async def _process_products_chunk(
                         "sync_uncertain_event_id": None,
                         "mapping_status": "mapped",
                         "missing_snapshot_count": 0,
+                        "last_seen_snapshot_id": snapshot_id,
                         "created_at": now,
                         "updated_at": now,
                     }
@@ -884,9 +939,7 @@ async def _process_webhook_notification_async(
     async with get_isolated_db_session() as session:
         inbox = (
             await session.execute(
-                select(WebhookInbox)
-                .where(WebhookInbox.webhook_id == webhook_id)
-                .with_for_update()
+                select(WebhookInbox).where(WebhookInbox.webhook_id == webhook_id).with_for_update()
             )
         ).scalar_one_or_none()
         if inbox is None or inbox.signature_valid is not True:

@@ -196,9 +196,7 @@ async def test_security_headers_include_hsts_in_production_mode():
 def test_webhook_signature_is_strict_base64_sha256():
     body = b'{"event":"inventory.updated"}'
     secret = "test-secret"
-    signature = base64.b64encode(
-        hmac.new(secret.encode(), body, hashlib.sha256).digest()
-    ).decode()
+    signature = base64.b64encode(hmac.new(secret.encode(), body, hashlib.sha256).digest()).decode()
     assert validate_webhook_signature(body, signature, secret)
     for malformed in ("not base64!", base64.b64encode(b"short").decode()):
         with pytest.raises(WebhookValidationError):
@@ -301,9 +299,7 @@ def test_maintenance_encrypts_plaintext_webhook_and_rotates_token_atomically_in_
 
 
 def test_celery_webhook_task_accepts_only_durable_inbox_identifier():
-    assert tuple(inspect.signature(process_webhook_notification).parameters) == (
-        "webhook_id",
-    )
+    assert tuple(inspect.signature(process_webhook_notification).parameters) == ("webhook_id",)
     assert tuple(inspect.signature(_process_webhook_notification_async).parameters) == (
         "webhook_id",
     )
@@ -317,9 +313,7 @@ def test_inventory_update_rejects_unbounded_or_nested_property_payloads():
     with pytest.raises(ValidationError):
         UpdateInventoryItemRequest.model_validate({"quantity": 2**31})
     with pytest.raises(ValidationError):
-        UpdateInventoryItemRequest.model_validate(
-            {"quantity": 1, "unexpected_mutation": True}
-        )
+        UpdateInventoryItemRequest.model_validate({"quantity": 1, "unexpected_mutation": True})
 
 
 def test_response_contract_keeps_execution_fences_visible_to_clients():
@@ -437,6 +431,8 @@ def test_staging_uses_the_same_transport_and_authentication_boundaries():
         PUBLIC_BASE_URL="https://staging-sync.ebartex.com",
         ALLOWED_ORIGINS="https://staging.ebartex.com",
         REDIS_URL="redis://brx-sync-redis:6379/0",
+        JWT_REQUIRE_ISSUER_AUDIENCE=True,
+        JWT_REQUIRE_JTI=True,
     )
     assert staging.jwt_require_issuer_audience is True
     assert staging.jwt_require_jti is True
@@ -543,7 +539,19 @@ async def test_task_status_does_not_expose_backend_exception_or_foreign_existenc
     )
     response = await get_task_status(task_id, user_id, _TaskSession(failed))
     assert response["error"] == "Task failed"
+    assert response["error_code"] == "task_failed"
     assert "private database" not in str(response)
+
+    rejected = SimpleNamespace(
+        status="failed",
+        operation_metadata={
+            "failure_code": "snapshot_rejected",
+            "result": {"problems": ["private export detail"]},
+        },
+    )
+    rejected_response = await get_task_status(task_id, user_id, _TaskSession(rejected))
+    assert rejected_response["error_code"] == "snapshot_rejected"
+    assert "private export detail" not in str(rejected_response)
 
     with pytest.raises(HTTPException) as missing:
         await get_task_status(task_id, user_id, _TaskSession(None))

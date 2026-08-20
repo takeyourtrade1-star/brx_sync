@@ -1,5 +1,7 @@
 """Unit coverage for fail-safe CardTrader webhook and snapshot semantics."""
 
+from datetime import datetime, timedelta, timezone
+
 from app.services import reconciler
 from app.services.webhook_ledger_processor import classify_order_webhook
 from app.services.webhook_processor import (
@@ -166,3 +168,49 @@ def test_only_cards_prints_mapping_can_enter_magic_inventory() -> None:
     assert mapping_problems == []
     assert [row["id"] for row in mapped] == ["10"]
     assert unsupported == 1
+
+
+def test_large_shrink_is_confirmed_by_three_recent_stable_exports() -> None:
+    now = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+    shrink_problem = ["set Magic implausibilmente ridotto: export=2033 baseline=2265 drop=232"]
+    prior = [
+        ("rejected", 2031, shrink_problem, now - timedelta(hours=6)),
+        ("rejected", 2033, shrink_problem, now - timedelta(hours=12)),
+    ]
+
+    assert reconciler._has_stable_shrink_confirmation(prior, 2030, now=now)
+
+
+def test_large_shrink_confirmation_stays_fail_closed_for_unstable_or_stale_exports() -> None:
+    now = datetime(2026, 8, 20, 8, 0, tzinfo=timezone.utc)
+    problem = ["set Magic implausibilmente ridotto: export=2000 baseline=2265 drop=265"]
+
+    assert not reconciler._has_stable_shrink_confirmation(
+        [("rejected", 2030, problem, now - timedelta(hours=6))],
+        2029,
+        now=now,
+    )
+    assert not reconciler._has_stable_shrink_confirmation(
+        [
+            ("rejected", 2030, problem, now - timedelta(hours=6)),
+            ("rejected", 1800, problem, now - timedelta(hours=12)),
+        ],
+        2029,
+        now=now,
+    )
+    assert not reconciler._has_stable_shrink_confirmation(
+        [
+            ("rejected", 2030, problem, now - timedelta(hours=6)),
+            ("rejected", 2029, problem, now - timedelta(hours=60)),
+        ],
+        2028,
+        now=now,
+    )
+    assert not reconciler._has_stable_shrink_confirmation(
+        [
+            ("applied", 2030, problem, now - timedelta(hours=6)),
+            ("rejected", 2029, problem, now - timedelta(hours=12)),
+        ],
+        2028,
+        now=now,
+    )

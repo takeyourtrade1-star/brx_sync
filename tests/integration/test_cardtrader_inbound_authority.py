@@ -408,6 +408,63 @@ async def test_new_product_is_not_created_from_snapshot_superseded_by_webhook(
 
 
 @pytest.mark.asyncio
+async def test_shared_missing_product_flow_quarantines_then_zeros_stale_rows(
+    test_session_factory,
+) -> None:
+    user_id = uuid.uuid4()
+    async with test_session_factory() as session, session.begin():
+        session.add(_settings(user_id))
+        item = _item(user_id, product_id="missing-from-export")
+        session.add(item)
+        await session.flush()
+        item_id = item.id
+
+    async with test_session_factory() as session, session.begin():
+        item = await session.get(UserInventoryItem, item_id)
+        first = await reconciler._apply_missing_products(
+            session,
+            local_items=[item],
+            present_ids=set(),
+            map_blueprint=_magic_mapper,
+            user_id=user_id,
+            environment="partial",
+            watermark=0,
+        )
+    assert first == {
+        "missing_quarantined": 1,
+        "archived": 0,
+        "skipped_unsafe": 0,
+    }
+
+    async with test_session_factory() as session, session.begin():
+        item = await session.get(UserInventoryItem, item_id)
+        assert item.lifecycle_status == "stale"
+        assert item.sync_state == "uncertain"
+        assert item.missing_snapshot_count == 1
+        second = await reconciler._apply_missing_products(
+            session,
+            local_items=[item],
+            present_ids=set(),
+            map_blueprint=_magic_mapper,
+            user_id=user_id,
+            environment="partial",
+            watermark=0,
+        )
+    assert second == {
+        "missing_quarantined": 0,
+        "archived": 1,
+        "skipped_unsafe": 0,
+    }
+
+    async with test_session_factory() as session:
+        item = await session.get(UserInventoryItem, item_id)
+        assert item.quantity == 0
+        assert item.lifecycle_status == "sold_out"
+        assert item.sync_state == "synced"
+        assert item.missing_snapshot_count == 2
+
+
+@pytest.mark.asyncio
 async def test_marketplace_listing_is_disabled_until_marker_clears(
     test_session_factory,
 ) -> None:
@@ -512,3 +569,40 @@ async def test_registered_reconcile_task_reaches_terminal_status(
         assert operation.status == "completed"
         assert operation.completed_at is not None
         assert operation.operation_metadata == {"result": {"status": "ok"}}
+
+
+@pytest.mark.asyncio
+async def test_periodic_registration_is_auditable_and_excludes_demo(
+    test_session_factory,
+    monkeypatch,
+) -> None:
+    partial_user = uuid.uuid4()
+    demo_user = uuid.uuid4()
+    async with test_session_factory() as session, session.begin():
+        session.add(_settings(partial_user))
+        demo_settings = _settings(demo_user)
+        demo_settings.execution_mode = "demo"
+        session.add(demo_settings)
+
+    @asynccontextmanager
+    async def isolated_test_session():
+        async with test_session_factory() as session, session.begin():
+            yield session
+
+    monkeypatch.setattr(periodic_sync, "get_isolated_db_session", isolated_test_session)
+
+    task_specs = await periodic_sync._register_active_reconciles_async()
+
+    assert [user_id for user_id, _task_id in task_specs] == [str(partial_user)]
+    async with test_session_factory() as session:
+        operations = list(
+            (
+                await session.execute(
+                    select(SyncOperation).where(SyncOperation.user_id == partial_user)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(operations) == 1
+        assert operations[0].operation_metadata == {"trigger": "periodic"}

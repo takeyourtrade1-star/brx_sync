@@ -15,7 +15,7 @@ import logging
 import math
 import uuid
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from sqlalchemy import and_, exists, func, or_, select, update
@@ -44,6 +44,10 @@ DETAIL_LIMIT = 50
 MISSING_CONFIRMATIONS_REQUIRED = 2
 SUSPICIOUS_DROP_RATIO = 0.10
 SUSPICIOUS_DROP_ABSOLUTE = 3
+SUSPICIOUS_SHRINK_CONFIRMATIONS_REQUIRED = 3
+SUSPICIOUS_SHRINK_COUNT_DRIFT_RATIO = 0.02
+SUSPICIOUS_SHRINK_COUNT_DRIFT_ABSOLUTE = 5
+SUSPICIOUS_SHRINK_CONFIRMATION_WINDOW = timedelta(hours=48)
 UNRESOLVED_INBOX_STATUSES = (
     "received",
     "processing",
@@ -445,31 +449,90 @@ async def _latest_unresolved_inbox_id(
     )
 
 
-async def _is_confirmed_suspicious_set(
+def _is_suspicious_shrink_problem(problems: Any) -> bool:
+    return bool(
+        isinstance(problems, list)
+        and any(
+            isinstance(problem, str) and problem.startswith("set Magic implausibilmente ridotto:")
+            for problem in problems
+        )
+    )
+
+
+def _has_stable_shrink_confirmation(
+    prior_snapshots: Iterable[tuple[str, int | None, Any, datetime]],
+    current_count: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Confirm a large shrink only after recent, consecutive, stable exports.
+
+    CardTrader inventories are live, so requiring an identical ID-set checksum
+    can deadlock forever while a seller keeps making small changes.  We retain
+    the fail-closed first observations, but accept the shrink only after three
+    consecutive exports (current plus two persisted rejections) agree within a
+    narrow count band.
+    """
+
+    rows = list(prior_snapshots)
+    required_prior = SUSPICIOUS_SHRINK_CONFIRMATIONS_REQUIRED - 1
+    if len(rows) != required_prior or current_count <= 0:
+        return False
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    cutoff = current_time - SUSPICIOUS_SHRINK_CONFIRMATION_WINDOW
+    counts = [current_count]
+
+    for status, product_count, problems, created_at in rows:
+        if status != "rejected" or not _is_suspicious_shrink_problem(problems):
+            return False
+        if not isinstance(product_count, int) or product_count <= 0:
+            return False
+        if not isinstance(created_at, datetime):
+            return False
+        created = created_at
+        if created.tzinfo is None or created.utcoffset() is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < cutoff or created > current_time + timedelta(minutes=5):
+            return False
+        counts.append(product_count)
+
+    allowed_drift = max(
+        SUSPICIOUS_SHRINK_COUNT_DRIFT_ABSOLUTE,
+        math.ceil(max(counts) * SUSPICIOUS_SHRINK_COUNT_DRIFT_RATIO),
+    )
+    return max(counts) - min(counts) <= allowed_drift
+
+
+async def _is_confirmed_suspicious_shrink(
     session: AsyncSession,
     user_id: uuid.UUID,
     environment: str,
-    checksum: str,
+    product_count: int,
 ) -> bool:
-    prior = (
-        await session.execute(
-            select(SyncSnapshot.problems_json)
-            .where(
-                SyncSnapshot.user_id == user_id,
-                SyncSnapshot.environment == environment,
-                SyncSnapshot.status == "rejected",
-                SyncSnapshot.checksum == checksum,
+    prior = list(
+        (
+            await session.execute(
+                select(
+                    SyncSnapshot.status,
+                    SyncSnapshot.product_count,
+                    SyncSnapshot.problems_json,
+                    SyncSnapshot.created_at,
+                )
+                .where(
+                    SyncSnapshot.user_id == user_id,
+                    SyncSnapshot.environment == environment,
+                )
+                .order_by(SyncSnapshot.created_at.desc())
+                .limit(SUSPICIOUS_SHRINK_CONFIRMATIONS_REQUIRED - 1)
             )
-            .order_by(SyncSnapshot.created_at.desc())
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    return bool(
-        isinstance(prior, list)
-        and any(
-            isinstance(problem, str) and problem.startswith("set Magic implausibilmente ridotto:")
-            for problem in prior
-        )
+        ).all()
+    )
+    return _has_stable_shrink_confirmation(
+        prior,
+        product_count,
     )
 
 
@@ -513,6 +576,12 @@ async def reconcile_user_report(
     normalized, shape_problems = normalize_magic_snapshot(raw_products)
     mapped, mapping_problems, unsupported = _filter_cards_prints(normalized, map_blueprint)
     previous_size = await _previous_snapshot_size(session, user_id, environment)
+    confirmed_shrink = await _is_confirmed_suspicious_shrink(
+        session,
+        user_id,
+        environment,
+        len(mapped),
+    )
     local_active = sum(
         1
         for item in local_items
@@ -522,6 +591,7 @@ async def reconcile_user_report(
         mapped,
         previous_size,
         local_active,
+        allow_confirmed_shrink=confirmed_shrink,
     )
     problems = shape_problems + mapping_problems + coverage_problems
     if not ok or problems:
@@ -560,6 +630,89 @@ def _eligible_inbound_state(snapshot_watermark: int):
             UserInventoryItem.sync_uncertain_event_id <= snapshot_watermark,
         ),
     )
+
+
+async def _apply_missing_products(
+    session: AsyncSession,
+    *,
+    local_items: Iterable[UserInventoryItem],
+    present_ids: set[str],
+    map_blueprint: BlueprintMapper,
+    user_id: uuid.UUID,
+    environment: str,
+    watermark: int,
+    progress_check: Callable[[], None] | None = None,
+) -> dict[str, int]:
+    """Quarantine then zero CardTrader rows absent from complete exports.
+
+    This is shared by initial imports and recurring reconciliation so a re-link
+    cannot leave stale local rows behind. Reserved or concurrently mutated rows
+    remain untouched through the same row-version and state predicates used by
+    the regular reconciler.
+    """
+
+    result_counts = {
+        "missing_quarantined": 0,
+        "archived": 0,
+        "skipped_unsafe": 0,
+    }
+    for index, local in enumerate(local_items, start=1):
+        if index % 500 == 0:
+            if progress_check is not None:
+                progress_check()
+            await session.flush()
+        pid = str(local.external_stock_id) if local.external_stock_id else ""
+        if not pid or pid in present_ids:
+            continue
+        mapping = map_blueprint(local.blueprint_id)
+        if (
+            getattr(local, "game_id", None) != MAGIC_GAME_ID
+            or mapping is None
+            or mapping[1] != MAGIC_MAPPING_TABLE
+        ):
+            continue
+
+        next_missing = int(local.missing_snapshot_count) + 1
+        if next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
+            values = {
+                "quantity": 0,
+                "lifecycle_status": "sold_out",
+                "sync_state": "synced",
+                "sync_uncertain_event_id": None,
+                "missing_snapshot_count": next_missing,
+                "row_version": UserInventoryItem.row_version + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        else:
+            values = {
+                "lifecycle_status": "stale",
+                "sync_state": "uncertain",
+                "sync_uncertain_event_id": max(watermark, 0),
+                "missing_snapshot_count": next_missing,
+                "row_version": UserInventoryItem.row_version + 1,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        update_result = await session.execute(
+            update(UserInventoryItem)
+            .where(
+                UserInventoryItem.id == local.id,
+                UserInventoryItem.user_id == user_id,
+                UserInventoryItem.environment == environment,
+                UserInventoryItem.source == "cardtrader",
+                UserInventoryItem.row_version == local.row_version,
+                UserInventoryItem.reserved_quantity == 0,
+                _eligible_inbound_state(watermark),
+            )
+            .values(**values)
+        )
+        if update_result.rowcount == 0:
+            result_counts["skipped_unsafe"] += 1
+        elif next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
+            result_counts["archived"] += 1
+        else:
+            result_counts["missing_quarantined"] += 1
+
+    return result_counts
 
 
 async def _quarantine_non_magic_legacy(
@@ -654,7 +807,12 @@ async def _reconcile_user_apply_locked(
     mapped, mapping_problems, unsupported = _filter_cards_prints(normalized, map_blueprint)
     checksum = _snapshot_id_set_checksum(mapped)
     previous_size = await _previous_snapshot_size(session, user_id, environment)
-    confirmed_shrink = await _is_confirmed_suspicious_set(session, user_id, environment, checksum)
+    confirmed_shrink = await _is_confirmed_suspicious_shrink(
+        session,
+        user_id,
+        environment,
+        len(mapped),
+    )
     local_active = sum(
         1
         for item in local_items
@@ -668,6 +826,18 @@ async def _reconcile_user_apply_locked(
     )
     problems = shape_problems + mapping_problems + coverage_problems
     if not ok or problems:
+        await session.execute(
+            update(UserSyncSettings)
+            .where(
+                UserSyncSettings.user_id == user_id,
+                UserSyncSettings.execution_mode == environment,
+                UserSyncSettings.sync_status == "active",
+            )
+            .values(
+                last_error="snapshot_rejected",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
         await _record_snapshot(
             session,
             snapshot_id=snapshot_id,
@@ -820,58 +990,19 @@ async def _reconcile_user_apply_locked(
             else:
                 applied["updated"] += 1
 
-        for index, (pid, local) in enumerate(local_by_pid.items(), start=1):
-            if index % 500 == 0:
-                _assert_mutation_lease(mutation_lease, lost_lease)
-            if pid in ct_by_pid:
-                continue
-            mapping = map_blueprint(local.blueprint_id)
-            if (
-                getattr(local, "game_id", None) != MAGIC_GAME_ID
-                or mapping is None
-                or mapping[1] != MAGIC_MAPPING_TABLE
-            ):
-                continue
-
-            next_missing = int(local.missing_snapshot_count) + 1
-            if next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
-                values = {
-                    "quantity": 0,
-                    "lifecycle_status": "sold_out",
-                    "sync_state": "synced",
-                    "sync_uncertain_event_id": None,
-                    "missing_snapshot_count": next_missing,
-                    "row_version": UserInventoryItem.row_version + 1,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            else:
-                values = {
-                    "lifecycle_status": "stale",
-                    "sync_state": "uncertain",
-                    "sync_uncertain_event_id": max(watermark, 0),
-                    "missing_snapshot_count": next_missing,
-                    "row_version": UserInventoryItem.row_version + 1,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            result = await session.execute(
-                update(UserInventoryItem)
-                .where(
-                    UserInventoryItem.id == local.id,
-                    UserInventoryItem.user_id == user_id,
-                    UserInventoryItem.environment == environment,
-                    UserInventoryItem.source == "cardtrader",
-                    UserInventoryItem.row_version == local.row_version,
-                    UserInventoryItem.reserved_quantity == 0,
-                    _eligible_inbound_state(watermark),
-                )
-                .values(**values)
-            )
-            if result.rowcount == 0:
-                applied["skipped_unsafe"] += 1
-            elif next_missing >= MISSING_CONFIRMATIONS_REQUIRED:
-                applied["archived"] += 1
-            else:
-                applied["missing_quarantined"] += 1
+        missing_result = await _apply_missing_products(
+            session,
+            local_items=local_by_pid.values(),
+            present_ids=set(ct_by_pid),
+            map_blueprint=map_blueprint,
+            user_id=user_id,
+            environment=environment,
+            watermark=watermark,
+            progress_check=lambda: _assert_mutation_lease(mutation_lease, lost_lease),
+        )
+        for metric, value in missing_result.items():
+            applied[metric] += value
+        _assert_mutation_lease(mutation_lease, lost_lease)
 
         settings_now.last_sync_at = datetime.now(timezone.utc)
         settings_now.last_error = None

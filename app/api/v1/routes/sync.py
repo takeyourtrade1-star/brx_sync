@@ -73,6 +73,21 @@ settings = get_settings()
 
 _ACTIVE_OUTBOX_STATUSES = ("pending", "running", "accepted")
 _POLICY_BLOCKING_OUTBOX_STATUSES = ("pending", "running", "accepted", "uncertain")
+_SAFE_TASK_FAILURE_MESSAGES = {
+    "snapshot_rejected": (
+        "CardTrader inventory snapshot was rejected for safety; "
+        "retry after the next complete export"
+    ),
+    "reconcile_deferred": "Synchronization was deferred because the account state changed",
+    "reconcile_superseded": "Synchronization was superseded by a newer CardTrader event",
+    "reconcile_locked": "Another synchronization is already running",
+    "reconcile_skipped": "Synchronization is not enabled for this account mode",
+    "dispatch_failed": "Synchronization could not be queued",
+    "initial_bulk_failed": "Initial CardTrader import failed",
+    "reconcile_failed": "CardTrader reconciliation failed",
+    "enqueue_failed": "Synchronization could not be queued",
+    "task_failed": "Task failed",
+}
 
 
 class WebhookBodyTooLarge(ValueError):
@@ -206,7 +221,10 @@ async def _mark_enqueue_failed(
         .values(
             status="failed",
             completed_at=datetime.utcnow(),
-            operation_metadata={"enqueue_error_type": type(error).__name__},
+            operation_metadata={
+                "failure_code": "enqueue_failed",
+                "error_type": type(error).__name__,
+            },
         )
     )
     await session.execute(
@@ -264,11 +282,7 @@ async def start_sync(
     # This row is the per-user admission mutex. Keep it locked through the
     # active-operation check and durable task registration so two API workers
     # cannot both publish bulk/reconcile work for the same user.
-    stmt = (
-        select(UserSyncSettings)
-        .where(UserSyncSettings.user_id == user_uuid)
-        .with_for_update()
-    )
+    stmt = select(UserSyncSettings).where(UserSyncSettings.user_id == user_uuid).with_for_update()
     result = await session.execute(stmt)
     sync_settings = result.scalar_one_or_none()
 
@@ -343,7 +357,7 @@ async def start_sync(
             .values(
                 status="failed",
                 completed_at=datetime.now(timezone.utc),
-                operation_metadata={"error": "stale operation recovered by API"},
+                operation_metadata={"failure_code": "reconcile_failed"},
             )
         )
         status_value = SyncStatusEnum.ERROR.value
@@ -454,7 +468,7 @@ async def get_task_status(
         if sync_op.status in {"completed", "failed", "uncertain", "cancelled"}:
             successful = sync_op.status == "completed"
             metadata = sync_op.operation_metadata or {}
-            
+
             # Direct keys (bulk_sync)
             processed = metadata.get("processed")
             created = metadata.get("created")
@@ -479,22 +493,37 @@ async def get_task_status(
                             + int(applied.get("unsupported_export_rows", 0))
                         )
                 if total_products is None:
-                    total_products = result_obj.get("magic_export_size") or result_obj.get("export_size")
+                    total_products = result_obj.get("magic_export_size") or result_obj.get(
+                        "export_size"
+                    )
                 if processed is None and created is not None and updated is not None:
                     processed = int(created) + int(updated) + int(skipped or 0)
 
+            error_code = None
             error_msg = None
             if not successful:
-                error_val = metadata.get("error")
-                error_msg = str(error_val) if error_val else "Task failed"
+                candidate_code = metadata.get("failure_code")
+                error_code = (
+                    str(candidate_code)
+                    if isinstance(candidate_code, str)
+                    and candidate_code in _SAFE_TASK_FAILURE_MESSAGES
+                    else "task_failed"
+                )
+                error_msg = _SAFE_TASK_FAILURE_MESSAGES[error_code]
 
             safe_result = {
                 "processed": int(processed) if isinstance(processed, (int, float)) else 0,
                 "created": int(created) if isinstance(created, (int, float)) else 0,
                 "updated": int(updated) if isinstance(updated, (int, float)) else 0,
                 "skipped": int(skipped) if isinstance(skipped, (int, float)) else 0,
-                "total_products": int(total_products) if isinstance(total_products, (int, float)) else (int(processed) if isinstance(processed, (int, float)) else 0),
-                "progress_percent": int(progress_percent) if isinstance(progress_percent, (int, float)) else 100,
+                "total_products": (
+                    int(total_products)
+                    if isinstance(total_products, (int, float))
+                    else (int(processed) if isinstance(processed, (int, float)) else 0)
+                ),
+                "progress_percent": (
+                    int(progress_percent) if isinstance(progress_percent, (int, float)) else 100
+                ),
             }
             return {
                 "task_id": normalized_task_id,
@@ -502,9 +531,11 @@ async def get_task_status(
                 "ready": True,
                 "result": safe_result if successful else None,
                 "error": error_msg,
+                "error_code": error_code,
                 "message": (
                     "Task completed successfully"
-                    if successful else (error_msg or "Task could not be completed")
+                    if successful
+                    else (error_msg or "Task could not be completed")
                 ),
             }
 
@@ -656,9 +687,7 @@ async def get_sync_status(
         ),
         last_sync_at=sync_settings.last_sync_at.isoformat() if sync_settings.last_sync_at else None,
         last_error=(
-            "Synchronization failed; retry or contact support"
-            if sync_settings.last_error
-            else None
+            "Synchronization failed; retry or contact support" if sync_settings.last_error else None
         ),
         disconnected=disconnected if disconnected else None,
         execution_mode=sync_settings.execution_mode,
@@ -866,9 +895,7 @@ async def receive_webhook(
                 detail="Webhook secret not configured",
             )
         try:
-            locked_secret = encryption_manager.decrypt_at_rest_secret(
-                locked_stored_secret
-            )
+            locked_secret = encryption_manager.decrypt_at_rest_secret(locked_stored_secret)
             verify_webhook(body, signature_header, locked_secret)
         except (WebhookValidationError, ValueError) as exc:
             raise HTTPException(
@@ -914,9 +941,7 @@ async def receive_webhook(
                 detail="Webhook ID collision",
             )
         if not locked_stored_secret.startswith("fernet:"):
-            sync_settings.webhook_secret = encryption_manager.encrypt_at_rest_secret(
-                locked_secret
-            )
+            sync_settings.webhook_secret = encryption_manager.encrypt_at_rest_secret(locked_secret)
         if inserted_id is None and inbox.status in ("completed", "ignored"):
             await session.commit()
             elapsed = (time.time() - start_time) * 1000
@@ -1145,9 +1170,7 @@ async def setup_test_user(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail="CardTrader ha restituito credenziali non valide.",
             )
-        webhook_secret_encrypted = encryption_manager.encrypt_at_rest_secret(
-            webhook_secret
-        )
+        webhook_secret_encrypted = encryption_manager.encrypt_at_rest_secret(webhook_secret)
 
         # Create or update sync settings
         stmt = (
