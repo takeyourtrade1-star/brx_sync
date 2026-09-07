@@ -13,6 +13,7 @@ from alembic import context
 
 # Import models for autogenerate
 from app.models.inventory import Base
+from app.models import catalog  # noqa: F401 - register catalog tables in metadata
 from app.core.config import get_settings
 
 # this is the Alembic Config object

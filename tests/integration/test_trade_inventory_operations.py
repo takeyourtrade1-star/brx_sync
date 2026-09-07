@@ -926,7 +926,7 @@ async def test_reconciler_does_not_change_active_escrow_or_trade_rows(
             sync_settings,
             lambda blueprint_id: (blueprint_id, "cards_prints"),
         )
-        assert result["applied"] == {
+        expected_applied = {
             "updated": 1,
             "created": 0,
             "sold_out": 0,
@@ -937,9 +937,41 @@ async def test_reconciler_does_not_change_active_escrow_or_trade_rows(
             "unsupported_export_rows": 0,
             "legacy_non_magic_quarantined": 0,
         }
+        assert {
+            key: result["applied"][key]
+            for key in expected_applied
+        } == expected_applied
+        assert {
+            key: result["applied"][key]
+            for key in (
+                "raw_rows",
+                "raw_copies",
+                "imported_rows",
+                "imported_copies",
+                "unmapped_rows",
+                "unmapped_copies",
+                "quarantined_rows",
+                "quarantined_copies",
+                "incomplete",
+            )
+        } == {
+            "raw_rows": 1,
+            "raw_copies": 1,
+            "imported_rows": 1,
+            "imported_copies": 1,
+            "unmapped_rows": 0,
+            "unmapped_copies": 0,
+            "quarantined_rows": 0,
+            "quarantined_copies": 0,
+            "incomplete": False,
+        }
 
     async with test_session_factory() as session:
         linked_row = await session.get(UserInventoryItem, linked_id)
         internal_row = await session.get(UserInventoryItem, internal_id)
         assert linked_row.quantity == 1
+        assert linked_row.reserved_quantity == 0
+        assert linked_row.sync_state == "synced"
         assert internal_row.quantity == 3
+        assert internal_row.reserved_quantity == 0
+        assert internal_row.sync_state == "synced"

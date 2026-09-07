@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from uuid import UUID
 
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -569,7 +569,10 @@ async def reserve_inventory(
                         UserInventoryItem.sync_uncertain_event_id.is_(None),
                         or_(
                             UserInventoryItem.source != "cardtrader",
-                            UserInventoryItem.game_id == 1,
+                            and_(
+                                UserInventoryItem.game_id == 1,
+                                UserInventoryItem.mapping_status == "mapped",
+                            ),
                         ),
                         UserInventoryItem.quantity >= requested.quantity,
                     )

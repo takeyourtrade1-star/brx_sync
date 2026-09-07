@@ -7,7 +7,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from sqlalchemy import and_, func, or_, select, text, update
@@ -49,6 +49,7 @@ from app.models.inventory import (
     CardTraderOutbox,
     InventoryOperation,
     SyncOperation,
+    SyncSnapshot,
     SyncStatusEnum,
     UserInventoryItem,
     UserSyncSettings,
@@ -71,6 +72,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sync", tags=["sync"])
 settings = get_settings()
 
+_CATALOG_METADATA_KEY = "_cardtrader_catalog"
+
 _ACTIVE_OUTBOX_STATUSES = ("pending", "running", "accepted")
 _POLICY_BLOCKING_OUTBOX_STATUSES = ("pending", "running", "accepted", "uncertain")
 _SAFE_TASK_FAILURE_MESSAGES = {
@@ -92,6 +95,115 @@ _SAFE_TASK_FAILURE_MESSAGES = {
 
 class WebhookBodyTooLarge(ValueError):
     pass
+
+
+async def _load_inventory_metrics(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    environment: str,
+) -> dict[str, int | bool]:
+    """Expose snapshot coverage and current quarantine counts to clients."""
+
+    latest = (
+        await session.execute(
+            select(SyncSnapshot.result_json)
+            .where(
+                SyncSnapshot.user_id == user_id,
+                SyncSnapshot.environment == environment,
+                SyncSnapshot.status == "applied",
+            )
+            .order_by(SyncSnapshot.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    stored = None
+    if isinstance(latest, dict):
+        nested_metrics = latest.get("metrics")
+        stored = nested_metrics if isinstance(nested_metrics, dict) else latest
+    metrics: dict[str, int | bool] = {
+        key: int(stored.get(key, 0))
+        for key in (
+            "raw_rows",
+            "raw_copies",
+            "imported_rows",
+            "imported_copies",
+            "unmapped_rows",
+            "unmapped_copies",
+        )
+        if isinstance(stored, dict)
+        and isinstance(stored.get(key), (int, float))
+        and not isinstance(stored.get(key), bool)
+    }
+
+    scope = [
+        UserInventoryItem.user_id == user_id,
+        UserInventoryItem.source == "cardtrader",
+        UserInventoryItem.environment == environment,
+    ]
+    mapped_scope = [
+        *scope,
+        UserInventoryItem.mapping_status == "mapped",
+        UserInventoryItem.lifecycle_status.in_(["active", "sold_out"]),
+        UserInventoryItem.sync_state == "synced",
+        UserInventoryItem.sync_uncertain_event_id.is_(None),
+    ]
+    unmapped_scope = [
+        *scope,
+        UserInventoryItem.game_id == 1,
+        UserInventoryItem.lifecycle_status.in_(["active", "sold_out"]),
+        UserInventoryItem.sync_state == "synced",
+        UserInventoryItem.sync_uncertain_event_id.is_(None),
+        UserInventoryItem.mapping_status != "mapped",
+    ]
+    quarantine_scope = [
+        *scope,
+        or_(
+            UserInventoryItem.game_id.is_(None),
+            UserInventoryItem.game_id != 1,
+            UserInventoryItem.lifecycle_status.in_(["stale", "sync_failed", "pending_delete"]),
+            UserInventoryItem.sync_state != "synced",
+            UserInventoryItem.sync_uncertain_event_id.is_not(None),
+            and_(
+                UserInventoryItem.mapping_status != "mapped",
+                or_(
+                    UserInventoryItem.lifecycle_status.notin_(
+                        ["active", "sold_out"]
+                    ),
+                    UserInventoryItem.game_id != 1,
+                ),
+            ),
+        ),
+    ]
+
+    async def _count_and_copies(filters: list) -> tuple[int, int]:
+        row = (
+            await session.execute(
+                select(
+                    func.count(),
+                    func.coalesce(func.sum(UserInventoryItem.quantity), 0),
+                )
+                .select_from(UserInventoryItem)
+                .where(*filters)
+            )
+        ).one()
+        return int(row[0] or 0), int(row[1] or 0)
+
+    mapped_rows, mapped_copies = await _count_and_copies(mapped_scope)
+    unmapped_rows, unmapped_copies = await _count_and_copies(unmapped_scope)
+    quarantined_rows, quarantined_copies = await _count_and_copies(quarantine_scope)
+    # Snapshot raw counts are historical evidence.  Imported/unmapped counts
+    # are live projections so they clear when the catalog worker resolves a
+    # blueprint without waiting for another CardTrader export.
+    metrics["imported_rows"] = mapped_rows
+    metrics["imported_copies"] = mapped_copies
+    metrics["unmapped_rows"] = unmapped_rows
+    metrics["unmapped_copies"] = unmapped_copies
+    metrics["quarantined_rows"] = quarantined_rows
+    metrics["quarantined_copies"] = quarantined_copies
+    metrics["incomplete"] = bool(
+        metrics.get("unmapped_rows", 0) or metrics.get("quarantined_rows", 0)
+    )
+    return metrics
 
 
 async def _read_webhook_body(request: Request) -> bytes:
@@ -149,6 +261,14 @@ async def _assert_no_unresolved_inventory_mutation(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Oggetto non riconciliato come Magic; modifica CardTrader bloccata.",
+        )
+    if item.source == "cardtrader" and item.mapping_status != "mapped":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Dati carta ancora in aggiornamento; pubblicazione/modifica "
+                "CardTrader bloccata fino al completamento del catalogo."
+            ),
         )
     if item.sync_state != "synced" or item.sync_uncertain_event_id is not None:
         raise HTTPException(
@@ -476,6 +596,20 @@ async def get_task_status(
             skipped = metadata.get("skipped")
             total_products = metadata.get("total_products")
             progress_percent = metadata.get("progress_percent", 100 if successful else 0)
+            coverage_metrics = {
+                key: metadata.get(key)
+                for key in (
+                    "raw_rows",
+                    "raw_copies",
+                    "imported_rows",
+                    "imported_copies",
+                    "unmapped_rows",
+                    "unmapped_copies",
+                    "quarantined_rows",
+                    "quarantined_copies",
+                    "incomplete",
+                )
+            }
 
             # Reconcile result structure (nested under result -> applied)
             result_obj = metadata.get("result")
@@ -496,6 +630,19 @@ async def get_task_status(
                     total_products = result_obj.get("magic_export_size") or result_obj.get(
                         "export_size"
                     )
+                result_metrics = result_obj.get("metrics")
+                metric_sources = (
+                    [result_metrics, result_obj]
+                    if isinstance(result_metrics, dict)
+                    else [result_obj]
+                )
+                for key in coverage_metrics:
+                    if coverage_metrics[key] is not None:
+                        continue
+                    for source in metric_sources:
+                        if isinstance(source, dict) and key in source:
+                            coverage_metrics[key] = source.get(key)
+                            break
                 if processed is None and created is not None and updated is not None:
                     processed = int(created) + int(updated) + int(skipped or 0)
 
@@ -524,6 +671,18 @@ async def get_task_status(
                 "progress_percent": (
                     int(progress_percent) if isinstance(progress_percent, (int, float)) else 100
                 ),
+                **{
+                    key: (
+                        bool(value)
+                        if key == "incomplete" and isinstance(value, bool)
+                        else int(value)
+                        if isinstance(value, (int, float)) and not isinstance(value, bool)
+                        else False
+                        if key == "incomplete"
+                        else 0
+                    )
+                    for key, value in coverage_metrics.items()
+                },
             }
             return {
                 "task_id": normalized_task_id,
@@ -609,14 +768,41 @@ async def get_sync_progress(
 
     # Extract progress from metadata
     metadata = sync_op.operation_metadata or {}
-    progress_pct = metadata.get("progress_percent", 0)
-    total_chunks = metadata.get("total_chunks", 0)
-    processed_chunks = metadata.get("processed_chunks", 0)
-    total_products = metadata.get("total_products", 0)
-    processed = metadata.get("processed", 0)
-    created = metadata.get("created", 0)
-    updated = metadata.get("updated", 0)
-    skipped = metadata.get("skipped", 0)
+    nested_result = metadata.get("result")
+    nested_metadata = nested_result if isinstance(nested_result, dict) else {}
+
+    def _metadata_value(key: str, default: Any = 0) -> Any:
+        value = metadata.get(key)
+        if value is not None:
+            return value
+        return nested_metadata.get(key, default)
+
+    progress_pct = _metadata_value("progress_percent", 0)
+    total_chunks = _metadata_value("total_chunks", 0)
+    processed_chunks = _metadata_value("processed_chunks", 0)
+    total_products = _metadata_value("total_products", 0)
+    processed = _metadata_value("processed", 0)
+    created = _metadata_value("created", 0)
+    updated = _metadata_value("updated", 0)
+    skipped = _metadata_value("skipped", 0)
+    coverage_metrics = {
+        key: _metadata_value(key, 0)
+        for key in (
+            "raw_rows",
+            "raw_copies",
+            "imported_rows",
+            "imported_copies",
+            "unmapped_rows",
+            "unmapped_copies",
+            "quarantined_rows",
+            "quarantined_copies",
+        )
+    }
+    coverage_metrics["incomplete"] = bool(
+        _metadata_value("incomplete", False)
+        or coverage_metrics["unmapped_rows"]
+        or coverage_metrics["quarantined_rows"]
+    )
 
     return {
         "user_id": user_id,
@@ -630,6 +816,7 @@ async def get_sync_progress(
         "created": created,
         "updated": updated,
         "skipped": skipped,
+        **coverage_metrics,
         "created_at": sync_op.created_at.isoformat() if sync_op.created_at else None,
         "completed_at": sync_op.completed_at.isoformat() if sync_op.completed_at else None,
     }
@@ -678,6 +865,12 @@ async def get_sync_status(
     except Exception:
         disconnected = True
 
+    metrics = await _load_inventory_metrics(
+        session,
+        user_uuid,
+        str(sync_settings.execution_mode),
+    )
+
     return SyncStatusResponse(
         user_id=user_id,
         sync_status=(
@@ -693,6 +886,7 @@ async def get_sync_status(
         execution_mode=sync_settings.execution_mode,
         mode_version=sync_settings.mode_version,
         writes_enabled=sync_settings.writes_enabled,
+        **metrics,
     )
 
 
@@ -1746,6 +1940,7 @@ async def get_listings_by_blueprint(
             UserInventoryItem.blueprint_id == blueprint_id,
             UserInventoryItem.source == "cardtrader",
             UserInventoryItem.game_id == 1,
+            UserInventoryItem.mapping_status == "mapped",
             UserInventoryItem.environment == "real",
             UserInventoryItem.lifecycle_status == "active",
             UserInventoryItem.sync_state == "synced",
@@ -1797,6 +1992,10 @@ async def get_inventory(
     limit: int = Query(default=100, ge=1, le=200),
     offset: int = Query(default=0, ge=0, le=10_000),
     include_history: bool = False,
+    include_anomalies: bool = Query(
+        default=False,
+        description="Include unmapped/quarantined CardTrader rows for diagnostics",
+    ),
     verified_user_id: str = Depends(verify_user_id_match),
     session: AsyncSession = Depends(get_db_session),
 ) -> InventoryResponse:
@@ -1824,14 +2023,27 @@ async def get_inventory(
             select(UserSyncSettings.execution_mode).where(UserSyncSettings.user_id == user_uuid)
         )
     ).scalar_one_or_none() or "demo"
+    show_anomalies = include_history or include_anomalies
+    cardtrader_scope = and_(
+        UserInventoryItem.source == "cardtrader",
+        UserInventoryItem.environment == settings_mode,
+    )
+    if not show_anomalies:
+        cardtrader_scope = and_(
+            cardtrader_scope,
+            # Current CT stock remains visible while catalog enrichment is
+            # pending.  Mapping status is enforced by publication/reservation
+            # gates, never by hiding the authoritative quantity here.
+            UserInventoryItem.game_id == 1,
+            UserInventoryItem.lifecycle_status.in_(["active", "sold_out"]),
+            UserInventoryItem.sync_state == "synced",
+            UserInventoryItem.sync_uncertain_event_id.is_(None),
+        )
     inventory_filters = [
         UserInventoryItem.user_id == user_uuid,
         or_(
             UserInventoryItem.source == "trade",
-            and_(
-                UserInventoryItem.source == "cardtrader",
-                UserInventoryItem.environment == settings_mode,
-            ),
+            cardtrader_scope,
             and_(
                 UserInventoryItem.source == "internal_test",
                 UserInventoryItem.environment == "demo",
@@ -1865,6 +2077,7 @@ async def get_inventory(
             InventoryItemResponse(
                 id=item.id,
                 blueprint_id=item.blueprint_id,
+                game_id=item.game_id,
                 quantity=item.quantity,
                 reserved_quantity=item.reserved_quantity,
                 price_cents=item.price_cents,
@@ -1879,12 +2092,25 @@ async def get_inventory(
                 description=item.description,
                 user_data_field=item.user_data_field,
                 graded=item.graded,
+                catalog_metadata=(
+                    item.properties.get(_CATALOG_METADATA_KEY)
+                    if isinstance(item.properties, dict)
+                    and isinstance(item.properties.get(_CATALOG_METADATA_KEY), dict)
+                    else None
+                ),
                 updated_at=item.updated_at.isoformat(),
                 created_at=item.created_at.isoformat() if item.created_at else None,
             )
             for item in items
         ],
         total=total,
+        # Coverage metrics are needed by the first page for the summary;
+        # avoid repeating the snapshot/count queries for every paginated page.
+        **(
+            await _load_inventory_metrics(session, user_uuid, str(settings_mode))
+            if offset == 0
+            else {}
+        ),
     )
 
 

@@ -51,6 +51,8 @@ cleanup() {
   unset SYNC_MIGRATION_DB_HOST SYNC_MIGRATION_DB_NAME
   unset SYNC_MIGRATION_DB_USER SYNC_MIGRATION_DB_PASSWORD
   unset MYSQL_HOST MYSQL_USER MYSQL_PASSWORD MYSQL_DATABASE
+  unset CATALOG_MYSQL_WRITER_USER CATALOG_MYSQL_WRITER_PASSWORD
+  unset CATALOG_MEILISEARCH_URL CATALOG_MEILISEARCH_API_KEY
   unset REDIS_URL
   unset FERNET_KEY
   unset JWT_PUBLIC_KEY
@@ -257,6 +259,21 @@ export ENVIRONMENT="production"
 export DEBUG="false"
 export AWS_SSM_ENABLED="false"   # I segreti sono già stati caricati sopra
 export MYSQL_PORT="3306"
+export CATALOG_IMPORT_ENABLED="${CATALOG_IMPORT_ENABLED:-false}"
+export CATALOG_MYSQL_WRITE_ENABLED="${CATALOG_MYSQL_WRITE_ENABLED:-false}"
+export CATALOG_SEARCH_PUBLISH_ENABLED="${CATALOG_SEARCH_PUBLISH_ENABLED:-false}"
+if [[ "$CATALOG_SEARCH_PUBLISH_ENABLED" == "true" ]]; then
+  export CATALOG_MEILISEARCH_URL="${CATALOG_MEILISEARCH_URL:-$(get_ssm "/prod/ebartex/catalog_meilisearch_url")}"
+  export CATALOG_MEILISEARCH_API_KEY="${CATALOG_MEILISEARCH_API_KEY:-$(get_ssm "/prod/ebartex/catalog_meilisearch_key")}"
+fi
+if [[ "$CATALOG_MYSQL_WRITE_ENABLED" == "true" ]]; then
+  export CATALOG_MYSQL_WRITER_USER="${CATALOG_MYSQL_WRITER_USER:-$(get_ssm "/prod/ebartex/catalog_mysql_writer_user")}"
+  export CATALOG_MYSQL_WRITER_PASSWORD="${CATALOG_MYSQL_WRITER_PASSWORD:-$(get_ssm "/prod/ebartex/catalog_mysql_writer_password")}"
+  [[ -n "${CATALOG_MYSQL_WRITER_USER:-}" && -n "${CATALOG_MYSQL_WRITER_PASSWORD:-}" ]] \
+    || { log_err "Catalog writer requires dedicated CATALOG_MYSQL_WRITER_USER/PASSWORD"; exit 1; }
+  [[ "$CATALOG_MYSQL_WRITER_USER" != "root" && "$CATALOG_MYSQL_WRITER_USER" != "admin" && "$CATALOG_MYSQL_WRITER_USER" != "brx_bd_admin" ]] \
+    || { log_err "Catalog MySQL writer role must be dedicated and least-privilege"; exit 1; }
+fi
 export ALLOWED_ORIGINS="https://www.ebartex.com,https://ebartex.com"
 export TRUSTED_HOSTS="${TRUSTED_HOSTS:-sync.ebartex.com,brx-sync-api,localhost,127.0.0.1}"
 export JWT_ISSUER="${JWT_ISSUER:-ebartex-auth}"
@@ -287,7 +304,7 @@ log_ok "Immagine aggiornata"
 
 # Migrations and credential rewrites run without old API/worker processes racing
 # on the shared tables. Redis remains available and durable.
-docker compose -f "$COMPOSE_FILE" stop brx-sync-api brx-sync-worker
+docker compose -f "$COMPOSE_FILE" stop brx-sync-api brx-sync-worker brx-sync-catalog-worker
 
 log_header "MIGRAZIONI DATABASE"
 
@@ -303,8 +320,9 @@ unset FERNET_PREVIOUS_KEYS
 # ── Avvio container ───────────────────────────────────────────────────────────
 log_header "AVVIO CONTAINER"
 
-log_step "Avvio brx-sync (API + worker + redis)..."
-docker compose -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
+log_step "Avvio brx-sync (API + worker + catalog worker + redis)..."
+docker compose -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans \
+  brx-sync-api brx-sync-worker brx-sync-catalog-worker brx-sync-redis
 log_ok "Container avviati"
 
 # ── Health check ──────────────────────────────────────────────────────────────
@@ -322,7 +340,7 @@ for i in $(seq 1 20); do
 done
 if [[ "$ready" != "true" ]]; then
   log_err "Readiness non raggiunta; deploy fallito"
-  docker compose -f "$COMPOSE_FILE" logs --tail=80 brx-sync-api brx-sync-worker
+  docker compose -f "$COMPOSE_FILE" logs --tail=80 brx-sync-api brx-sync-worker brx-sync-catalog-worker
   exit 1
 fi
 log_ok "API e dipendenze sono ready"
@@ -343,5 +361,6 @@ echo "  Region:      ${AWS_REGION}"
 echo ""
 echo "  Log live:    docker compose -f ${COMPOSE_FILE} logs -f brx-sync-api"
 echo "  Worker log:  docker compose -f ${COMPOSE_FILE} logs -f brx-sync-worker"
+echo "  Catalog log: docker compose -f ${COMPOSE_FILE} logs -f brx-sync-catalog-worker"
 echo "  Stop:        docker compose -f ${COMPOSE_FILE} down"
 echo ""

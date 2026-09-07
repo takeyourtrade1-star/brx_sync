@@ -5,7 +5,6 @@ Uses Redis cache for performance.
 import logging
 from typing import Optional, Tuple, Dict
 
-from app.core.database import get_mysql_connection
 from app.core.redis_client import get_redis_sync
 
 logger = logging.getLogger(__name__)
@@ -15,7 +14,7 @@ class BlueprintMapper:
     """Maps CardTrader blueprint_id to Ebartex print_id and table name."""
 
     CACHE_TTL = 86400  # 24 hours
-    CACHE_PREFIX = "blueprint_mapping:"
+    CACHE_PREFIX = "blueprint_mapping:v2:"
 
     def __init__(self):
         self.redis = get_redis_sync()
@@ -32,10 +31,14 @@ class BlueprintMapper:
         if cached:
             try:
                 # Format: "print_id:table_name"
+                if isinstance(cached, bytes):
+                    cached = cached.decode("ascii")
                 parts = cached.split(":", 1)
-                if len(parts) == 2:
+                if len(parts) == 2 and parts[1] in {
+                    "cards_prints", "op_prints", "pk_prints", "sealed_products"
+                } and int(parts[0]) > 0:
                     return int(parts[0]), parts[1]
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, UnicodeDecodeError):
                 logger.warning("Invalid blueprint cache record; ignoring it")
         
         return None
@@ -46,63 +49,42 @@ class BlueprintMapper:
         value = f"{print_id}:{table_name}"
         self.redis.setex(key, self.CACHE_TTL, value)
 
-    def _query_mysql(self, blueprint_id: int) -> Optional[Tuple[int, str]]:
-        """
-        Query MySQL database for blueprint_id mapping.
-        Returns (print_id, table_name) or None if not found.
-        """
+    def _query_many(self, blueprint_ids: list[int]) -> Dict[int, Optional[Tuple[int, str]]]:
+        """Read exact identities; conflicting tables are not a valid mapping."""
         from app.core.database import get_mysql_connection_context
-        
-        with get_mysql_connection_context() as conn:
-            try:
+
+        ids = list(dict.fromkeys(blueprint_ids))
+        results = {blueprint_id: None for blueprint_id in ids}
+        if not ids:
+            return results
+        placeholders = ",".join(["%s"] * len(ids))
+        tables = ("cards_prints", "op_prints", "pk_prints", "sealed_products")
+        query = " UNION ALL ".join(
+            f"SELECT id, '{table}' AS table_name, cardtrader_id FROM {table} "
+            f"WHERE cardtrader_id IN ({placeholders})"
+            for table in tables
+        )
+        try:
+            with get_mysql_connection_context() as conn:
                 with conn.cursor() as cursor:
-                    # Query all print tables for the blueprint_id
-                    # Priority: cards_prints, op_prints, pk_prints, sealed_products
-                    
-                    # Try cards_prints (MTG)
-                    cursor.execute(
-                        "SELECT id FROM cards_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "cards_prints"
-                    
-                    # Try op_prints (One Piece)
-                    cursor.execute(
-                        "SELECT id FROM op_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "op_prints"
-                    
-                    # Try pk_prints (Pokemon)
-                    cursor.execute(
-                        "SELECT id FROM pk_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "pk_prints"
-                    
-                    # Try sealed_products
-                    cursor.execute(
-                        "SELECT id FROM sealed_products WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "sealed_products"
-                    
-                    return None
-            except Exception as exc:
-                logger.error(
-                    "MySQL blueprint lookup failed for id=%s (%s)",
-                    blueprint_id,
-                    type(exc).__name__,
+                    cursor.execute(query, ids * len(tables))
+                    rows = cursor.fetchall()
+            candidates: dict[int, set[Tuple[int, str]]] = {}
+            for row in rows:
+                candidates.setdefault(int(row["cardtrader_id"]), set()).add(
+                    (int(row["id"]), row["table_name"])
                 )
-                return None
+            for blueprint_id, matches in candidates.items():
+                if len(matches) == 1:
+                    results[blueprint_id] = next(iter(matches))
+                else:
+                    logger.error("Ambiguous catalog identity for blueprint id=%s", blueprint_id)
+        except Exception as exc:
+            logger.error("MySQL blueprint lookup failed (%s)", type(exc).__name__)
+        return results
+
+    def _query_mysql(self, blueprint_id: int) -> Optional[Tuple[int, str]]:
+        return self._query_many([blueprint_id]).get(blueprint_id)
 
     def map_blueprint_id(self, blueprint_id: int) -> Optional[Tuple[int, str]]:
         """
@@ -155,57 +137,13 @@ class BlueprintMapper:
             else:
                 uncached_ids.append(blueprint_id)
         
-        # Query MySQL for uncached IDs
+        # Single and batch reads share the same ambiguity policy.
         if uncached_ids:
-            from app.core.database import get_mysql_connection_context
-            
-            with get_mysql_connection_context() as conn:
-                try:
-                    with conn.cursor() as cursor:
-                        # Build UNION query for all tables
-                        placeholders = ",".join(["%s"] * len(uncached_ids))
-                        
-                        query = f"""
-                        SELECT id, 'cards_prints' as table_name, cardtrader_id
-                        FROM cards_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'op_prints' as table_name, cardtrader_id
-                        FROM op_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'pk_prints' as table_name, cardtrader_id
-                        FROM pk_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'sealed_products' as table_name, cardtrader_id
-                        FROM sealed_products
-                        WHERE cardtrader_id IN ({placeholders})
-                        """
-                        
-                        # Execute with all IDs repeated for each UNION
-                        params = uncached_ids * 4
-                        cursor.execute(query, params)
-                        
-                        for row in cursor.fetchall():
-                            blueprint_id = row["cardtrader_id"]
-                            print_id = row["id"]
-                            table_name = row["table_name"]
-                            results[blueprint_id] = (print_id, table_name)
-                            # Cache the result
-                            self._set_cache(blueprint_id, print_id, table_name)
-                        
-                        # Mark missing IDs as None
-                        for blueprint_id in uncached_ids:
-                            if blueprint_id not in results:
-                                results[blueprint_id] = None
-                except Exception as exc:
-                    logger.error("MySQL batch blueprint lookup failed (%s)", type(exc).__name__)
-                    # Fallback to individual queries
-                    for blueprint_id in uncached_ids:
-                        if blueprint_id not in results:
-                            results[blueprint_id] = self.map_blueprint_id(blueprint_id)
-        
+            for blueprint_id, mapping in self._query_many(uncached_ids).items():
+                results[blueprint_id] = mapping
+                if mapping is not None:
+                    self._set_cache(blueprint_id, *mapping)
+
         return results
 
 

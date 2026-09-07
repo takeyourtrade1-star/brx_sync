@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 # Note: nest_asyncio is NOT applied at module level to avoid conflicts with uvloop.
 # We use isolated event loops in run_async() instead.
-from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.crypto import get_encryption_manager
@@ -303,8 +303,10 @@ async def _initial_bulk_sync_locked(
                 _assert_mutation_lease(mutation_lease, lost_lease)
                 logger.info(f"Exported {len(products)} products from CardTrader")
                 from app.services.reconciler import (
-                    _filter_cards_prints,
                     _apply_missing_products,
+                    _apply_catalog_mapping_gate,
+                    _classify_magic_products,
+                    _snapshot_metrics,
                     _is_confirmed_suspicious_shrink,
                     _previous_snapshot_size,
                     _record_snapshot,
@@ -315,19 +317,31 @@ async def _initial_bulk_sync_locked(
                 )
 
                 normalized, shape_problems = normalize_magic_snapshot(products)
-                products, mapping_problems, unsupported_rows = _filter_cards_prints(
+                mapped_products, unmapped_products, mapping_problems, unsupported_rows = (
+                    _classify_magic_products(
+                        normalized,
+                        blueprint_mapper.map_blueprint_id,
+                    )
+                )
+                mapped_products, unmapped_products = await _apply_catalog_mapping_gate(
+                    session,
+                    mapped_products,
+                    unmapped_products,
+                )
+                metrics = _snapshot_metrics(
                     normalized,
-                    blueprint_mapper.map_blueprint_id,
+                    mapped_products,
+                    unmapped_products,
                 )
 
-                checksum = _snapshot_id_set_checksum(products)
+                checksum = _snapshot_id_set_checksum(normalized)
                 previous_size = await _previous_snapshot_size(session, user_uuid, environment)
                 confirmed_shrink = await _is_confirmed_suspicious_shrink(
-                    session, user_uuid, environment, len(products)
+                    session, user_uuid, environment, len(normalized)
                 )
 
                 snapshot_ok, snapshot_problems = validate_snapshot(
-                    products,
+                    normalized,
                     previous_snapshot_size=previous_size,
                     local_active_rows=local_active_rows,
                     allow_confirmed_shrink=confirmed_shrink,
@@ -340,7 +354,7 @@ async def _initial_bulk_sync_locked(
                         user_id=user_uuid,
                         environment=environment,
                         status="rejected",
-                        product_count=len(products),
+                        product_count=len(normalized),
                         checksum=checksum,
                         problems=all_snapshot_problems,
                     )
@@ -356,10 +370,17 @@ async def _initial_bulk_sync_locked(
                 total_skipped = 0
                 total_missing_quarantined = 0
                 total_archived = 0
+                total_unmapped_created = 0
+                total_unmapped_updated = 0
+                total_unmapped_skipped_unsafe = 0
+                total_catalog_import_queued = 0
                 snapshot_id = uuid.uuid4()
 
-                total_chunks = (len(products) + CHUNK_SIZE - 1) // CHUNK_SIZE
-                chunks = [products[i : i + CHUNK_SIZE] for i in range(0, len(products), CHUNK_SIZE)]
+                total_chunks = (len(normalized) + CHUNK_SIZE - 1) // CHUNK_SIZE
+                chunks = [
+                    normalized[i : i + CHUNK_SIZE]
+                    for i in range(0, len(normalized), CHUNK_SIZE)
+                ]
 
                 # Process chunks in parallel batches (3-5 at a time)
                 # This significantly speeds up processing while not overwhelming the DB
@@ -399,6 +420,14 @@ async def _initial_bulk_sync_locked(
                         total_created += chunk_result["created"]
                         total_updated += chunk_result["updated"]
                         total_skipped += chunk_result["skipped"]
+                        total_unmapped_created += chunk_result.get("unmapped_created", 0)
+                        total_unmapped_updated += chunk_result.get("unmapped_updated", 0)
+                        total_unmapped_skipped_unsafe += chunk_result.get(
+                            "unmapped_skipped_unsafe", 0
+                        )
+                        total_catalog_import_queued += chunk_result.get(
+                            "catalog_import_queued", 0
+                        )
 
                         logger.info(
                             f"Processed chunk {idx + 1}/{total_chunks}: "
@@ -412,7 +441,8 @@ async def _initial_bulk_sync_locked(
                     if sync_op:
                         progress_pct = int((batch_start + len(batch_chunks)) / total_chunks * 100)
                         sync_op.operation_metadata = {
-                            "total_products": len(products),
+                            "total_products": len(normalized),
+                            **metrics,
                             "total_chunks": total_chunks,
                             "processed_chunks": batch_start + len(batch_chunks),
                             "progress_percent": progress_pct,
@@ -454,7 +484,7 @@ async def _initial_bulk_sync_locked(
                 missing_result = await _apply_missing_products(
                     session,
                     local_items=linked_rows,
-                    present_ids={str(product["id"]) for product in products},
+                    present_ids={str(product["id"]) for product in normalized},
                     map_blueprint=blueprint_mapper.map_blueprint_id,
                     user_id=user_uuid,
                     environment=environment,
@@ -526,12 +556,17 @@ async def _initial_bulk_sync_locked(
                     sync_op.status = "completed"
                     sync_op.completed_at = datetime.utcnow()
                     sync_op.operation_metadata = {
-                        "total_products": len(products),
+                        "total_products": len(normalized),
+                        **metrics,
                         "processed": total_processed,
                         "created": total_created,
                         "updated": total_updated,
                         "skipped": total_skipped,
                         "unsupported_rows": unsupported_rows,
+                        "unmapped_created": total_unmapped_created,
+                        "unmapped_updated": total_unmapped_updated,
+                        "unmapped_skipped_unsafe": total_unmapped_skipped_unsafe,
+                        "catalog_import_queued": total_catalog_import_queued,
                         "missing_quarantined": total_missing_quarantined,
                         "archived": total_archived,
                         "snapshot_watermark": watermark,
@@ -543,8 +578,8 @@ async def _initial_bulk_sync_locked(
                         user_id=user_uuid,
                         environment=environment,
                         status="rejected" if superseded else "applied",
-                        product_count=len(products),
-                        checksum=_snapshot_checksum(products),
+                        product_count=len(normalized),
+                        checksum=_snapshot_checksum(normalized),
                         problems_json=(
                             ["snapshot superseded by webhook " f"{latest_unresolved}"]
                             if superseded
@@ -552,10 +587,16 @@ async def _initial_bulk_sync_locked(
                         ),
                         result_json={
                             "operation": "initial_bulk_sync",
+                            **metrics,
                             "processed": total_processed,
                             "created": total_created,
                             "updated": total_updated,
                             "skipped": total_skipped,
+                            "unsupported_rows": unsupported_rows,
+                            "unmapped_created": total_unmapped_created,
+                            "unmapped_updated": total_unmapped_updated,
+                            "unmapped_skipped_unsafe": total_unmapped_skipped_unsafe,
+                            "catalog_import_queued": total_catalog_import_queued,
                             "missing_quarantined": total_missing_quarantined,
                             "archived": total_archived,
                             "snapshot_watermark": watermark,
@@ -569,13 +610,19 @@ async def _initial_bulk_sync_locked(
 
                 return {
                     "status": "superseded" if superseded else "completed",
-                    "total_products": len(products),
+                    "total_products": len(normalized),
+                    **metrics,
                     "processed": total_processed,
                     "created": total_created,
                     "updated": total_updated,
                     "skipped": total_skipped,
                     "missing_quarantined": total_missing_quarantined,
                     "archived": total_archived,
+                    "unsupported_rows": unsupported_rows,
+                    "unmapped_created": total_unmapped_created,
+                    "unmapped_updated": total_unmapped_updated,
+                    "unmapped_skipped_unsafe": total_unmapped_skipped_unsafe,
+                    "catalog_import_queued": total_catalog_import_queued,
                 }
 
         except Exception as e:
@@ -654,14 +701,29 @@ async def _process_products_chunk(
     from sqlalchemy import tuple_
 
     from app.core.database import get_isolated_db_session
+    from app.services.reconciler import (
+        _current_inventory_item,
+        _eligible_inbound_state,
+        _mapped_inventory_insert_batch_statement,
+        _persist_unmapped_product,
+    )
+    from app.services.catalog_mapping_gate import (
+        blocked_catalog_blueprints,
+        catalog_mapping_allowed_for,
+        catalog_mapping_blocked,
+    )
 
     created = 0
     updated = 0
     skipped = 0
+    unmapped_created = 0
+    unmapped_updated = 0
+    unmapped_skipped_unsafe = 0
+    catalog_import_queued = 0
 
     # Step 1: Filter and prepare products
-    valid_products = []
-    blueprint_ids = []
+    valid_products: list[dict[str, Any]] = []
+    blueprint_ids: list[int] = []
 
     for product in products:
         blueprint_id = product.get("blueprint_id")
@@ -676,19 +738,22 @@ async def _process_products_chunk(
             skipped += 1
             continue
 
-        valid_products.append(
+        valid_product = dict(product)
+        valid_product.update(
             {
-                "blueprint_id": blueprint_id,
+                "id": str(product_id),
+                "blueprint_id": int(blueprint_id),
                 "game_id": 1,
                 "external_stock_id": str(product_id),
-                "quantity": product.get("quantity", 0),
-                "price_cents": product.get("price_cents", 0),
+                "quantity": int(product.get("quantity", 0)),
+                "price_cents": int(product.get("price_cents", 0)),
                 "properties": product.get("properties_hash", {}),
                 "source": "cardtrader",
                 "environment": environment,
             }
         )
-        blueprint_ids.append(blueprint_id)
+        valid_products.append(valid_product)
+        blueprint_ids.append(int(blueprint_id))
 
     if not valid_products:
         return {
@@ -696,52 +761,25 @@ async def _process_products_chunk(
             "created": 0,
             "updated": 0,
             "skipped": skipped,
+            "unmapped_created": 0,
+            "unmapped_updated": 0,
+            "unmapped_skipped_unsafe": 0,
+            "catalog_import_queued": 0,
         }
 
     # Step 2: Batch map blueprint_ids
     mappings = blueprint_mapper.batch_map_blueprint_ids(blueprint_ids)
 
-    # Step 3: Filter products that have valid blueprint mappings (escludi One Piece per ora)
-    products_to_process = []
-    for product in valid_products:
-        blueprint_id = product["blueprint_id"]
-        mapping = mappings.get(blueprint_id)
-        # Defense in depth: BRX currently imports only Magic cards_prints.
-        if mapping and mapping[1] == "cards_prints":
-            products_to_process.append(product)
-        else:
-            reason = (
-                f"mapping non Magic ({mapping[1]})" if mapping else "nessun mapping nel catalogo"
-            )
-            logger.info(
-                "Sync skip: blueprint_id=%s external_stock_id=%s — %s",
-                blueprint_id,
-                product.get("external_stock_id"),
-                reason,
-            )
-            skipped += 1
-
-    if not products_to_process:
-        return {
-            "processed": len(products),
-            "created": 0,
-            "updated": 0,
-            "skipped": skipped,
-        }
-
-    # Step 4–8: Use isolated DB session for this chunk (prevents race conditions with parallel chunks)
+    # Step 3–8: Use an isolated DB session for this chunk (prevents race
+    # conditions with parallel chunks).  The catalog gate is read in this
+    # transaction and repeated in each mapped write statement.
     async with get_isolated_db_session() as session:
         # Batch SELECT to find existing items (ONE query instead of N)
         lookup_keys = [
             (user_uuid, environment, p["blueprint_id"], p["external_stock_id"])
-            for p in products_to_process
+            for p in valid_products
         ]
-        existing_items_stmt = select(
-            UserInventoryItem.id,
-            UserInventoryItem.blueprint_id,
-            UserInventoryItem.external_stock_id,
-            UserInventoryItem.row_version,
-        ).where(
+        existing_items_stmt = select(UserInventoryItem).where(
             tuple_(
                 UserInventoryItem.user_id,
                 UserInventoryItem.environment,
@@ -750,26 +788,84 @@ async def _process_products_chunk(
             ).in_(lookup_keys)
         )
         result = await session.execute(existing_items_stmt)
-        existing_items = result.all()
+        existing_items = list(result.scalars().all())
         existing_keys = {
-            (item.blueprint_id, item.external_stock_id): (
-                item.id,
-                item.row_version,
-            )
-            for item in existing_items
+            (item.blueprint_id, item.external_stock_id): item for item in existing_items
         }
+
+        blocked = await blocked_catalog_blueprints(
+            session,
+            (
+                product["blueprint_id"]
+                for product in valid_products
+                if mappings.get(product["blueprint_id"])
+                and mappings[product["blueprint_id"]][1] == "cards_prints"
+            ),
+        )
+
+        # Step 4: Split mapped stock from unresolved rows without dropping
+        # either.  A canonical MySQL print remains pending until Search ACK.
+        products_to_process: list[dict[str, Any]] = []
+        unresolved_products: list[dict[str, Any]] = []
+        for product in valid_products:
+            blueprint_id = product["blueprint_id"]
+            mapping = mappings.get(blueprint_id)
+            if mapping and mapping[1] == "cards_prints" and blueprint_id not in blocked:
+                products_to_process.append(product)
+            else:
+                unresolved = dict(product)
+                unresolved["_mapping_status"] = "unsupported" if mapping else "missing"
+                if mapping and blueprint_id in blocked:
+                    unresolved["_mapping_status"] = "missing"
+                    unresolved["_mapping_reason"] = "catalog_search_pending"
+                if mapping:
+                    unresolved["_mapping_table"] = str(mapping[1])
+                unresolved_products.append(unresolved)
+                logger.info(
+                    "Sync conserva prodotto unmapped: blueprint_id=%s external_stock_id=%s — %s",
+                    blueprint_id,
+                    product.get("external_stock_id"),
+                    (
+                        "catalog Search non ancora ACK"
+                        if blueprint_id in blocked
+                        else f"mapping non Magic ({mapping[1]})"
+                        if mapping
+                        else "nessun mapping nel catalogo"
+                    ),
+                )
+
+        # Step 5: Persist unresolved products first, so a blocked catalog row
+        # is visible even when the mapper has just started returning a print.
+        for product in unresolved_products:
+            local = existing_keys.get(
+                (product["blueprint_id"], product["external_stock_id"])
+            )
+            unresolved_result = await _persist_unmapped_product(
+                session,
+                product=product,
+                local=local,
+                user_id=user_uuid,
+                environment=environment,
+                watermark=snapshot_watermark,
+                snapshot_id=snapshot_id,
+            )
+            unmapped_created += unresolved_result["unmapped_created"]
+            unmapped_updated += unresolved_result["unmapped_updated"]
+            unmapped_skipped_unsafe += unresolved_result["unmapped_skipped_unsafe"]
+            catalog_import_queued += 1
         # Step 5: Separate products into INSERT and UPDATE batches
         items_to_insert = []
         items_to_update = []
         now = datetime.utcnow()
         for product in products_to_process:
             key = (product["blueprint_id"], product["external_stock_id"])
-            if key in existing_keys:
-                item_id, expected_row_version = existing_keys[key]
+            local = existing_keys.get(key)
+            if local is not None:
                 items_to_update.append(
                     {
-                        "id": item_id,
-                        "expected_row_version": expected_row_version,
+                        "id": local.id,
+                        "expected_row_version": local.row_version,
+                        "blueprint_id": product["blueprint_id"],
                         "game_id": 1,
                         "quantity": product["quantity"],
                         "price_cents": product["price_cents"],
@@ -780,9 +876,15 @@ async def _process_products_chunk(
                         "lifecycle_status": "sold_out" if product["quantity"] == 0 else "active",
                         "sync_state": "synced",
                         "sync_uncertain_event_id": None,
+                        "mapping_status": "mapped",
                         "missing_snapshot_count": 0,
                         "last_seen_snapshot_id": snapshot_id,
+                        "last_external_update_at": now,
+                        "description": product.get("description"),
+                        "user_data_field": product.get("user_data_field"),
+                        "graded": product.get("graded"),
                         "updated_at": now,
+                        "source_product": product,
                     }
                 )
             else:
@@ -803,6 +905,10 @@ async def _process_products_chunk(
                         "mapping_status": "mapped",
                         "missing_snapshot_count": 0,
                         "last_seen_snapshot_id": snapshot_id,
+                        "last_external_update_at": now,
+                        "description": product.get("description"),
+                        "user_data_field": product.get("user_data_field"),
+                        "graded": product.get("graded"),
                         "created_at": now,
                         "updated_at": now,
                     }
@@ -813,26 +919,53 @@ async def _process_products_chunk(
             for offset in range(0, len(items_to_insert), 1000):
                 insert_batch = items_to_insert[offset : offset + 1000]
                 result = await session.execute(
-                    pg_insert(UserInventoryItem).values(insert_batch).on_conflict_do_nothing()
+                    _mapped_inventory_insert_batch_statement(insert_batch)
                 )
                 created += int(result.rowcount or 0)
-            skipped += len(items_to_insert) - created
+                skipped += len(insert_batch) - int(result.rowcount or 0)
+
+            # A job can be committed after the pre-split read but before the
+            # guarded INSERT statement.  Re-read the durable gate and persist
+            # those rows as unresolved instead of leaving a mapped row behind.
+            blocked_after_insert = await blocked_catalog_blueprints(
+                session,
+                (product["blueprint_id"] for product in items_to_insert),
+            )
+            for product in items_to_insert:
+                if product["blueprint_id"] not in blocked_after_insert:
+                    continue
+                unresolved = dict(product)
+                unresolved["_mapping_status"] = "missing"
+                unresolved["_mapping_reason"] = "catalog_search_pending"
+                local = existing_keys.get(
+                    (product["blueprint_id"], product["external_stock_id"])
+                )
+                if local is None:
+                    local = await _current_inventory_item(
+                        session,
+                        user_id=user_uuid,
+                        environment=environment,
+                        product=product,
+                    )
+                unresolved_result = await _persist_unmapped_product(
+                    session,
+                    product=unresolved,
+                    local=local,
+                    user_id=user_uuid,
+                    environment=environment,
+                    watermark=snapshot_watermark,
+                    snapshot_id=snapshot_id,
+                )
+                unmapped_created += unresolved_result["unmapped_created"]
+                unmapped_updated += unresolved_result["unmapped_updated"]
+                unmapped_skipped_unsafe += unresolved_result["unmapped_skipped_unsafe"]
+                catalog_import_queued += 1
 
         if items_to_update:
             for item_data in items_to_update:
                 item_id = item_data.pop("id")
                 expected_row_version = item_data.pop("expected_row_version")
-                eligible_inbound = or_(
-                    and_(
-                        UserInventoryItem.sync_state == "synced",
-                        UserInventoryItem.sync_uncertain_event_id.is_(None),
-                    ),
-                    and_(
-                        UserInventoryItem.sync_state.in_(("synced", "failed", "uncertain")),
-                        UserInventoryItem.sync_uncertain_event_id.isnot(None),
-                        UserInventoryItem.sync_uncertain_event_id <= snapshot_watermark,
-                    ),
-                )
+                source_product = item_data.pop("source_product")
                 stmt = (
                     update(UserInventoryItem)
                     .where(
@@ -842,7 +975,8 @@ async def _process_products_chunk(
                         UserInventoryItem.source == "cardtrader",
                         UserInventoryItem.row_version == expected_row_version,
                         UserInventoryItem.reserved_quantity == 0,
-                        eligible_inbound,
+                        _eligible_inbound_state(snapshot_watermark),
+                        catalog_mapping_allowed_for(UserInventoryItem.blueprint_id),
                     )
                     .values(
                         **item_data,
@@ -853,7 +987,32 @@ async def _process_products_chunk(
                 if result.rowcount == 1:
                     updated += 1
                 else:
-                    skipped += 1
+                    if await catalog_mapping_blocked(
+                        session, int(item_data["blueprint_id"])
+                    ):
+                        unresolved = dict(source_product)
+                        unresolved["_mapping_status"] = "missing"
+                        unresolved["_mapping_reason"] = "catalog_search_pending"
+                        unresolved_result = await _persist_unmapped_product(
+                            session,
+                            product=unresolved,
+                            local=await _current_inventory_item(
+                                session,
+                                user_id=user_uuid,
+                                environment=environment,
+                                product=source_product,
+                            ),
+                            user_id=user_uuid,
+                            environment=environment,
+                            watermark=snapshot_watermark,
+                            snapshot_id=snapshot_id,
+                        )
+                        unmapped_created += unresolved_result["unmapped_created"]
+                        unmapped_updated += unresolved_result["unmapped_updated"]
+                        unmapped_skipped_unsafe += unresolved_result["unmapped_skipped_unsafe"]
+                        catalog_import_queued += 1
+                    else:
+                        skipped += 1
         # commit is done by get_isolated_db_session context
 
     return {
@@ -861,6 +1020,10 @@ async def _process_products_chunk(
         "created": created,
         "updated": updated,
         "skipped": skipped,
+        "unmapped_created": unmapped_created,
+        "unmapped_updated": unmapped_updated,
+        "unmapped_skipped_unsafe": unmapped_skipped_unsafe,
+        "catalog_import_queued": catalog_import_queued,
     }
 
 

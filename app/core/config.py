@@ -7,7 +7,7 @@ import ipaddress
 import json
 import re
 import ssl
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
@@ -283,6 +283,59 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Catalog repair (CardTrader GET -> MySQL canonical catalog -> Search).
+    # Disabled by default until the dedicated worker MySQL role and migration
+    # have been installed.  API processes never receive the writer credentials.
+    CATALOG_IMPORT_ENABLED: bool = Field(
+        default=False,
+        description="Persist exact Magic blueprint catalog-import requests",
+    )
+    CATALOG_MYSQL_WRITE_ENABLED: bool = Field(
+        default=False,
+        description="Allow the catalog worker's dedicated MySQL writer",
+    )
+    CATALOG_MYSQL_WRITER_USER: Optional[str] = Field(
+        default=None,
+        description="Dedicated catalog-worker MySQL role; never use the read-only sync role",
+    )
+    CATALOG_MYSQL_WRITER_PASSWORD: Optional[SecretStr] = Field(
+        default=None,
+        repr=False,
+        description="Dedicated catalog-worker MySQL password",
+    )
+    CATALOG_IMPORT_LEASE_SECONDS: int = Field(default=300, ge=30, le=1800)
+    CATALOG_IMPORT_MAX_ATTEMPTS: int = Field(default=8, ge=1, le=20)
+    CATALOG_IMPORT_BATCH_SIZE: int = Field(default=25, ge=1, le=100)
+    CATALOG_IMPORT_RETRY_BACKOFF_BASE_SECONDS: int = Field(default=30, ge=1, le=3600)
+    CATALOG_IMPORT_RETRY_BACKOFF_MAX_SECONDS: int = Field(default=3600, ge=60, le=86400)
+    CATALOG_IMPORT_MAX_EXPANSIONS_SCAN: int = Field(default=256, ge=1, le=512)
+    CATALOG_IMPORT_EXPANSION_CACHE_SECONDS: int = Field(default=1800, ge=60, le=86400)
+    CATALOG_INDEX_OUTBOX_BATCH_SIZE: int = Field(default=25, ge=1, le=100)
+    CATALOG_SEARCH_PUBLISH_ENABLED: bool = Field(
+        default=False,
+        description="Allow the catalog worker to publish one Search document at a time",
+    )
+    CATALOG_MEILISEARCH_URL: Optional[str] = Field(
+        default=None,
+        description="Private Meilisearch origin for targeted catalog publication",
+    )
+    CATALOG_MEILISEARCH_API_KEY: Optional[SecretStr] = Field(
+        default=None,
+        repr=False,
+        description="Dedicated Meilisearch key, injected only into the catalog worker",
+    )
+    CATALOG_MEILISEARCH_INDEX: str = Field(
+        default="cards",
+        min_length=1,
+        max_length=64,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="Meilisearch index receiving canonical catalog documents",
+    )
+    CATALOG_SCRYFALL_API_BASE_URL: str = Field(
+        default="https://api.scryfall.com",
+        description="Read-only Scryfall API origin used for exact oracle metadata",
+    )
+
     # Rate Limiting
     RATE_LIMIT_REQUESTS: int = Field(default=200, description="Rate limit requests per window")
     RATE_LIMIT_WINDOW_SECONDS: int = Field(default=10, description="Rate limit window in seconds")
@@ -493,6 +546,35 @@ class Settings(BaseSettings):
                 raise ValueError("Production PostgreSQL must use a dedicated least-privilege role")
             if self.MYSQL_USER.casefold() in {"root", "admin", "brx_bd_admin"}:
                 raise ValueError("Production MySQL must use a dedicated read-only role")
+            if self.CATALOG_MYSQL_WRITE_ENABLED:
+                if self.SERVICE_ROLE != "worker":
+                    raise ValueError("Catalog MySQL writer is permitted only in the worker role")
+                if not self.CATALOG_MYSQL_WRITER_USER or not self.CATALOG_MYSQL_WRITER_PASSWORD:
+                    raise ValueError(
+                        "Catalog MySQL writer requires a dedicated user and password"
+                    )
+                if self.CATALOG_MYSQL_WRITER_USER.casefold() in {
+                    "root",
+                    "admin",
+                    "brx_bd_admin",
+                }:
+                    raise ValueError("Catalog MySQL writer must use a dedicated least-privilege role")
+            if self.CATALOG_SEARCH_PUBLISH_ENABLED:
+                if not self.CATALOG_MEILISEARCH_URL or not self.CATALOG_MEILISEARCH_API_KEY:
+                    raise ValueError(
+                        "Catalog Meilisearch publisher requires a private URL and API key"
+                    )
+                search_origin = urlsplit(self.CATALOG_MEILISEARCH_URL)
+                if (
+                    search_origin.scheme != "https"
+                    or not search_origin.hostname
+                    or search_origin.username is not None
+                    or search_origin.password is not None
+                    or search_origin.query
+                    or search_origin.fragment
+                    or search_origin.path not in {"", "/"}
+                ):
+                    raise ValueError("Catalog Meilisearch URL must be an HTTPS origin")
         try:
             for cidr in self.INTERNAL_API_ALLOWED_CIDRS.split(","):
                 if cidr.strip():
