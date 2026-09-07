@@ -18,6 +18,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 import pymysql
@@ -31,6 +32,17 @@ MAGIC_CATEGORY_ID = 1
 _MAX_BLUEPRINT_ID = 2**63 - 1
 _MAX_EXPANSIONS_SCAN = 512
 _CACHE_MAX_ENTRIES = 32
+_SCRYFALL_IMAGE_HOSTS = frozenset({
+    "cards.scryfall.io",
+    "c1.scryfall.com",
+    "c2.scryfall.com",
+})
+_CARDTRADER_IMAGE_HOSTS = frozenset({
+    "cardtrader.com",
+    "www.cardtrader.com",
+    "cdn.cardtrader.com",
+    "static.cardtrader.com",
+})
 _SHARED_BLUEPRINT_CACHE: dict[tuple[str, int], tuple[float, list[dict[str, Any]]]] = {}
 _SHARED_EXPANSIONS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
@@ -221,17 +233,85 @@ def _expansion_id_from_product(product: Mapping[str, Any]) -> int | None:
     return _positive_int(value, "expansion_id")
 
 
-def _blueprint_image_path(blueprint: Mapping[str, Any]) -> str | None:
-    value = blueprint.get("image_url")
-    image = blueprint.get("image")
-    if value is None and isinstance(image, Mapping):
-        value = image.get("url")
-        if value is None and isinstance(image.get("show"), Mapping):
-            value = image["show"].get("url")
+def _validated_image_url(
+    value: Any,
+    *,
+    allowed_hosts: frozenset[str],
+) -> str | None:
+    """Accept one bounded HTTPS image URL from an explicit provider allowlist."""
+
     if not isinstance(value, str):
         return None
     value = value.strip()
-    return value[:255] if value else None
+    if not value or len(value) > 255 or any(character.isspace() for character in value):
+        return None
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or hostname.casefold() not in allowed_hosts
+        or port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/")
+        or parsed.path == "/"
+        or parsed.fragment
+        or any(ord(character) < 0x20 or ord(character) == 0x7F or character == "\\" for character in value)
+    ):
+        return None
+    return value
+
+
+def _validated_scryfall_image_url(value: Any) -> str | None:
+    return _validated_image_url(value, allowed_hosts=_SCRYFALL_IMAGE_HOSTS)
+
+
+def _is_cardtrader_image_url(value: Any) -> bool:
+    return _validated_image_url(value, allowed_hosts=_CARDTRADER_IMAGE_HOSTS) is not None
+
+
+def _scryfall_image_path(scryfall: Mapping[str, Any]) -> str | None:
+    """Select only Scryfall's normal image, using the front face for DFCs."""
+
+    image_uris = scryfall.get("image_uris")
+    if isinstance(image_uris, Mapping):
+        for key in ("normal", "large"):
+            image_path = _validated_scryfall_image_url(image_uris.get(key))
+            if image_path is not None:
+                return image_path
+    card_faces = scryfall.get("card_faces")
+    if isinstance(card_faces, list) and card_faces:
+        front_face = card_faces[0]
+        if isinstance(front_face, Mapping):
+            front_uris = front_face.get("image_uris")
+            if isinstance(front_uris, Mapping):
+                for key in ("normal", "large"):
+                    image_path = _validated_scryfall_image_url(front_uris.get(key))
+                    if image_path is not None:
+                        return image_path
+    return None
+
+
+def _image_for_existing_print(
+    existing_image_path: Any,
+    image_status: Any,
+    new_image_path: Any,
+) -> str | None:
+    """Repair only pending CT-origin images with a validated Scryfall image."""
+
+    if str(image_status or "") != "pending":
+        return existing_image_path if isinstance(existing_image_path, str) else None
+    validated_new = _validated_scryfall_image_url(new_image_path)
+    if validated_new is None:
+        return existing_image_path if isinstance(existing_image_path, str) else None
+    if existing_image_path is None or _is_cardtrader_image_url(existing_image_path):
+        return validated_new
+    return existing_image_path if isinstance(existing_image_path, str) else None
 
 
 def _string_list(value: Any, *, field: str, required: bool = False) -> list[str]:
@@ -386,11 +466,11 @@ def _exact_record(
         [str(lang).strip()] if isinstance(lang, str) and lang.strip() else ["en"]
     )
     finishes = _string_list(scryfall.get("finishes"), field="finishes")
-    image_uris = scryfall.get("image_uris")
-    image_path = _blueprint_image_path(blueprint)
-    if image_path is None and isinstance(image_uris, Mapping):
-        normal = image_uris.get("normal") or image_uris.get("large")
-        image_path = str(normal).strip()[:255] if isinstance(normal, str) and normal.strip() else None
+    # CardTrader image URLs are provider content and are rejected by the
+    # public catalogue allowlist.  Scryfall has already been fetched by its
+    # exact UUID, so only its validated image origin can enter the canonical
+    # projection.
+    image_path = _scryfall_image_path(scryfall)
 
     collector = fixed_properties.get("collector_number")
     if collector is None:
@@ -687,6 +767,7 @@ class MySQLCanonicalCatalogWriter:
         return await asyncio.to_thread(self._upsert_sync, record)
 
     def _upsert_sync(self, record: CanonicalCatalogRecord) -> CatalogPrintReference:
+        validated_image_path = _validated_scryfall_image_url(record.image_path)
         with self.connection_context_factory() as connection:
             try:
                 connection.begin()
@@ -790,13 +871,18 @@ class MySQLCanonicalCatalogWriter:
                                 "print_set_conflict",
                                 "existing cards_prints set identity conflicts with CardTrader",
                             )
+                        image_path = _image_for_existing_print(
+                            existing_print.get("image_path"),
+                            existing_print.get("image_status"),
+                            validated_image_path,
+                        )
                         cursor.execute(
                             """
                             UPDATE cards_prints
                             SET oracle_id=%s, set_id=%s, cardtrader_id=COALESCE(cardtrader_id, %s),
                                 scryfall_id=%s,
                                 collector_number=%s, rarity=%s,
-                                image_path=COALESCE(image_path, %s),
+                                image_path=%s,
                                 available_languages=%s,
                                 has_foil=GREATEST(has_foil, %s),
                                 has_signed=GREATEST(has_signed, %s),
@@ -811,7 +897,7 @@ class MySQLCanonicalCatalogWriter:
                                 record.scryfall_id,
                                 record.collector_number,
                                 record.rarity,
-                                record.image_path,
+                                image_path,
                                 json.dumps(record.available_languages),
                                 int(record.has_foil),
                                 int(record.has_signed),
@@ -840,7 +926,7 @@ class MySQLCanonicalCatalogWriter:
                                 record.collector_number,
                                 record.rarity,
                                 "NM",
-                                record.image_path,
+                                validated_image_path,
                                 "pending",
                                 json.dumps(record.available_languages),
                                 int(record.has_foil),

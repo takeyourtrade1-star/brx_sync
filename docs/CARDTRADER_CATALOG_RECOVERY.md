@@ -57,6 +57,12 @@ pubblicazione e il suo ACK, senza stampare segreti nei log.
 
 ## Verifica e recupero operativo
 
+Le immagini provengono dalla risposta Scryfall dello stesso UUID della stampa:
+si usa `normal` (oppure `large`) e, per carte bifronte, la faccia anteriore.
+Sono ammessi solo gli host Scryfall consentiti dal frontend, conservando il
+parametro di versione della cache. Un retry può sostituire un'immagine CardTrader
+ancora `pending`; conserva invece immagini approvate o già caricate sul CDN.
+
 Confrontare il prodotto CT per `external_stock_id` e la sua `quantity`; il numero
 delle righe e la somma delle copie sono metriche differenti. Per una verifica
 completa usare un nuovo export GET, rispettando la modalità corrente del profilo.

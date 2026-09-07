@@ -55,7 +55,8 @@ def record():
         color_identity=['R'], colors=['R'], keywords=[], type_line='Creature', legalities={},
         set_cardtrader_id=4415, set_code='msh', set_name='Marvel Super Heroes', release_date=None,
         cardtrader_id=393523, scryfall_id='4d8c8ceb-84cd-46d2-9230-ab6ca4569334',
-        collector_number='224', rarity='Rare', image_path='https://cardtrader.com/test.jpg',
+        collector_number='224', rarity='Rare',
+        image_path='https://cards.scryfall.io/normal/front/1/2/123.jpg',
         available_languages=['en', 'it'], has_foil=True, has_signed=False, has_altered=False,
         condition_options=['Near Mint'],
     )
@@ -87,6 +88,21 @@ async def test_writer_is_idempotent_and_uses_mysql_generated_identity(catalog_co
             'base_card_id': 777,
             'image_path': 'https://cdn.ebartex.test/approved.jpg',
         }
+
+
+@pytest.mark.asyncio
+async def test_pending_cardtrader_image_is_repaired_without_changing_print_identity(catalog_connection, record):
+    writer = MySQLCanonicalCatalogWriter(catalog_connection)
+    first = await writer.upsert_canonical(record)
+    with catalog_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE cards_prints SET image_path=%s, image_status='pending' WHERE id=%s",
+            ("https://cardtrader.com/old.jpg", first.local_print_id),
+        )
+    assert await writer.upsert_canonical(record) == first
+    with catalog_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT image_path FROM cards_prints WHERE id=%s", (first.local_print_id,))
+        assert cur.fetchone()['image_path'] == record.image_path
 
 
 @pytest.mark.asyncio
