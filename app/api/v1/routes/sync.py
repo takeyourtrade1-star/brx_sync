@@ -901,7 +901,7 @@ async def disconnect_sync(
     Suspend or remove CardTrader sync for the user.
 
     - suspend: set sync_status to idle (keeps token; user can start sync again).
-    - remove: set sync_status to idle and clear token/webhook (user must re-enter token).
+    - remove: clear token/webhook and apply the explicit local inventory choice.
     """
     try:
         user_uuid = uuid.UUID(user_id)
@@ -921,6 +921,65 @@ async def disconnect_sync(
             detail=f"User {user_id} not found in sync settings",
         )
     await _assert_user_has_no_unresolved_mutations(session, user_uuid)
+
+    if body.action == "suspend" and body.inventory_action is not None:
+        raise HTTPException(status_code=422, detail="Inventory choice requires remove")
+
+    # Il lock sulle impostazioni serializza il cambio con import e prenotazioni.
+    pending_sync = (
+        await session.execute(
+            select(SyncOperation.id).where(
+                SyncOperation.user_id == user_uuid,
+                SyncOperation.operation_type.in_(["bulk_sync", "reconcile"]),
+                SyncOperation.status.in_(["pending", "processing", "running", "retry"]),
+            ).limit(1)
+        )
+    ).scalar_one_or_none()
+    if pending_sync is not None or str(sync_settings.sync_status) == "initial_sync":
+        raise HTTPException(status_code=409, detail="Sincronizzazione ancora in corso. Riprova al termine.")
+
+    inventory_mode = "demo"
+    if body.action == "remove" and body.inventory_action == "keep":
+        inventory_mode = sync_settings.execution_mode
+        if inventory_mode == "demo":
+            # Una precedente sospensione passa in demo: recupera l'ultimo catalogo importato.
+            inventory_mode = (
+                await session.execute(
+                    select(UserInventoryItem.environment).where(
+                        UserInventoryItem.user_id == user_uuid,
+                        UserInventoryItem.source == "cardtrader",
+                        UserInventoryItem.environment.in_(["partial", "real"]),
+                        UserInventoryItem.lifecycle_status.notin_(["archived", "pending_delete"]),
+                    ).order_by(UserInventoryItem.updated_at.desc(), UserInventoryItem.id.desc()).limit(1)
+                )
+            ).scalar_one_or_none() or "demo"
+
+    removed_items = 0
+    if body.action == "remove" and body.inventory_action == "delete":
+        # Blocca anche le righe non prenotate per chiudere la corsa con nuove riserve.
+        reserved_quantities = (
+            await session.execute(
+                select(UserInventoryItem.reserved_quantity).where(
+                    UserInventoryItem.user_id == user_uuid,
+                    UserInventoryItem.source == "cardtrader",
+                ).order_by(UserInventoryItem.id).with_for_update()
+            )
+        ).scalars().all()
+        if any(quantity > 0 for quantity in reserved_quantities):
+            raise HTTPException(status_code=409, detail="Carte prenotate: completa le operazioni prima di eliminare il catalogo.")
+        # Rimozione locale logica: conserva gli ID storici senza chiamare CardTrader.
+        removed = await session.execute(
+            update(UserInventoryItem).where(
+                UserInventoryItem.user_id == user_uuid,
+                UserInventoryItem.source == "cardtrader",
+            ).values(
+                quantity=0,
+                lifecycle_status="archived",
+                row_version=UserInventoryItem.row_version + 1,
+                updated_at=func.now(),
+            )
+        )
+        removed_items = removed.rowcount
 
     from sqlalchemy import text
 
@@ -959,7 +1018,7 @@ async def disconnect_sync(
                 SET sync_status = CAST(:status AS sync_status_enum),
                     cardtrader_token_encrypted = :token,
                     webhook_secret = NULL,
-                    execution_mode = 'demo',
+                    execution_mode = :inventory_mode,
                     writes_enabled = FALSE,
                     mode_version = mode_version + 1,
                     mode_changed_at = NOW(),
@@ -969,6 +1028,7 @@ async def disconnect_sync(
             {
                 "status": SyncStatusEnum.IDLE.value,
                 "token": empty_token_encrypted,
+                "inventory_mode": inventory_mode,
                 "user_id": str(user_uuid),
             },
         )
@@ -977,6 +1037,9 @@ async def disconnect_sync(
             "status": "success",
             "message": "Collegamento CardTrader rimosso. Inserisci di nuovo il token per sincronizzare.",
             "action": "remove",
+            "inventory_action": body.inventory_action,
+            "execution_mode": inventory_mode,
+            "removed_items": removed_items,
             "sync_status": SyncStatusEnum.IDLE.value,
         }
 

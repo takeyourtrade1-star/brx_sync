@@ -18,6 +18,11 @@ class DisconnectSyncRequest(BaseModel):
         description="suspend = set status to idle (keep token); remove = set idle and clear token/webhook",
     )
 
+    inventory_action: Optional[Literal["keep", "delete"]] = Field(
+        None,
+        description="For remove: keep the imported catalog visible, or delete it locally. Omitted preserves legacy behavior.",
+    )
+
 
 # Request Schemas
 
