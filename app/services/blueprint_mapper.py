@@ -10,6 +10,22 @@ from app.core.redis_client import get_redis_sync
 
 logger = logging.getLogger(__name__)
 
+# Tabelle del catalogo MySQL che espongono `cardtrader_id`, in ordine di priorità.
+# Unica fonte di verità: aggiungere un gioco significa aggiungere una riga qui,
+# non un nuovo ramo in ciascuna query.
+#   cards_prints    → Magic           (game CardTrader 1)
+#   op_prints       → One Piece       (game CardTrader 15)
+#   pk_prints       → Pokémon         (game CardTrader 5)
+#   lorcana_prints  → Disney Lorcana  (game CardTrader 18)
+#   sealed_products → prodotti sigillati di tutti i giochi
+CATALOG_PRINT_TABLES: tuple[str, ...] = (
+    "cards_prints",
+    "op_prints",
+    "pk_prints",
+    "lorcana_prints",
+    "sealed_products",
+)
+
 
 class BlueprintMapper:
     """Maps CardTrader blueprint_id to Ebartex print_id and table name."""
@@ -33,7 +49,9 @@ class BlueprintMapper:
             try:
                 # Format: "print_id:table_name"
                 parts = cached.split(":", 1)
-                if len(parts) == 2:
+                # Una voce in cache che nomina una tabella non più supportata
+                # (o un id non valido) va ignorata, non propagata.
+                if len(parts) == 2 and parts[1] in CATALOG_PRINT_TABLES and int(parts[0]) > 0:
                     return int(parts[0]), parts[1]
             except (ValueError, IndexError):
                 logger.warning("Invalid blueprint cache record; ignoring it")
@@ -56,45 +74,15 @@ class BlueprintMapper:
         with get_mysql_connection_context() as conn:
             try:
                 with conn.cursor() as cursor:
-                    # Query all print tables for the blueprint_id
-                    # Priority: cards_prints, op_prints, pk_prints, sealed_products
-                    
-                    # Try cards_prints (MTG)
-                    cursor.execute(
-                        "SELECT id FROM cards_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "cards_prints"
-                    
-                    # Try op_prints (One Piece)
-                    cursor.execute(
-                        "SELECT id FROM op_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "op_prints"
-                    
-                    # Try pk_prints (Pokemon)
-                    cursor.execute(
-                        "SELECT id FROM pk_prints WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "pk_prints"
-                    
-                    # Try sealed_products
-                    cursor.execute(
-                        "SELECT id FROM sealed_products WHERE cardtrader_id = %s LIMIT 1",
-                        (blueprint_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        return result["id"], "sealed_products"
-                    
+                    for table_name in CATALOG_PRINT_TABLES:
+                        cursor.execute(
+                            f"SELECT id FROM {table_name} WHERE cardtrader_id = %s LIMIT 1",
+                            (blueprint_id,),
+                        )
+                        result = cursor.fetchone()
+                        if result:
+                            return result["id"], table_name
+
                     return None
             except Exception as exc:
                 logger.error(
@@ -162,29 +150,17 @@ class BlueprintMapper:
             with get_mysql_connection_context() as conn:
                 try:
                     with conn.cursor() as cursor:
-                        # Build UNION query for all tables
+                        # Build UNION query for all catalog tables
                         placeholders = ",".join(["%s"] * len(uncached_ids))
-                        
-                        query = f"""
-                        SELECT id, 'cards_prints' as table_name, cardtrader_id
-                        FROM cards_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'op_prints' as table_name, cardtrader_id
-                        FROM op_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'pk_prints' as table_name, cardtrader_id
-                        FROM pk_prints
-                        WHERE cardtrader_id IN ({placeholders})
-                        UNION
-                        SELECT id, 'sealed_products' as table_name, cardtrader_id
-                        FROM sealed_products
-                        WHERE cardtrader_id IN ({placeholders})
-                        """
-                        
-                        # Execute with all IDs repeated for each UNION
-                        params = uncached_ids * 4
+
+                        query = " UNION ".join(
+                            f"SELECT id, '{table_name}' as table_name, cardtrader_id "
+                            f"FROM {table_name} WHERE cardtrader_id IN ({placeholders})"
+                            for table_name in CATALOG_PRINT_TABLES
+                        )
+
+                        # Execute with all IDs repeated for each UNION branch
+                        params = uncached_ids * len(CATALOG_PRINT_TABLES)
                         cursor.execute(query, params)
                         
                         for row in cursor.fetchall():
