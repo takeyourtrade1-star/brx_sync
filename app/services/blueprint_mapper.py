@@ -9,6 +9,24 @@ from app.core.redis_client import get_redis_sync
 
 logger = logging.getLogger(__name__)
 
+# Tabelle del catalogo MySQL che espongono `cardtrader_id`.
+# Unica fonte di verità: aggiungere un gioco significa aggiungere una riga qui,
+# non una tupla in più in ciascun punto che le elenca. Una tabella dimenticata
+# non produce un errore — le inserzioni di quel gioco restano semplicemente non
+# mappabili e spariscono dall'inventario senza traccia.
+#   cards_prints    → Magic           (game CardTrader 1)
+#   op_prints       → One Piece       (game CardTrader 15)
+#   pk_prints       → Pokémon         (game CardTrader 5)
+#   lorcana_prints  → Disney Lorcana  (game CardTrader 18)
+#   sealed_products → prodotti sigillati di tutti i giochi
+CATALOG_PRINT_TABLES: tuple[str, ...] = (
+    "cards_prints",
+    "op_prints",
+    "pk_prints",
+    "lorcana_prints",
+    "sealed_products",
+)
+
 
 class BlueprintMapper:
     """Maps CardTrader blueprint_id to Ebartex print_id and table name."""
@@ -34,9 +52,7 @@ class BlueprintMapper:
                 if isinstance(cached, bytes):
                     cached = cached.decode("ascii")
                 parts = cached.split(":", 1)
-                if len(parts) == 2 and parts[1] in {
-                    "cards_prints", "op_prints", "pk_prints", "sealed_products"
-                } and int(parts[0]) > 0:
+                if len(parts) == 2 and parts[1] in CATALOG_PRINT_TABLES and int(parts[0]) > 0:
                     return int(parts[0]), parts[1]
             except (ValueError, IndexError, UnicodeDecodeError):
                 logger.warning("Invalid blueprint cache record; ignoring it")
@@ -58,7 +74,7 @@ class BlueprintMapper:
         if not ids:
             return results
         placeholders = ",".join(["%s"] * len(ids))
-        tables = ("cards_prints", "op_prints", "pk_prints", "sealed_products")
+        tables = CATALOG_PRINT_TABLES
         query = " UNION ALL ".join(
             f"SELECT id, '{table}' AS table_name, cardtrader_id FROM {table} "
             f"WHERE cardtrader_id IN ({placeholders})"
