@@ -31,11 +31,13 @@ async def project_inventory_to_marketplace(
             WHERE listing.user_id = CAST(:user_id AS uuid)
               AND inventory.user_id = CAST(:user_id AS uuid)
               AND inventory.source = 'cardtrader'
-              AND inventory.game_id = 1
               AND inventory.environment = :environment
               AND (
                   inventory.sync_state <> 'synced'
                   OR inventory.sync_uncertain_event_id IS NOT NULL
+                  OR inventory.game_id IS DISTINCT FROM 1
+                  OR inventory.mapping_status IS DISTINCT FROM 'mapped'
+                  OR inventory.lifecycle_status NOT IN ('active', 'sold_out')
               )
               AND listing.cardtrader_article_id = CASE
                   WHEN inventory.external_stock_id ~ '^[0-9]+$'
@@ -61,6 +63,9 @@ async def project_inventory_to_marketplace(
               AND inventory.user_id = CAST(:user_id AS uuid)
               AND inventory.source = 'cardtrader'
               AND inventory.environment = :environment
+              AND inventory.game_id = 1
+              AND inventory.mapping_status = 'mapped'
+              AND inventory.lifecycle_status IN ('active', 'sold_out')
               AND inventory.sync_state = 'synced'
               AND inventory.sync_uncertain_event_id IS NULL
               AND listing.cardtrader_article_id = CASE

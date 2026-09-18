@@ -63,6 +63,7 @@ services:
       - AWS_SSM_ENABLED
       - ALLOWED_ORIGINS
       - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
+      - CATALOG_IMPORT_ENABLED=${CATALOG_IMPORT_ENABLED:-false}
       - REQUEST_MAX_BODY_MESSAGES=1024
       - SYNC_LOG_TO_FILE=false
     volumes:
@@ -142,6 +143,9 @@ services:
       - CARDTRADER_WRITES_ENABLED=${CARDTRADER_WRITES_ENABLED:-false}
       - CARDTRADER_JOB_POLL_TIMEOUT_SECONDS=${CARDTRADER_JOB_POLL_TIMEOUT_SECONDS:-180}
       - CARDTRADER_JOB_POLL_INTERVAL_SECONDS=${CARDTRADER_JOB_POLL_INTERVAL_SECONDS:-1.1}
+      # The main worker only persists catalog requests. It does not consume
+      # catalog queues and receives no catalog writer or Search secret.
+      - CATALOG_IMPORT_ENABLED=${CATALOG_IMPORT_ENABLED:-false}
       - SYNC_LOG_TO_FILE=false
     volumes:
       - ./certs/aws-rds-global-bundle.pem:/etc/ssl/certs/aws-rds-global-bundle.pem:ro
@@ -159,6 +163,28 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # Catalog imports and Search indexing run in an isolated process. This
+  # service inherits the hardened runtime, database pools and network from the
+  # normal worker, but is the only service receiving catalog writer and
+  # Meilisearch credentials. It deliberately does not run Celery beat.
+  brx-sync-catalog-worker:
+    extends:
+      service: brx-sync-worker
+    container_name: brx-sync-catalog-worker
+    command: celery -A app.tasks.celery_app worker -Q catalog-import,catalog-index --loglevel=info --concurrency=1
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    environment:
+      - CATALOG_IMPORT_ENABLED=${CATALOG_IMPORT_ENABLED:-false}
+      - CATALOG_MYSQL_WRITE_ENABLED=${CATALOG_MYSQL_WRITE_ENABLED:-false}
+      - CATALOG_MYSQL_WRITER_USER=${CATALOG_MYSQL_WRITER_USER:-}
+      - CATALOG_MYSQL_WRITER_PASSWORD=${CATALOG_MYSQL_WRITER_PASSWORD:-}
+      - CATALOG_SEARCH_PUBLISH_ENABLED=${CATALOG_SEARCH_PUBLISH_ENABLED:-false}
+      - CATALOG_MEILISEARCH_URL=${CATALOG_MEILISEARCH_URL:-}
+      - CATALOG_MEILISEARCH_API_KEY=${CATALOG_MEILISEARCH_API_KEY:-}
+      - CATALOG_MEILISEARCH_INDEX=${CATALOG_MEILISEARCH_INDEX:-cards}
+
   # One-shot schema owner. It deliberately receives no runtime database URL,
   # Fernet/JWT keys, MySQL/Redis credentials or internal caller tokens.
   brx-sync-schema-migrate:
@@ -173,6 +199,7 @@ services:
         psql -v ON_ERROR_STOP=1 -f migrations/20260714_trade_inventory_visibility.sql
         psql -v ON_ERROR_STOP=1 -f migrations/20260716_cardtrader_execution_policy.sql
         psql -v ON_ERROR_STOP=1 -f migrations/20260810_cardtrader_outbound_create.sql
+        psql -v ON_ERROR_STOP=1 -f migrations/20260907_catalog_import_queue.sql
     read_only: true
     mem_limit: 256m
     cpus: 0.5

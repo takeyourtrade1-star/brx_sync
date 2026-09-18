@@ -14,6 +14,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.models.inventory import Base
+# Register catalog queue tables before Base.metadata.create_all runs. Tests
+# that do not exercise the queue still use the same disposable schema fixture.
+from app.models import catalog as _catalog_models  # noqa: F401
 
 
 @pytest.fixture(scope="session")

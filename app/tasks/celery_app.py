@@ -14,7 +14,12 @@ celery_app = Celery(
     "brx_sync",
     broker=settings.celery_broker_url,
     backend=settings.celery_result_backend,
-    include=["app.tasks.sync_tasks", "app.tasks.periodic_sync", "app.tasks.outbox_tasks"],
+    include=[
+        "app.tasks.sync_tasks",
+        "app.tasks.periodic_sync",
+        "app.tasks.outbox_tasks",
+        "app.tasks.catalog_tasks",
+    ],
 )
 
 # Celery configuration
@@ -36,6 +41,12 @@ celery_app.conf.update(
         "app.tasks.periodic_sync.recover_inventory_reservations": {"queue": "high-priority"},
         "app.tasks.outbox_tasks.process_cardtrader_outbox_command": {"queue": "sync-real"},
         "app.tasks.outbox_tasks.dispatch_pending_cardtrader_outbox": {"queue": "sync-real"},
+        "app.tasks.catalog_tasks.process_catalog_import_job": {"queue": "catalog-import"},
+        "app.tasks.catalog_tasks.dispatch_pending_catalog_imports": {"queue": "catalog-import"},
+        "app.tasks.catalog_tasks.process_catalog_index_outbox": {"queue": "catalog-index"},
+        "app.tasks.catalog_tasks.dispatch_pending_catalog_index_outbox": {
+            "queue": "catalog-index"
+        },
     },
     task_default_queue="default",
     task_create_missing_queues=False,
@@ -52,6 +63,14 @@ celery_app.conf.update(
         "dispatch-cardtrader-outbox": {
             "task": "app.tasks.outbox_tasks.dispatch_pending_cardtrader_outbox",
             "schedule": 10.0,
+        },
+        "dispatch-catalog-imports": {
+            "task": "app.tasks.catalog_tasks.dispatch_pending_catalog_imports",
+            "schedule": 15.0,
+        },
+        "dispatch-catalog-index-outbox": {
+            "task": "app.tasks.catalog_tasks.dispatch_pending_catalog_index_outbox",
+            "schedule": 15.0,
         },
     },
     # Il beat gira embedded nel worker (-B): file di stato in /tmp
@@ -95,6 +114,14 @@ celery_app.conf.task_queues = {
     "sync-real": {
         "exchange": "sync-real",
         "routing_key": "sync-real",
+    },
+    "catalog-import": {
+        "exchange": "catalog-import",
+        "routing_key": "catalog-import",
+    },
+    "catalog-index": {
+        "exchange": "catalog-index",
+        "routing_key": "catalog-index",
     },
     "default": {
         "exchange": "default",

@@ -18,6 +18,11 @@ class DisconnectSyncRequest(BaseModel):
         description="suspend = set status to idle (keep token); remove = set idle and clear token/webhook",
     )
 
+    inventory_action: Optional[Literal["keep", "delete"]] = Field(
+        None,
+        description="For remove: keep the imported catalog visible, or delete it locally. Omitted preserves legacy behavior.",
+    )
+
 
 # Request Schemas
 
@@ -210,6 +215,15 @@ class SyncStatusResponse(BaseModel):
     )
     mode_version: int = Field(1, ge=1, description="Execution-policy fence version")
     writes_enabled: bool = Field(False, description="Whether real CardTrader writes are enabled")
+    raw_rows: int = Field(0, ge=0, description="Magic rows received from CardTrader")
+    raw_copies: int = Field(0, ge=0, description="Magic copies received from CardTrader")
+    imported_rows: int = Field(0, ge=0, description="Magic rows mapped into the canonical catalog")
+    imported_copies: int = Field(0, ge=0, description="Copies in mapped Magic rows")
+    unmapped_rows: int = Field(0, ge=0, description="Valid Magic rows awaiting catalog mapping")
+    unmapped_copies: int = Field(0, ge=0, description="Copies in rows awaiting catalog mapping")
+    quarantined_rows: int = Field(0, ge=0, description="Rows excluded by safety/quarantine state")
+    quarantined_copies: int = Field(0, ge=0, description="Copies excluded by safety/quarantine state")
+    incomplete: bool = Field(False, description="Whether the latest import has unresolved rows")
     
 class InventoryItemResponse(BaseModel):
     """Response schema for inventory item."""
@@ -235,6 +249,7 @@ class InventoryItemResponse(BaseModel):
     
     id: int = Field(..., description="Item ID")
     blueprint_id: int = Field(..., description="CardTrader blueprint ID")
+    game_id: Optional[int] = Field(None, description="Catalog game identifier")
     quantity: int = Field(..., description="Current quantity")
     reserved_quantity: int = Field(
         0, description="Quantity locked by accepted trades"
@@ -264,6 +279,10 @@ class InventoryItemResponse(BaseModel):
     description: Optional[str] = Field(None, description="Product description")
     user_data_field: Optional[str] = Field(None, description="Custom metadata field")
     graded: Optional[bool] = Field(None, description="Whether the product is graded")
+    catalog_metadata: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Validated CardTrader name/image/expansion metadata while catalog mapping is pending",
+    )
     updated_at: str = Field(..., description="Last update timestamp (ISO format)")
     created_at: Optional[str] = Field(None, description="Creation timestamp (ISO format)")
     
@@ -283,6 +302,15 @@ class InventoryResponse(BaseModel):
     user_id: str = Field(..., description="User UUID")
     items: List[InventoryItemResponse] = Field(..., description="List of inventory items")
     total: int = Field(..., description="Total number of items")
+    raw_rows: int = Field(0, ge=0, description="Magic rows received from CardTrader")
+    raw_copies: int = Field(0, ge=0, description="Magic copies received from CardTrader")
+    imported_rows: int = Field(0, ge=0, description="Magic rows mapped into the canonical catalog")
+    imported_copies: int = Field(0, ge=0, description="Copies in mapped Magic rows")
+    unmapped_rows: int = Field(0, ge=0, description="Valid Magic rows awaiting catalog mapping")
+    unmapped_copies: int = Field(0, ge=0, description="Copies in rows awaiting catalog mapping")
+    quarantined_rows: int = Field(0, ge=0, description="Rows excluded by safety/quarantine state")
+    quarantined_copies: int = Field(0, ge=0, description="Copies excluded by safety/quarantine state")
+    incomplete: bool = Field(False, description="Whether the latest import has unresolved rows")
     
 class SyncStartResponse(BaseModel):
     """Response schema for sync start operation."""
